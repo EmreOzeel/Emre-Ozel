@@ -1,0 +1,27 @@
+# Environment
+.env
+
+# Go
+backend/vendor/
+backend/*.exe
+backend/server
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Data
+data/
+*.db
+*.pcap
+*.pcapng
+*.cap
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

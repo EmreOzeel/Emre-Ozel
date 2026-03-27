@@ -1,0 +1,174 @@
+<template>
+  <el-container class="layout">
+    <!-- Sidebar -->
+    <el-aside width="240px" class="sidebar">
+      <div class="sidebar-logo">
+        <el-icon size="28" color="#409EFF"><DataAnalysis /></el-icon>
+        <span>PCAP Analyzer</span>
+      </div>
+
+      <el-menu
+        :default-active="activeMenu"
+        router
+        background-color="#1a1a2e"
+        text-color="#c8cdd6"
+        active-text-color="#409EFF"
+        class="sidebar-menu"
+      >
+        <el-menu-item index="/">
+          <el-icon><HomeFilled /></el-icon>
+          <span>Dashboard</span>
+        </el-menu-item>
+        <el-menu-item index="/history">
+          <el-icon><Tickets /></el-icon>
+          <span>Analysis History</span>
+        </el-menu-item>
+      </el-menu>
+
+      <div class="sidebar-footer">
+        <div class="user-info">
+          <el-avatar :size="32" class="user-avatar">
+            {{ auth.user?.username?.charAt(0)?.toUpperCase() || 'U' }}
+          </el-avatar>
+          <span class="username">{{ auth.user?.username || 'User' }}</span>
+        </div>
+        <el-tooltip content="Sign Out" placement="right">
+          <el-button
+            link
+            class="logout-btn"
+            @click="handleLogout"
+          >
+            <el-icon size="18"><SwitchButton /></el-icon>
+          </el-button>
+        </el-tooltip>
+      </div>
+    </el-aside>
+
+    <!-- Main content -->
+    <el-container>
+      <el-main class="main-content">
+        <router-view />
+      </el-main>
+    </el-container>
+  </el-container>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+
+const route = useRoute()
+const router = useRouter()
+const auth = useAuthStore()
+
+const activeMenu = computed(() => {
+  if (route.path.startsWith('/analysis')) return '/history'
+  return route.path
+})
+
+function handleLogout() {
+  auth.logout()
+  router.push('/login')
+}
+</script>
+
+<style scoped>
+.layout {
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #1a1a2e;
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  height: 100vh;
+  z-index: 100;
+  box-shadow: 4px 0 12px rgba(0,0,0,0.15);
+}
+
+.sidebar-logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 20px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.sidebar-logo span {
+  font-size: 16px;
+  font-weight: 700;
+  color: white;
+  letter-spacing: 0.3px;
+}
+
+.sidebar-menu {
+  flex: 1;
+  border-right: none;
+  padding: 12px 0;
+}
+
+.sidebar-menu :deep(.el-menu-item) {
+  height: 48px;
+  line-height: 48px;
+  margin: 4px 8px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.sidebar-menu :deep(.el-menu-item.is-active) {
+  background: rgba(64, 158, 255, 0.15) !important;
+}
+
+.sidebar-menu :deep(.el-menu-item:hover) {
+  background: rgba(255, 255, 255, 0.06) !important;
+}
+
+.sidebar-footer {
+  padding: 16px 20px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.user-avatar {
+  background: #409EFF;
+  color: white;
+  font-weight: 600;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.username {
+  color: #c8cdd6;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
+}
+
+.logout-btn {
+  color: #606266 !important;
+}
+
+.logout-btn:hover {
+  color: #f56c6c !important;
+}
+
+.main-content {
+  margin-left: 240px;
+  min-height: 100vh;
+  background: #f0f2f5;
+  padding: 24px;
+}
+</style>

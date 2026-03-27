@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pcap-backend
+    restart: unless-stopped
+    environment:
+      - GIN_MODE=release
+      - JWT_SECRET=${JWT_SECRET:-change-this-secret-in-production}
+      - DEFAULT_USER=${DEFAULT_USER:-admin}
+      - DEFAULT_PASS=${DEFAULT_PASS:-admin123}
+      - DB_PATH=/data/pcap_analyzer.db
+      - UPLOAD_DIR=/data/uploads
+    volumes:
+      - pcap-data:/data
+    networks:
+      - pcap-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pcap-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - pcap-net
+
+volumes:
+  pcap-data:
+    driver: local
+
+networks:
+  pcap-net:
+    driver: bridge
