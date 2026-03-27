@@ -43,7 +43,7 @@ type connRecord struct {
 	serverPort uint16
 	packets    []rawPacket
 	startTime  time.Time
-	// direction key: "clientIP:clientPort-serverIP:serverPort"
+	hasSYN     bool // false = mid-stream capture (no SYN seen)
 }
 
 // ConnectionState holds all connection tracking data
@@ -109,12 +109,12 @@ func analyzeConnections(packet gopacket.Packet, state *analysisState) {
 		payloadLen: len(tcp.Payload),
 	}
 
-	// SYN-only packet = new connection; register the initiator as client
+	// SYN-only: new connection, initiator is definitively the client
 	if tcp.SYN && !tcp.ACK {
 		key := fmt.Sprintf("%s:%d-%s:%d", srcIP, srcPort, dstIP, dstPort)
 		if _, exists := cs.records[key]; !exists {
 			if len(cs.records) >= maxConnections {
-				return // cap reached
+				return
 			}
 			cs.records[key] = &connRecord{
 				clientIP:   srcIP,
@@ -122,6 +122,7 @@ func analyzeConnections(packet gopacket.Packet, state *analysisState) {
 				clientPort: srcPort,
 				serverPort: dstPort,
 				startTime:  ts,
+				hasSYN:     true,
 			}
 			cs.order = append(cs.order, key)
 		}
@@ -129,10 +130,26 @@ func analyzeConnections(packet gopacket.Packet, state *analysisState) {
 		return
 	}
 
-	// For other packets, find the existing record
+	// For all other packets: find existing record or auto-create (mid-stream)
 	key := cs.canonicalKey(srcIP, dstIP, srcPort, dstPort)
 	if key == "" {
-		return // no matching connection
+		// Mid-stream: no SYN seen — use port heuristic to guess client/server
+		clientIP, clientPort, serverIP, serverPort := guessDirection(srcIP, srcPort, dstIP, dstPort)
+		key = fmt.Sprintf("%s:%d-%s:%d", clientIP, clientPort, serverIP, serverPort)
+		if _, exists := cs.records[key]; !exists {
+			if len(cs.records) >= maxConnections {
+				return
+			}
+			cs.records[key] = &connRecord{
+				clientIP:   clientIP,
+				serverIP:   serverIP,
+				clientPort: clientPort,
+				serverPort: serverPort,
+				startTime:  ts,
+				hasSYN:     false,
+			}
+			cs.order = append(cs.order, key)
+		}
 	}
 	cs.records[key].packets = append(cs.records[key].packets, pkt)
 }
@@ -259,7 +276,18 @@ func buildConnection(id int, rec *connRecord) models.TCPConnection {
 	}
 
 	// Determine connection state
-	conn.State = determineState(hasSYN, hasSYNACK, hasACKAfterHandshake, hasFIN, hasRST)
+	if !rec.hasSYN {
+		// Capture started mid-session
+		if hasRST {
+			conn.State = "reset"
+		} else if hasFIN {
+			conn.State = "fin-closed"
+		} else {
+			conn.State = "mid-stream"
+		}
+	} else {
+		conn.State = determineState(hasSYN, hasSYNACK, hasACKAfterHandshake, hasFIN, hasRST)
+	}
 
 	return conn
 }
@@ -319,6 +347,22 @@ func describePacket(p rawPacket, hasSYN, hasSYNACK bool) string {
 			return fmt.Sprintf("Data — %d bytes", p.payloadLen)
 		}
 		return "Control packet"
+	}
+}
+
+// guessDirection decides which side is client/server when no SYN is available.
+// Lower (server-side) ports win; otherwise the numerically smaller port is server.
+func guessDirection(srcIP string, srcPort uint16, dstIP string, dstPort uint16) (clientIP string, clientPort uint16, serverIP string, serverPort uint16) {
+	isWellKnown := func(p uint16) bool { return p <= 1024 }
+	switch {
+	case isWellKnown(dstPort) && !isWellKnown(srcPort):
+		return srcIP, srcPort, dstIP, dstPort
+	case isWellKnown(srcPort) && !isWellKnown(dstPort):
+		return dstIP, dstPort, srcIP, srcPort
+	case dstPort < srcPort:
+		return srcIP, srcPort, dstIP, dstPort
+	default:
+		return dstIP, dstPort, srcIP, srcPort
 	}
 }
 

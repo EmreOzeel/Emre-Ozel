@@ -195,6 +195,7 @@
                   <el-option label="FIN Closed" value="fin-closed" />
                   <el-option label="Reset" value="reset" />
                   <el-option label="Half-Open" value="half-open" />
+                  <el-option label="Mid-Stream" value="mid-stream" />
                 </el-select>
               </div>
 
@@ -412,11 +413,11 @@ function timelineType(severity) {
 
 // TCP Connection helpers
 function stateTagType(state) {
-  return { established: 'success', 'fin-closed': 'info', reset: 'danger', 'half-open': 'warning', 'syn-ack-sent': 'warning' }[state] || ''
+  return { established: 'success', 'fin-closed': 'info', reset: 'danger', 'half-open': 'warning', 'syn-ack-sent': 'warning', 'mid-stream': '' }[state] || ''
 }
 
 function stateLabel(state) {
-  return { established: 'Established', 'fin-closed': 'FIN Closed', reset: 'Reset (RST)', 'half-open': 'Half-Open', 'syn-ack-sent': 'SYN-ACK Sent', unknown: 'Unknown' }[state] || state
+  return { established: 'Established', 'fin-closed': 'FIN Closed', reset: 'Reset (RST)', 'half-open': 'Half-Open', 'syn-ack-sent': 'SYN-ACK Sent', 'mid-stream': 'Mid-Stream', unknown: 'Unknown' }[state] || state
 }
 
 function stepRowClass(step) {
