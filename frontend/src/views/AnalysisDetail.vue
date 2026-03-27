@@ -82,25 +82,20 @@
         </el-card>
       </div>
 
-      <!-- Findings Filters -->
+      <!-- Tabs: Findings / TCP Connections -->
       <el-card class="findings-card" shadow="never">
-        <template #header>
-          <div class="findings-header">
-            <span class="card-title">
-              Findings
-              <el-badge :value="filteredFindings.length" class="badge" />
-            </span>
-            <div class="filter-row">
+        <el-tabs v-model="activeTab">
+
+          <!-- ── FINDINGS TAB ── -->
+          <el-tab-pane name="findings">
+            <template #label>
+              <span>Findings <el-badge :value="filteredFindings.length" style="margin-left:4px" /></span>
+            </template>
+            <div class="tab-toolbar">
               <el-select v-model="filterSeverity" placeholder="Severity" clearable size="small" style="width: 130px">
-                <el-option label="Critical" value="critical">
-                  <el-tag type="danger" size="small">Critical</el-tag>
-                </el-option>
-                <el-option label="Warning" value="warning">
-                  <el-tag type="warning" size="small">Warning</el-tag>
-                </el-option>
-                <el-option label="Info" value="info">
-                  <el-tag type="info" size="small">Info</el-tag>
-                </el-option>
+                <el-option label="Critical" value="critical"><el-tag type="danger" size="small">Critical</el-tag></el-option>
+                <el-option label="Warning" value="warning"><el-tag type="warning" size="small">Warning</el-tag></el-option>
+                <el-option label="Info" value="info"><el-tag type="info" size="small">Info</el-tag></el-option>
               </el-select>
               <el-select v-model="filterCategory" placeholder="Category" clearable size="small" style="width: 130px">
                 <el-option label="TCP/IP" value="tcp" />
@@ -109,14 +104,12 @@
                 <el-option label="HTTP" value="http" />
               </el-select>
             </div>
-          </div>
-        </template>
 
-        <!-- No findings -->
-        <el-empty v-if="filteredFindings.length === 0" description="No findings match the current filter" :image-size="80" />
+            <!-- No findings -->
+            <el-empty v-if="filteredFindings.length === 0" description="No findings match the current filter" :image-size="80" />
 
-        <!-- Timeline view -->
-        <el-timeline v-else>
+            <!-- Timeline view -->
+            <el-timeline v-else>
           <el-timeline-item
             v-for="finding in filteredFindings"
             :key="finding.id"
@@ -182,7 +175,141 @@
               </el-collapse>
             </el-card>
           </el-timeline-item>
-        </el-timeline>
+            </el-timeline>
+          </el-tab-pane>
+
+          <!-- ── TCP CONNECTIONS TAB ── -->
+          <el-tab-pane name="connections">
+            <template #label>
+              <span>TCP Connections <el-badge :value="result.connections?.length || 0" style="margin-left:4px" /></span>
+            </template>
+
+            <el-empty v-if="!result.connections?.length" description="No TCP connections captured" :image-size="80" />
+
+            <template v-else>
+              <!-- Search box -->
+              <div class="tab-toolbar">
+                <el-input v-model="connSearch" placeholder="Filter by IP or port…" :prefix-icon="Search" clearable size="small" style="max-width:300px" />
+                <el-select v-model="connStateFilter" placeholder="State" clearable size="small" style="width:160px">
+                  <el-option label="Established" value="established" />
+                  <el-option label="FIN Closed" value="fin-closed" />
+                  <el-option label="Reset" value="reset" />
+                  <el-option label="Half-Open" value="half-open" />
+                </el-select>
+              </div>
+
+              <!-- Connections table with expand -->
+              <el-table
+                :data="filteredConnections"
+                row-key="id"
+                style="width:100%"
+                @expand-change="onExpandChange"
+              >
+                <el-table-column type="expand">
+                  <template #default="{ row }">
+                    <div class="conn-flow-wrap">
+                      <div class="conn-flow-header">
+                        <span class="conn-flow-title">
+                          <el-icon><Connection /></el-icon>
+                          {{ row.client_ip }}:{{ row.client_port }}
+                          <span class="arrow">⟶</span>
+                          {{ row.server_ip }}:{{ row.server_port }}
+                        </span>
+                        <span class="conn-flow-meta">
+                          {{ row.packet_count }} packets ·
+                          ↑ {{ formatSize(row.bytes_client) }} ·
+                          ↓ {{ formatSize(row.bytes_server) }}
+                        </span>
+                      </div>
+
+                      <!-- Step-by-step packet table -->
+                      <table class="packet-table">
+                        <thead>
+                          <tr>
+                            <th>#</th>
+                            <th>Time (s)</th>
+                            <th>Dir</th>
+                            <th>Flags</th>
+                            <th>Seq</th>
+                            <th>Ack</th>
+                            <th>Len</th>
+                            <th>Description</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr
+                            v-for="(step, idx) in row.steps"
+                            :key="idx"
+                            :class="stepRowClass(step)"
+                          >
+                            <td class="pkt-num">{{ idx + 1 }}</td>
+                            <td class="pkt-time">+{{ step.rel_time_sec.toFixed(4) }}s</td>
+                            <td class="pkt-dir" :class="step.direction === '→' ? 'dir-fwd' : 'dir-rev'">
+                              {{ step.direction }}
+                            </td>
+                            <td class="pkt-flags">
+                              <span
+                                v-for="flag in step.flags.split('+')"
+                                :key="flag"
+                                :class="'flag flag-' + flag.toLowerCase()"
+                              >{{ flag }}</span>
+                            </td>
+                            <td class="pkt-seq">{{ step.seq_num }}</td>
+                            <td class="pkt-ack">{{ step.ack_num }}</td>
+                            <td class="pkt-len">{{ step.payload_len > 0 ? step.payload_len + 'B' : '—' }}</td>
+                            <td class="pkt-desc">{{ step.description }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                      <p v-if="row.packet_count > row.steps?.length" class="truncated-note">
+                        ⚠ Showing first {{ row.steps?.length }} of {{ row.packet_count }} packets
+                      </p>
+                    </div>
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="#" prop="id" width="55" />
+
+                <el-table-column label="Client" min-width="170">
+                  <template #default="{ row }">
+                    <span class="mono">{{ row.client_ip }}:{{ row.client_port }}</span>
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="Server" min-width="170">
+                  <template #default="{ row }">
+                    <span class="mono">{{ row.server_ip }}:{{ row.server_port }}</span>
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="State" width="130">
+                  <template #default="{ row }">
+                    <el-tag :type="stateTagType(row.state)" size="small" effect="light">
+                      {{ stateLabel(row.state) }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="Duration" width="100">
+                  <template #default="{ row }">
+                    {{ formatDuration(row.duration_sec) }}
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="Packets" prop="packet_count" width="90" />
+
+                <el-table-column label="↑ Client" width="100">
+                  <template #default="{ row }">{{ formatSize(row.bytes_client) }}</template>
+                </el-table-column>
+
+                <el-table-column label="↓ Server" width="100">
+                  <template #default="{ row }">{{ formatSize(row.bytes_server) }}</template>
+                </el-table-column>
+              </el-table>
+            </template>
+          </el-tab-pane>
+
+        </el-tabs>
       </el-card>
     </template>
 
@@ -193,6 +320,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
+import { Search } from '@element-plus/icons-vue'
 import api from '../api'
 
 const route = useRoute()
@@ -202,6 +330,9 @@ const analysisData = ref(null)
 const result = ref(null)
 const filterSeverity = ref('')
 const filterCategory = ref('')
+const activeTab = ref('findings')
+const connSearch = ref('')
+const connStateFilter = ref('')
 
 onMounted(async () => {
   try {
@@ -220,6 +351,19 @@ const filteredFindings = computed(() => {
   return result.value.findings.filter(f => {
     if (filterSeverity.value && f.severity !== filterSeverity.value) return false
     if (filterCategory.value && f.category !== filterCategory.value) return false
+    return true
+  })
+})
+
+const filteredConnections = computed(() => {
+  if (!result.value?.connections) return []
+  return result.value.connections.filter(c => {
+    if (connStateFilter.value && c.state !== connStateFilter.value) return false
+    if (connSearch.value) {
+      const q = connSearch.value.toLowerCase()
+      const haystack = `${c.client_ip} ${c.server_ip} ${c.client_port} ${c.server_port}`.toLowerCase()
+      if (!haystack.includes(q)) return false
+    }
     return true
   })
 })
@@ -265,6 +409,27 @@ function categoryLabel(category) {
 function timelineType(severity) {
   return { critical: 'danger', warning: 'warning', info: 'primary' }[severity] || 'primary'
 }
+
+// TCP Connection helpers
+function stateTagType(state) {
+  return { established: 'success', 'fin-closed': 'info', reset: 'danger', 'half-open': 'warning', 'syn-ack-sent': 'warning' }[state] || ''
+}
+
+function stateLabel(state) {
+  return { established: 'Established', 'fin-closed': 'FIN Closed', reset: 'Reset (RST)', 'half-open': 'Half-Open', 'syn-ack-sent': 'SYN-ACK Sent', unknown: 'Unknown' }[state] || state
+}
+
+function stepRowClass(step) {
+  if (step.flags.includes('RST')) return 'row-rst'
+  if (step.flags.includes('FIN')) return 'row-fin'
+  if (step.flags === 'SYN') return 'row-syn'
+  if (step.flags === 'SYN+ACK') return 'row-synack'
+  if (step.payload_len > 0) return 'row-data'
+  return ''
+}
+
+function onExpandChange() {}
+
 
 function formatKey(key) {
   return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
@@ -564,5 +729,119 @@ function formatDuration(sec) {
   font-family: monospace;
   word-break: break-all;
   white-space: pre-wrap;
+}
+
+/* ── Tabs toolbar ── */
+.tab-toolbar {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+/* ── Connection flow expand area ── */
+.conn-flow-wrap {
+  padding: 0 16px 16px;
+}
+
+.conn-flow-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0 10px;
+  border-bottom: 1px solid #e4e7ed;
+  margin-bottom: 12px;
+}
+
+.conn-flow-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+  font-family: monospace;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conn-flow-title .arrow {
+  color: #409EFF;
+  font-size: 18px;
+}
+
+.conn-flow-meta {
+  font-size: 12px;
+  color: #909399;
+}
+
+/* ── Packet table ── */
+.packet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.packet-table th {
+  background: #f5f7fa;
+  color: #606266;
+  font-weight: 600;
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 2px solid #e4e7ed;
+  white-space: nowrap;
+}
+
+.packet-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid #f0f2f5;
+  vertical-align: middle;
+}
+
+.packet-table tr:hover td {
+  background: #fafafa;
+}
+
+/* Row color coding */
+.row-syn td { background: #f0f9eb; }
+.row-synack td { background: #ecf5ff; }
+.row-fin td { background: #fdf6ec; }
+.row-rst td { background: #fef0f0; }
+.row-data td { background: #fafafa; }
+
+.pkt-num { color: #909399; width: 30px; }
+.pkt-time { color: #67C23A; width: 90px; white-space: nowrap; }
+.pkt-seq, .pkt-ack { color: #909399; width: 90px; }
+.pkt-len { color: #E6A23C; width: 55px; text-align: right; }
+.pkt-desc { color: #303133; }
+
+.pkt-dir { font-size: 16px; font-weight: 700; width: 30px; text-align: center; }
+.dir-fwd { color: #409EFF; }
+.dir-rev { color: #67C23A; }
+
+/* Flag badges */
+.flag {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  margin-right: 2px;
+}
+.flag-syn  { background: #e1f3d8; color: #529b2e; }
+.flag-ack  { background: #ecf5ff; color: #409eff; }
+.flag-fin  { background: #fdf6ec; color: #b88230; }
+.flag-rst  { background: #fef0f0; color: #f56c6c; }
+.flag-psh  { background: #f4f4f5; color: #909399; }
+.flag-urg  { background: #fff0f0; color: #f56c6c; }
+
+.mono { font-family: monospace; font-size: 13px; }
+
+.truncated-note {
+  font-size: 12px;
+  color: #E6A23C;
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: #fdf6ec;
+  border-radius: 4px;
 }
 </style>

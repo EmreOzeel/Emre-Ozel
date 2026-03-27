@@ -29,8 +29,9 @@ type Analysis struct {
 
 // AnalysisResult is the full result of a PCAP analysis (stored as JSON in ResultJSON)
 type AnalysisResult struct {
-	Summary  Summary   `json:"summary"`
-	Findings []Finding `json:"findings"`
+	Summary     Summary         `json:"summary"`
+	Findings    []Finding       `json:"findings"`
+	Connections []TCPConnection `json:"connections"`
 }
 
 type Summary struct {
@@ -50,6 +51,33 @@ type Summary struct {
 type TopTalker struct {
 	IP    string `json:"ip"`
 	Bytes int64  `json:"bytes"`
+}
+
+// TCPConnection represents a single TCP session with step-by-step packet flow
+type TCPConnection struct {
+	ID           int              `json:"id"`
+	ClientIP     string           `json:"client_ip"`   // SYN initiator
+	ServerIP     string           `json:"server_ip"`
+	ClientPort   int              `json:"client_port"`
+	ServerPort   int              `json:"server_port"`
+	State        string           `json:"state"` // established, half-open, reset, fin-closed
+	StartTime    *time.Time       `json:"start_time"`
+	DurationSec  float64          `json:"duration_sec"`
+	BytesClient  int64            `json:"bytes_client"` // client→server
+	BytesServer  int64            `json:"bytes_server"` // server→client
+	PacketCount  int              `json:"packet_count"`
+	Steps        []ConnectionStep `json:"steps"`
+}
+
+// ConnectionStep is a single packet event within a TCP connection
+type ConnectionStep struct {
+	RelTimeSec  float64 `json:"rel_time_sec"` // seconds from connection start
+	Direction   string  `json:"direction"`    // "→" (client→server) or "←" (server→client)
+	Flags       string  `json:"flags"`
+	SeqNum      uint32  `json:"seq_num"`
+	AckNum      uint32  `json:"ack_num"`
+	PayloadLen  int     `json:"payload_len"`
+	Description string  `json:"description"`
 }
 
 type Finding struct {

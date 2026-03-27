@@ -38,6 +38,9 @@ type analysisState struct {
 
 	// HTTP state
 	httpState *HTTPState
+
+	// Connection flow state
+	connState *ConnectionState
 }
 
 // newPacketSource opens a pcap or pcapng file using the pure-Go pcapgo reader
@@ -82,6 +85,7 @@ func Analyze(filePath string) (*models.AnalysisResult, error) {
 		secState:  newSecurityState(),
 		dnsState:  newDNSState(),
 		httpState: newHTTPState(),
+		connState: newConnectionState(),
 	}
 
 	packetSource.NoCopy = true
@@ -107,6 +111,7 @@ func Analyze(filePath string) (*models.AnalysisResult, error) {
 		analyzeSecurity(packet, state)
 		analyzeDNS(packet, state)
 		analyzeHTTP(packet, state)
+		analyzeConnections(packet, state)
 	}
 
 	findings := collectFindings(state)
@@ -123,9 +128,12 @@ func Analyze(filePath string) (*models.AnalysisResult, error) {
 
 	summary := buildSummary(state, findings)
 
+	connections := finalizeConnections(state.connState)
+
 	return &models.AnalysisResult{
-		Summary:  summary,
-		Findings: findings,
+		Summary:     summary,
+		Findings:    findings,
+		Connections: connections,
 	}, nil
 }
 
