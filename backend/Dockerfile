@@ -5,11 +5,8 @@ RUN apk add --no-cache gcc musl-dev libpcap-dev
 
 WORKDIR /app
 
-COPY go.mod go.sum* ./
-RUN go mod download
-
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux go build -o /app/server .
+RUN go mod tidy && CGO_ENABLED=1 GOOS=linux go build -o /app/server .
 
 # -------------------------
 FROM alpine:3.19
