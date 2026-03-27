@@ -14,11 +14,12 @@ api.interceptors.request.use(config => {
   return config
 })
 
-// Handle 401 globally
+// Handle 401 globally — but NOT for the login endpoint itself
 api.interceptors.response.use(
   response => response,
   error => {
-    if (error.response?.status === 401) {
+    const isLoginEndpoint = error.config?.url?.includes('/auth/login')
+    if (error.response?.status === 401 && !isLoginEndpoint) {
       localStorage.removeItem('token')
       window.location.href = '/login'
     }
