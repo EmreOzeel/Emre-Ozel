@@ -2,12 +2,16 @@ package analyzer
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcapgo"
 
 	"pcap-analyzer/models"
 )
@@ -36,13 +40,39 @@ type analysisState struct {
 	httpState *HTTPState
 }
 
+// newPacketSource opens a pcap or pcapng file using the pure-Go pcapgo reader
+// (no libpcap / CGO required).
+func newPacketSource(r io.Reader, filePath string) (*gopacket.PacketSource, error) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext == ".pcapng" {
+		ng, err := pcapgo.NewNgReader(r, pcapgo.DefaultNgReaderOptions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse pcapng file: %w", err)
+		}
+		src := gopacket.NewPacketSource(ng, ng.LinkType())
+		return src, nil
+	}
+	// .pcap or .cap
+	pcapReader, err := pcapgo.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse pcap file: %w", err)
+	}
+	src := gopacket.NewPacketSource(pcapReader, pcapReader.LinkType())
+	return src, nil
+}
+
 // Analyze opens a PCAP file and runs all analysis modules
 func Analyze(filePath string) (*models.AnalysisResult, error) {
-	handle, err := pcap.OpenOffline(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pcap file: %w", err)
 	}
-	defer handle.Close()
+	defer f.Close()
+
+	packetSource, err := newPacketSource(f, filePath)
+	if err != nil {
+		return nil, err
+	}
 
 	state := &analysisState{
 		uniqueIPs: make(map[string]struct{}),
@@ -54,7 +84,6 @@ func Analyze(filePath string) (*models.AnalysisResult, error) {
 		httpState: newHTTPState(),
 	}
 
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetSource.NoCopy = true
 
 	for packet := range packetSource.Packets() {
