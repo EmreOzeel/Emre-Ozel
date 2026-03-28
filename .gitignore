@@ -25,3 +25,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+backend/analyzers/__pycache__
+backend/core/__pycache__
+backend/**/__pycache__

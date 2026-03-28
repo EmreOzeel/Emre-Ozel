@@ -182,37 +182,61 @@ async function uploadFile(file) {
 
   uploading.value = true
   uploadingFilename.value = file.name
-  uploadProgress.value = 10
-
-  // Simulate progress while backend processes
-  const progressInterval = setInterval(() => {
-    if (uploadProgress.value < 85) {
-      uploadProgress.value += Math.random() * 8
-    }
-  }, 800)
+  uploadProgress.value = 5
 
   try {
+    // Step 1: upload (fast, returns 202 immediately)
     const formData = new FormData()
     formData.append('file', file)
-
     const res = await api.post('/analyses', formData, {
       headers: { 'Content-Type': 'multipart/form-data' }
     })
+    const analysisId = res.data.id
+    uploadProgress.value = 15
 
-    clearInterval(progressInterval)
-    uploadProgress.value = 100
+    // Step 2: poll status until completed or failed
+    let pollAttempts = 0
+    const maxAttempts = 180   // 3 min @ 1s intervals
+    await new Promise((resolve, reject) => {
+      const poller = setInterval(async () => {
+        pollAttempts++
+        if (pollAttempts > maxAttempts) {
+          clearInterval(poller)
+          reject(new Error('Analysis timed out'))
+          return
+        }
+        try {
+          const statusRes = await api.get(`/analyses/${analysisId}/status`)
+          const status = statusRes.data.status
+          // Smooth progress: pending=15-30, running=30-90, completed=100
+          if (status === 'pending') {
+            uploadProgress.value = Math.min(30, uploadProgress.value + 1)
+          } else if (status === 'running') {
+            uploadProgress.value = Math.min(92, uploadProgress.value + 0.8)
+          } else if (status === 'completed') {
+            clearInterval(poller)
+            uploadProgress.value = 100
+            resolve()
+          } else if (status === 'failed') {
+            clearInterval(poller)
+            reject(new Error(statusRes.data.error || 'Analysis failed'))
+          }
+        } catch (e) {
+          // ignore transient poll errors
+        }
+      }, 1000)
+    })
 
     ElMessage.success('Analysis complete!')
+    await fetchRecent()
+    setTimeout(() => router.push(`/analysis/${analysisId}`), 400)
 
-    setTimeout(() => {
-      router.push(`/analysis/${res.data.analysis_id}`)
-    }, 500)
   } catch (err) {
-    clearInterval(progressInterval)
+    const msg = err.message || err.response?.data?.detail || 'Upload or analysis failed'
+    ElMessage.error(msg)
+  } finally {
     uploading.value = false
     uploadProgress.value = 0
-    const msg = err.response?.data?.error || 'Upload failed'
-    ElMessage.error(msg)
   }
 }
 

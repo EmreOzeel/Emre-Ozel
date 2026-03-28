@@ -27,17 +27,19 @@ class UserModel(Base):
 
 class AnalysisModel(Base):
     __tablename__ = "analyses"
-    id = Column(String, primary_key=True)          # UUID string
+    id = Column(String, primary_key=True)           # UUID string
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     filename = Column(String, nullable=False)
     file_path = Column(String, nullable=True)
-    status = Column(String, default="pending")
+    status = Column(String, default="pending")       # pending / running / completed / failed
     packet_count = Column(Integer, default=0)
     issue_count = Column(Integer, default=0)
     critical_count = Column(Integer, default=0)
     error = Column(Text, nullable=True)
     result_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
 
 
 def get_db():

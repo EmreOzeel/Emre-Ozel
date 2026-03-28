@@ -72,22 +72,53 @@
         <!-- ── Tab 2: Hosts ──────────────────────────────────────────────── -->
         <el-tab-pane label="Hosts" name="hosts">
           <el-card shadow="never">
-            <template #header><span class="card-title">Top IP Endpoints by Traffic</span></template>
-            <el-table :data="data.ip_endpoints" size="small" stripe>
-              <el-table-column prop="ip" label="IP Address" width="150" />
-              <el-table-column label="Total Bytes" sortable>
-                <template #default="{ row }">{{ formatBytes(row.bytes) }}</template>
+            <template #header><span class="card-title">Host Profiles (sorted by anomaly score)</span></template>
+            <el-table :data="data.hosts || data.ip_endpoints" size="small" stripe>
+              <el-table-column prop="ip" label="IP" width="140" />
+              <el-table-column prop="role" label="Role" width="110">
+                <template #default="{ row }">
+                  <el-tag size="small" type="info">{{ row.role || '—' }}</el-tag>
+                </template>
               </el-table-column>
-              <el-table-column prop="packets" label="Packets" sortable>
-                <template #default="{ row }">{{ formatNum(row.packets) }}</template>
+              <el-table-column label="Anomaly" width="110" sortable prop="anomaly_score">
+                <template #default="{ row }">
+                  <span v-if="row.anomaly_score != null" :style="`color:${row.anomaly_score >= 5 ? '#f56c6c' : row.anomaly_score >= 2 ? '#e6a23c' : '#67c23a'}`">
+                    {{ row.anomaly_score?.toFixed(1) }}
+                  </span>
+                  <span v-else>—</span>
+                </template>
               </el-table-column>
-              <el-table-column label="TX Bytes">
-                <template #default="{ row }">{{ formatBytes(row.tx_bytes) }}</template>
+              <el-table-column label="Sent" sortable prop="bytes_sent">
+                <template #default="{ row }">{{ formatBytes(row.bytes_sent || row.tx_bytes) }}</template>
               </el-table-column>
-              <el-table-column label="RX Bytes">
-                <template #default="{ row }">{{ formatBytes(row.rx_bytes) }}</template>
+              <el-table-column label="Received">
+                <template #default="{ row }">{{ formatBytes(row.bytes_recv || row.rx_bytes) }}</template>
+              </el-table-column>
+              <el-table-column prop="unique_peers" label="Peers" width="80" />
+              <el-table-column prop="unique_dst_ports" label="Ports" width="80" />
+              <el-table-column label="Behaviors" show-overflow-tooltip>
+                <template #default="{ row }">
+                  <span class="text-warn" v-if="row.suspicious_behaviors?.length">
+                    {{ row.suspicious_behaviors.join('; ') }}
+                  </span>
+                  <span v-else-if="row.periodic_interval_sec > 0" class="text-danger">
+                    Beaconing every {{ row.periodic_interval_sec }}s
+                  </span>
+                  <span v-else style="color:#909399">—</span>
+                </template>
               </el-table-column>
             </el-table>
+          </el-card>
+
+          <!-- Host stories -->
+          <el-card shadow="never" class="mt-4" v-if="Object.keys(data.host_stories || {}).length">
+            <template #header><span class="card-title">Host Narratives</span></template>
+            <div class="host-stories">
+              <div v-for="(story, ip) in data.host_stories" :key="ip" class="host-story">
+                <span class="story-ip">{{ ip }}</span>
+                <p>{{ story }}</p>
+              </div>
+            </div>
           </el-card>
         </el-tab-pane>
 
@@ -338,12 +369,33 @@
                 <span class="finding-count" v-if="issue.count">× {{ formatNum(issue.count) }}</span>
               </div>
               <p class="finding-desc">{{ issue.description }}</p>
-              <div class="finding-rec" v-if="issue.recommendation">
-                <el-icon><Sunny /></el-icon>
-                <span>{{ issue.recommendation }}</span>
+              <!-- Score + confidence -->
+              <div class="finding-meta" v-if="issue.score != null">
+                <el-tag size="small" type="danger" plain>Score {{ issue.score?.toFixed(1) }}</el-tag>
+                <el-tag size="small" plain>{{ issue.confidence }}</el-tag>
               </div>
-              <div class="finding-examples" v-if="issue.examples?.length">
-                <code v-for="(ex, ei) in issue.examples" :key="ei">{{ ex }}</code>
+              <!-- MITRE ATT&CK badges -->
+              <div class="mitre-badges" v-if="issue.mitre?.length">
+                <a
+                  v-for="m in issue.mitre.slice(0, 3)"
+                  :key="m.technique_id"
+                  :href="m.url"
+                  target="_blank"
+                  class="mitre-badge"
+                >
+                  {{ m.technique_id }}: {{ m.technique_name }}
+                </a>
+              </div>
+              <!-- Evidence samples -->
+              <div class="finding-evidence" v-if="issue.evidence?.samples?.length">
+                <code v-for="(s, si) in issue.evidence.samples.slice(0, 5)" :key="si">{{ s }}</code>
+              </div>
+              <!-- Recommendations -->
+              <div class="finding-actions" v-if="issue.recommended_actions?.length">
+                <div class="actions-label">Recommended Actions:</div>
+                <ul>
+                  <li v-for="(act, ai) in issue.recommended_actions" :key="ai">{{ act }}</li>
+                </ul>
               </div>
             </el-card>
           </div>
@@ -625,4 +677,29 @@ export default { components: { KvTable, StatCard } }
 
 .empty-state { text-align: center; padding: 60px 20px; }
 .text-danger { color: #f56c6c; }
+.text-warn { color: #e6a23c; }
+
+.finding-meta { display: flex; gap: 6px; margin: 4px 0 8px; }
+.mitre-badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.mitre-badge {
+  display: inline-flex; align-items: center; padding: 2px 8px;
+  background: #ecf5ff; border-radius: 3px; font-size: 11px;
+  color: #409eff; text-decoration: none; border: 1px solid #c6e2ff;
+  transition: background 0.2s;
+}
+.mitre-badge:hover { background: #c6e2ff; }
+.finding-evidence { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.finding-evidence code {
+  background: #f5f7fa; padding: 2px 6px; border-radius: 3px;
+  font-size: 11px; color: #606266; font-family: monospace;
+}
+.finding-actions { margin-top: 8px; font-size: 12px; }
+.actions-label { font-weight: 600; margin-bottom: 4px; color: #606266; }
+.finding-actions ul { margin: 0; padding-left: 18px; color: #606266; }
+.finding-actions li { margin: 2px 0; }
+
+.host-stories { display: flex; flex-direction: column; gap: 12px; }
+.host-story { background: #f5f7fa; border-radius: 4px; padding: 10px 14px; }
+.story-ip { font-weight: 700; font-size: 13px; color: #409eff; }
+.host-story p { margin: 4px 0 0; font-size: 13px; color: #606266; line-height: 1.6; }
 </style>

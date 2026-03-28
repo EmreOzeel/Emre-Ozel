@@ -1,371 +1,322 @@
-"""Additional protocol analyzers: ICMP, ARP, DHCP, SMTP, FTP, SSH, SMB, RDP, Kerberos, LDAP, SIP, NTP, SNMP, QUIC."""
+"""
+Additional protocol analyzers (ICMP, ARP, DHCP, SMTP, FTP, SSH, SMB, RDP,
+Kerberos, LDAP, NTP, SNMP, QUIC, SIP).
+Operates on normalized PacketRecord extras dict.
+"""
+from __future__ import annotations
 from collections import defaultdict
-from typing import List, Dict, Any
+from typing import Dict, List
 
+from models import CaptureContext, Evidence, Severity, Confidence, TimelineEvent
+from detection.engine import build_finding
 
-ICMP_TYPES = {
-    "0": "Echo Reply", "3": "Dest Unreachable", "4": "Source Quench",
-    "5": "Redirect", "8": "Echo Request", "9": "Router Advertisement",
-    "11": "Time Exceeded", "12": "Parameter Problem", "13": "Timestamp",
-}
-
-DHCP_MSG_TYPES = {
+_DHCP_TYPES = {
     "1": "DISCOVER", "2": "OFFER", "3": "REQUEST", "4": "DECLINE",
     "5": "ACK", "6": "NAK", "7": "RELEASE", "8": "INFORM",
 }
 
-SMB2_COMMANDS = {
-    "0": "NEGOTIATE", "1": "SESSION_SETUP", "2": "LOGOFF", "3": "TREE_CONNECT",
-    "4": "TREE_DISCONNECT", "5": "CREATE", "6": "CLOSE", "7": "FLUSH",
-    "8": "READ", "9": "WRITE", "10": "LOCK", "11": "IOCTL",
-    "14": "FIND", "16": "GETINFO", "17": "SETINFO", "18": "CHANGE_NOTIFY",
-}
 
-KERBEROS_MSG_TYPES = {
-    "10": "AS-REQ", "11": "AS-REP", "12": "TGS-REQ", "13": "TGS-REP",
-    "14": "AP-REQ", "15": "AP-REP", "30": "KRB-ERROR",
-}
-
-
-def analyze(packets: List[Dict]) -> Dict[str, Any]:
-    issues = []
-    timeline_events = []
-
-    # ICMP
+def analyze(ctx: CaptureContext) -> None:
+    # Per-protocol counters
     icmp_type_counts: Dict[str, int] = defaultdict(int)
-    icmp_unreachable: List[Dict] = []
-
-    # ARP
-    arp_requests = 0
-    arp_replies = 0
-    gratuitous_arps: List[Dict] = []
-
-    # DHCP
-    dhcp_events: List[Dict] = []
+    arp_requests = arp_replies = 0
+    gratuitous_count = 0
     dhcp_type_counts: Dict[str, int] = defaultdict(int)
-
-    # SMTP
+    dhcp_assignments: List[Dict] = []
     smtp_commands: Dict[str, int] = defaultdict(int)
     smtp_auth_plain = 0
-
-    # FTP
     ftp_commands: Dict[str, int] = defaultdict(int)
-    ftp_cleartext_creds = 0
-
-    # SSH
+    ftp_cred_count = 0
     ssh_versions: Dict[str, int] = defaultdict(int)
-    ssh_old_versions: List[Dict] = []
-
-    # SMB
-    smb_commands: Dict[str, int] = defaultdict(int)
-    smb2_commands: Dict[str, int] = defaultdict(int)
-
-    # RDP
-    rdp_connections: List[Dict] = []
-
-    # Kerberos
-    kerb_msg_counts: Dict[str, int] = defaultdict(int)
+    ssh_v1_instances: List[Dict] = []
+    smb1_cmds: Dict[str, int] = defaultdict(int)
+    smb2_cmds: Dict[str, int] = defaultdict(int)
+    rdp_count = 0
+    kerb_types: Dict[str, int] = defaultdict(int)
     kerb_errors = 0
-
-    # LDAP
-    ldap_requests: List[Dict] = []
-
-    # SIP
+    ldap_count = 0
+    ntp_modes: Dict[str, int] = defaultdict(int)
+    snmp_versions: Dict[str, int] = defaultdict(int)
+    snmp_insecure = 0
+    quic_versions: Dict[str, int] = defaultdict(int)
     sip_methods: Dict[str, int] = defaultdict(int)
     sip_status: Dict[str, int] = defaultdict(int)
 
-    # NTP
-    ntp_modes: Dict[str, int] = defaultdict(int)
-    ntp_strata: Dict[str, int] = defaultdict(int)
+    for pkt in ctx.packets:
+        raw = pkt.extras
+        src, dst = pkt.src_ip, pkt.dst_ip
+        ts = pkt.ts
 
-    # SNMP
-    snmp_versions: Dict[str, int] = defaultdict(int)
-    snmp_v1_v2_count = 0
+        # ICMP
+        if pkt.has_icmp:
+            t = raw.get("icmp.type", "")
+            _names = {"0": "Echo Reply", "3": "Unreachable", "8": "Echo Request", "11": "TTL Exceeded"}
+            icmp_type_counts[_names.get(t, f"Type {t}")] += 1
+            if t == "3":
+                ctx.timeline.append(TimelineEvent(
+                    ts=ts, event_type="icmp_unreachable",
+                    src_ip=src, dst_ip=dst,
+                    label=f"ICMP Unreachable: {src}→{dst}",
+                    detail=f"ICMP Unreachable code={raw.get('icmp.code','')} from {src}",
+                    severity=Severity.INFO, protocol="ICMP",
+                ))
 
-    # QUIC
-    quic_versions: Dict[str, int] = defaultdict(int)
-
-    for pkt in packets:
-        ts_str = pkt.get("frame.time_epoch", "0")
-        try:
-            ts = float(ts_str)
-        except ValueError:
-            ts = 0.0
-
-        src_ip = pkt.get("ip.src", pkt.get("ipv6.src", ""))
-        dst_ip = pkt.get("ip.dst", pkt.get("ipv6.dst", ""))
-
-        # ── ICMP ─────────────────────────────────────────────────────────────
-        if "icmp.type" in pkt:
-            icmp_type = pkt.get("icmp.type", "")
-            icmp_code = pkt.get("icmp.code", "")
-            type_name = ICMP_TYPES.get(icmp_type, f"Type {icmp_type}")
-            icmp_type_counts[type_name] += 1
-
-            if icmp_type == "3":
-                icmp_unreachable.append({
-                    "src_ip": src_ip, "dst_ip": dst_ip,
-                    "code": icmp_code, "ts": ts,
-                })
-                timeline_events.append({
-                    "ts": ts, "type": "icmp_unreachable",
-                    "label": f"ICMP Unreachable: {src_ip} → {dst_ip}",
-                    "detail": f"ICMP Destination Unreachable code={icmp_code} from {src_ip}",
-                    "severity": "warning",
-                })
-
-        # ── ARP ──────────────────────────────────────────────────────────────
-        if "arp.opcode" in pkt:
-            opcode = pkt.get("arp.opcode", "")
-            sender_ip = pkt.get("arp.src.proto_ipv4", "")
-            target_ip = pkt.get("arp.dst.proto_ipv4", "")
-            if opcode == "1":
+        # ARP
+        if pkt.has_arp:
+            op = raw.get("arp.opcode", "")
+            if op == "1":
                 arp_requests += 1
-            elif opcode == "2":
+            elif op == "2":
                 arp_replies += 1
-                # Gratuitous ARP: sender == target
-                if sender_ip and sender_ip == target_ip:
-                    gratuitous_arps.append({
-                        "ip": sender_ip,
-                        "mac": pkt.get("arp.src.hw_mac", ""),
-                        "ts": ts,
-                    })
+                s_ip = raw.get("arp.src.proto_ipv4", "")
+                t_ip = raw.get("arp.dst.proto_ipv4", "")
+                if s_ip and s_ip == t_ip:
+                    gratuitous_count += 1
 
-        # ── DHCP ─────────────────────────────────────────────────────────────
-        if "dhcp.option.dhcp" in pkt:
-            msg_type = pkt.get("dhcp.option.dhcp", "")
-            msg_name = DHCP_MSG_TYPES.get(msg_type, f"Type {msg_type}")
-            dhcp_type_counts[msg_name] += 1
-            assigned_ip = pkt.get("dhcp.ip.your", "")
-            if assigned_ip and msg_type == "5":   # ACK
-                dhcp_events.append({
-                    "type": "ACK", "assigned_ip": assigned_ip,
-                    "src_ip": src_ip, "ts": ts,
-                })
-                timeline_events.append({
-                    "ts": ts, "type": "dhcp_ack",
-                    "label": f"DHCP ACK: {assigned_ip}",
-                    "detail": f"DHCP server {src_ip} assigned {assigned_ip}",
-                    "severity": "info",
-                })
+        # DHCP
+        if pkt.has_dhcp:
+            mtype = raw.get("dhcp.option.dhcp", "")
+            if mtype:
+                dhcp_type_counts[_DHCP_TYPES.get(mtype, f"Type{mtype}")] += 1
+            if mtype == "5":   # ACK
+                assigned = raw.get("dhcp.ip.your", "")
+                mac = raw.get("dhcp.hw.mac_addr", "")
+                if assigned:
+                    dhcp_assignments.append({"ip": assigned, "mac": mac, "server": src, "ts": ts})
+                    ctx.timeline.append(TimelineEvent(
+                        ts=ts, event_type="dhcp_ack",
+                        src_ip=src, dst_ip=dst,
+                        label=f"DHCP ACK: {assigned}",
+                        detail=f"{src} assigned {assigned} to {mac or 'unknown'}",
+                        severity=Severity.INFO, protocol="DHCP",
+                    ))
 
-        # ── SMTP ─────────────────────────────────────────────────────────────
-        if "smtp.req.command" in pkt:
-            cmd = pkt.get("smtp.req.command", "").upper()
+        # SMTP
+        cmd = raw.get("smtp.req.command", "").upper()
+        if cmd:
             smtp_commands[cmd] += 1
             if cmd in ("AUTH", "AUTH PLAIN", "AUTH LOGIN"):
                 smtp_auth_plain += 1
-                timeline_events.append({
-                    "ts": ts, "type": "smtp_auth",
-                    "label": f"SMTP Auth: {src_ip} → {dst_ip}",
-                    "detail": f"Cleartext SMTP auth command from {src_ip}",
-                    "severity": "warning",
-                })
 
-        # ── FTP ──────────────────────────────────────────────────────────────
-        if "ftp.request.command" in pkt:
-            cmd = pkt.get("ftp.request.command", "").upper()
-            ftp_commands[cmd] += 1
-            if cmd in ("USER", "PASS"):
-                ftp_cleartext_creds += 1
+        # FTP
+        fcmd = raw.get("ftp.request.command", "").upper()
+        if fcmd:
+            ftp_commands[fcmd] += 1
+            if fcmd in ("USER", "PASS"):
+                ftp_cred_count += 1
 
-        # ── SSH ──────────────────────────────────────────────────────────────
-        if "ssh.protocol" in pkt:
-            proto = pkt.get("ssh.protocol", "")
-            ssh_versions[proto] += 1
-            if proto.startswith("SSH-1"):
-                ssh_old_versions.append({
-                    "src_ip": src_ip, "dst_ip": dst_ip,
-                    "version": proto, "ts": ts,
-                })
+        # SSH
+        sproto = raw.get("ssh.protocol", "")
+        if sproto:
+            ssh_versions[sproto] += 1
+            if sproto.startswith("SSH-1"):
+                ssh_v1_instances.append({"src": src, "dst": dst, "version": sproto, "ts": ts})
 
-        # ── SMB ──────────────────────────────────────────────────────────────
-        if "smb.cmd" in pkt:
-            smb_commands[pkt.get("smb.cmd", "")] += 1
-        if "smb2.cmd" in pkt:
-            cmd = pkt.get("smb2.cmd", "")
-            cmd_name = SMB2_COMMANDS.get(cmd, f"CMD-{cmd}")
-            smb2_commands[cmd_name] += 1
+        # SMB
+        if raw.get("smb.cmd"):
+            smb1_cmds[raw["smb.cmd"]] += 1
+        if raw.get("smb2.cmd"):
+            smb2_cmds[raw["smb2.cmd"]] += 1
 
-        # ── RDP ──────────────────────────────────────────────────────────────
-        if "rdp.neg_req.selectedProtocol" in pkt:
-            proto = pkt.get("rdp.neg_req.selectedProtocol", "")
-            rdp_connections.append({
-                "src_ip": src_ip, "dst_ip": dst_ip,
-                "protocol": proto, "ts": ts,
-            })
-            timeline_events.append({
-                "ts": ts, "type": "rdp_connect",
-                "label": f"RDP: {src_ip} → {dst_ip}",
-                "detail": f"RDP connection attempt from {src_ip} to {dst_ip}",
-                "severity": "info",
-            })
+        # RDP
+        if raw.get("rdp.neg_req.selectedProtocol"):
+            rdp_count += 1
+            ctx.timeline.append(TimelineEvent(
+                ts=ts, event_type="rdp_connect",
+                src_ip=src, dst_ip=dst,
+                label=f"RDP: {src}→{dst}",
+                detail=f"RDP connection attempt {src}→{dst}",
+                severity=Severity.INFO, protocol="RDP",
+            ))
 
-        # ── Kerberos ──────────────────────────────────────────────────────────
-        if "kerberos.msg_type" in pkt:
-            msg_type = pkt.get("kerberos.msg_type", "")
-            msg_name = KERBEROS_MSG_TYPES.get(msg_type, f"Type {msg_type}")
-            kerb_msg_counts[msg_name] += 1
-            if msg_type == "30":
+        # Kerberos
+        ktype = raw.get("kerberos.msg_type", "")
+        if ktype:
+            _knames = {"10": "AS-REQ", "11": "AS-REP", "12": "TGS-REQ", "13": "TGS-REP",
+                       "14": "AP-REQ", "15": "AP-REP", "30": "KRB-ERROR"}
+            kerb_types[_knames.get(ktype, f"Type{ktype}")] += 1
+            if ktype == "30":
                 kerb_errors += 1
 
-        # ── LDAP ─────────────────────────────────────────────────────────────
-        if "ldap.requestName" in pkt:
-            ldap_requests.append({
-                "src_ip": src_ip, "dst_ip": dst_ip,
-                "request": pkt.get("ldap.requestName", ""), "ts": ts,
-            })
+        # LDAP
+        if raw.get("ldap.requestName"):
+            ldap_count += 1
 
-        # ── SIP ───────────────────────────────────────────────────────────────
-        if "sip.Method" in pkt:
-            sip_methods[pkt.get("sip.Method", "")] += 1
-        if "sip.Status-Code" in pkt:
-            sip_status[pkt.get("sip.Status-Code", "")] += 1
+        # NTP
+        nmode = raw.get("ntp.mode", "")
+        if nmode:
+            ntp_modes[nmode] += 1
 
-        # ── NTP ───────────────────────────────────────────────────────────────
-        if "ntp.mode" in pkt:
-            ntp_modes[pkt.get("ntp.mode", "")] += 1
-        if "ntp.stratum" in pkt:
-            ntp_strata[pkt.get("ntp.stratum", "")] += 1
+        # SNMP
+        sver = raw.get("snmp.version", "")
+        if sver:
+            snmp_versions[sver] += 1
+            if sver in ("0", "1"):   # v1, v2c
+                snmp_insecure += 1
 
-        # ── SNMP ──────────────────────────────────────────────────────────────
-        if "snmp.version" in pkt:
-            ver = pkt.get("snmp.version", "")
-            snmp_versions[ver] += 1
-            if ver in ("0", "1"):   # v1 or v2c (community string in plaintext)
-                snmp_v1_v2_count += 1
+        # QUIC
+        qver = raw.get("quic.version", "")
+        if qver:
+            quic_versions[qver] += 1
 
-        # ── QUIC ──────────────────────────────────────────────────────────────
-        if "quic.version" in pkt:
-            quic_versions[pkt.get("quic.version", "")] += 1
+        # SIP
+        sm = raw.get("sip.Method", "")
+        if sm:
+            sip_methods[sm] += 1
+        ss = raw.get("sip.Status-Code", "")
+        if ss:
+            sip_status[ss] += 1
 
-    # ── Build issues ──────────────────────────────────────────────────────────
-    if ftp_cleartext_creds >= 2:
-        issues.append({
-            "severity": "critical", "category": "protocols",
-            "title": "FTP Credentials Transmitted in Cleartext",
-            "description": (
-                f"FTP USER/PASS commands detected — credentials are being transmitted "
-                f"in plaintext over the network. FTP has no encryption; use SFTP or FTPS instead. "
-                f"{ftp_cleartext_creds} credential-related FTP commands captured."
+    # ── Build findings ─────────────────────────────────────────────────────────
+
+    if ftp_cred_count >= 2:
+        ctx.findings.append(build_finding(
+            rule_id="PROTO-001",
+            severity=Severity.CRITICAL, confidence=Confidence.HIGH,
+            category="protocols",
+            title=f"FTP Cleartext Credentials — {ftp_cred_count} Commands",
+            description=f"{ftp_cred_count} FTP USER/PASS commands captured in plaintext.",
+            explanation=(
+                "FTP transmits credentials in the clear. Any network observer between "
+                "client and server can read usernames and passwords trivially."
             ),
-            "count": ftp_cleartext_creds,
-        })
-
-    if ssh_old_versions:
-        issues.append({
-            "severity": "critical", "category": "protocols",
-            "title": f"SSHv1 Detected — Insecure Protocol",
-            "description": (
-                f"{len(ssh_old_versions)} SSH connections using SSHv1, which is cryptographically broken "
-                "and vulnerable to man-in-the-middle attacks. All SSH should use protocol version 2."
+            possible_causes=["Legacy FTP service without encryption"],
+            recommended_actions=[
+                "Replace FTP with SFTP (SSH) or FTPS (FTP over TLS)",
+                "If FTP must remain, restrict to trusted networks only",
+            ],
+            affected_hosts=[],
+            affected_flows=[],
+            evidence=Evidence(
+                metrics={"ftp_cred_commands": ftp_cred_count,
+                         "ftp_commands": dict(ftp_commands)},
             ),
-            "count": len(ssh_old_versions),
-        })
+            mitre_keys=["cleartext_creds_ftp"],
+        ))
 
-    if snmp_v1_v2_count >= 5:
-        issues.append({
-            "severity": "warning", "category": "protocols",
-            "title": f"SNMP v1/v2c in Use — Cleartext Community Strings",
-            "description": (
-                f"{snmp_v1_v2_count} SNMP packets using v1 or v2c, which transmit community strings "
-                "(essentially passwords) in plaintext. Use SNMPv3 with authentication and encryption."
+    if ssh_v1_instances:
+        ctx.findings.append(build_finding(
+            rule_id="PROTO-002",
+            severity=Severity.CRITICAL, confidence=Confidence.HIGH,
+            category="protocols",
+            title=f"SSHv1 Protocol Detected ({len(ssh_v1_instances)} sessions)",
+            description=f"{len(ssh_v1_instances)} SSH connections using broken SSHv1.",
+            explanation=(
+                "SSH protocol version 1 has known cryptographic weaknesses including "
+                "susceptibility to man-in-the-middle attacks. Only SSHv2 should be used."
             ),
-            "count": snmp_v1_v2_count,
-        })
+            possible_causes=["Unpatched legacy SSH servers or clients"],
+            recommended_actions=[
+                "Add 'Protocol 2' to /etc/ssh/sshd_config on all SSH servers",
+                "Audit and upgrade legacy SSH clients",
+            ],
+            affected_hosts=list({i["src"] for i in ssh_v1_instances} |
+                                {i["dst"] for i in ssh_v1_instances}),
+            affected_flows=[],
+            evidence=Evidence(
+                metrics={"sshv1_sessions": len(ssh_v1_instances)},
+                samples=[f"{i['src']}→{i['dst']} ({i['version']})"
+                         for i in ssh_v1_instances[:5]],
+            ),
+            mitre_keys=["ssh_v1"],
+        ))
 
-    if smtp_auth_plain >= 1:
-        issues.append({
-            "severity": "warning", "category": "protocols",
-            "title": f"SMTP Plaintext Authentication",
-            "description": (
-                f"{smtp_auth_plain} SMTP AUTH PLAIN/LOGIN commands detected. "
-                "Email credentials may be exposed if connection is not TLS-encrypted. "
-                "Verify SMTP connections use STARTTLS or SMTPS (port 465)."
+    if snmp_insecure >= 5:
+        ctx.findings.append(build_finding(
+            rule_id="PROTO-003",
+            severity=Severity.MEDIUM, confidence=Confidence.HIGH,
+            category="protocols",
+            title=f"SNMP v1/v2c — Cleartext Community Strings ({snmp_insecure} packets)",
+            description=f"{snmp_insecure} SNMP packets using v1/v2c with cleartext community strings.",
+            explanation=(
+                "SNMP v1 and v2c transmit community strings (effectively passwords) in plaintext. "
+                "Community strings can be sniffed and used to read/write MIB variables, "
+                "potentially exposing full network topology and configuration."
             ),
-            "count": smtp_auth_plain,
-        })
+            possible_causes=["Network devices using legacy SNMP configuration"],
+            recommended_actions=[
+                "Upgrade all SNMP to v3 with authPriv security level",
+                "Use strong authentication (SHA) and encryption (AES)",
+                "Restrict SNMP access to management VLANs only",
+            ],
+            affected_hosts=[],
+            affected_flows=[],
+            evidence=Evidence(metrics={"snmp_insecure_packets": snmp_insecure,
+                                       "versions": dict(snmp_versions)}),
+            mitre_keys=[],
+        ))
 
     if kerb_errors >= 10:
-        issues.append({
-            "severity": "warning", "category": "protocols",
-            "title": f"Kerberos Errors — Possible Brute Force or Misconfiguration",
-            "description": (
-                f"{kerb_errors} Kerberos KRB-ERROR messages detected. "
-                "High Kerberos error counts may indicate password spraying, brute-force attacks, "
-                "or domain authentication misconfigurations."
+        ctx.findings.append(build_finding(
+            rule_id="PROTO-004",
+            severity=Severity.MEDIUM, confidence=Confidence.LOW,
+            category="protocols",
+            title=f"Kerberos Errors — {kerb_errors} KRB-ERROR Messages",
+            description=f"{kerb_errors} Kerberos error responses detected.",
+            explanation=(
+                "High Kerberos error rates may indicate password spraying, Kerberoasting, "
+                "AS-REP roasting, or simply misconfigured accounts. "
+                "Kerberoasting (T1558.003) involves requesting TGS tickets for service "
+                "accounts to crack offline."
             ),
-            "count": kerb_errors,
-        })
+            possible_causes=[
+                "Password brute-force or spraying against domain accounts",
+                "Kerberoasting attack targeting service account SPNs",
+                "Expired or misconfigured service account credentials",
+                "Clock skew exceeding 5 minutes between DC and client",
+            ],
+            recommended_actions=[
+                "Enable AD audit logs and alert on KRB-ERROR events",
+                "Use long, random passwords for service accounts",
+                "Consider Protected Users security group for privileged accounts",
+                "Verify NTP synchronization across domain members",
+            ],
+            affected_hosts=[],
+            affected_flows=[],
+            evidence=Evidence(metrics={"krb_errors": kerb_errors,
+                                       "message_types": dict(kerb_types)}),
+            mitre_keys=["kerberoasting"],
+        ))
 
-    if len(rdp_connections) >= 20:
-        unique_srcs = len({r["src_ip"] for r in rdp_connections})
-        issues.append({
-            "severity": "warning", "category": "protocols",
-            "title": f"Excessive RDP Connection Attempts ({len(rdp_connections)})",
-            "description": (
-                f"{len(rdp_connections)} RDP connection attempts from {unique_srcs} source(s). "
-                "High RDP activity may indicate brute-force attacks or unauthorized remote access attempts."
+    if smtp_auth_plain >= 1:
+        ctx.findings.append(build_finding(
+            rule_id="PROTO-005",
+            severity=Severity.MEDIUM, confidence=Confidence.MEDIUM,
+            category="protocols",
+            title=f"SMTP Plaintext Authentication ({smtp_auth_plain} auth attempts)",
+            description=f"{smtp_auth_plain} SMTP AUTH PLAIN/LOGIN commands detected.",
+            explanation=(
+                "SMTP AUTH PLAIN and AUTH LOGIN encode credentials in base64 (not encrypted). "
+                "If the SMTP session is not TLS-protected, credentials are exposed. "
+                "Even with STARTTLS, verify the upgrade is happening."
             ),
-            "count": len(rdp_connections),
-        })
+            possible_causes=["Mail client not enforcing TLS before authentication"],
+            recommended_actions=[
+                "Enforce STARTTLS before AUTH (require_tls in Postfix)",
+                "Use SMTPS on port 465 (implicit TLS) instead of port 587",
+                "Audit mail client configurations for TLS enforcement",
+            ],
+            affected_hosts=[],
+            affected_flows=[],
+            evidence=Evidence(metrics={"smtp_auth_count": smtp_auth_plain,
+                                       "commands": dict(smtp_commands)}),
+            mitre_keys=[],
+        ))
 
-    return {
-        "icmp": {
-            "type_counts": dict(icmp_type_counts),
-            "unreachable_count": len(icmp_unreachable),
-        },
-        "arp": {
-            "requests": arp_requests,
-            "replies": arp_replies,
-            "gratuitous_count": len(gratuitous_arps),
-        },
-        "dhcp": {
-            "type_counts": dict(dhcp_type_counts),
-            "assignments": dhcp_events[:50],
-        },
-        "smtp": {
-            "command_counts": dict(smtp_commands),
-            "auth_plain_count": smtp_auth_plain,
-        },
-        "ftp": {
-            "command_counts": dict(ftp_commands),
-            "cleartext_cred_count": ftp_cleartext_creds,
-        },
-        "ssh": {
-            "version_counts": dict(ssh_versions),
-            "old_version_count": len(ssh_old_versions),
-        },
-        "smb": {
-            "smb1_commands": dict(smb_commands),
-            "smb2_commands": dict(smb2_commands),
-        },
-        "rdp": {
-            "connection_count": len(rdp_connections),
-        },
-        "kerberos": {
-            "message_counts": dict(kerb_msg_counts),
-            "error_count": kerb_errors,
-        },
-        "ldap": {
-            "request_count": len(ldap_requests),
-        },
-        "sip": {
-            "method_counts": dict(sip_methods),
-            "status_counts": dict(sip_status),
-        },
-        "ntp": {
-            "mode_counts": dict(ntp_modes),
-            "strata": dict(ntp_strata),
-        },
-        "snmp": {
-            "version_counts": dict(snmp_versions),
-            "insecure_count": snmp_v1_v2_count,
-        },
-        "quic": {
-            "version_counts": dict(quic_versions),
-            "total": sum(quic_versions.values()),
-        },
-        "issues": issues,
-        "timeline_events": timeline_events[:200],
+    # Store protocol stats for serialization
+    ctx.protocol_details = {
+        "icmp": {"type_counts": dict(icmp_type_counts)},
+        "arp": {"requests": arp_requests, "replies": arp_replies, "gratuitous": gratuitous_count},
+        "dhcp": {"type_counts": dict(dhcp_type_counts), "assignments": dhcp_assignments[:50]},
+        "smtp": {"command_counts": dict(smtp_commands), "auth_plain_count": smtp_auth_plain},
+        "ftp": {"command_counts": dict(ftp_commands), "cleartext_cred_count": ftp_cred_count},
+        "ssh": {"version_counts": dict(ssh_versions), "v1_count": len(ssh_v1_instances)},
+        "smb": {"smb1_commands": dict(smb1_cmds), "smb2_commands": dict(smb2_cmds)},
+        "rdp": {"connection_count": rdp_count},
+        "kerberos": {"message_counts": dict(kerb_types), "error_count": kerb_errors},
+        "ldap": {"request_count": ldap_count},
+        "ntp": {"mode_counts": dict(ntp_modes)},
+        "snmp": {"version_counts": dict(snmp_versions), "insecure_count": snmp_insecure},
+        "quic": {"version_counts": dict(quic_versions), "total": sum(quic_versions.values())},
+        "sip": {"method_counts": dict(sip_methods), "status_counts": dict(sip_status)},
     }
