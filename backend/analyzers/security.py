@@ -1,460 +1,663 @@
 """
-Security anomaly detector — port scans, ARP spoofing, SYN/ICMP floods,
-C2 beaconing (jitter-based), and lateral movement detection.
-Operates on normalized PacketRecord and FlowRecord models.
+Security analyzer — detects network-layer attacks by inspecting
+ctx.packets (List[PacketRecord]) and ctx.flows (Dict[str, FlowRecord]).
+
+Detects:
+  SCAN-001  Port scan (per source IP, >= 20 unique ports via SYN)
+  ARP-001   ARP spoofing (same IP → multiple MAC addresses)
+  DOS-001   SYN flood (>= 200 SYNs from one source, no ACK)
+  DOS-002   ICMP flood (>= 100 echo requests from one source)
+  C2-001    C2 beaconing (internal→external, >= 8 SYNs, CoV <= 15%, 5s–3600s intervals)
+  LAT-001   Lateral movement (internal→internal SYN to sensitive ports, >= 5 attempts)
+
+Timeline events: port scan detected, ARP spoof detected, C2 beacon detected.
+Stats stored in ctx.security_stats.
 """
 from __future__ import annotations
-import math
-import ipaddress
-from collections import defaultdict
-from typing import Dict, List, Set, Tuple
 
+import math
+from collections import defaultdict
+from typing import Dict, List, Set, Tuple, Any
+
+from detection.engine import build_finding, _is_private
+from detection.rules import load_rules, get_threshold
 from models import (
     CaptureContext, Evidence, Severity, Confidence, TimelineEvent,
 )
-from detection.engine import build_finding, _is_private
-from detection.rules import load_rules, get_threshold
 
-_SENSITIVE_PORT_NAMES: Dict[int, str] = {
-    22: "SSH", 23: "Telnet", 135: "RPC", 139: "NetBIOS",
-    445: "SMB", 3389: "RDP", 5985: "WinRM-HTTP", 5986: "WinRM-HTTPS",
-    1433: "MSSQL", 3306: "MySQL", 5432: "PostgreSQL",
-    6379: "Redis", 27017: "MongoDB", 5900: "VNC",
+# ── Sensitive port definitions ────────────────────────────────────────────────
+_SENSITIVE_PORTS: Set[int] = {
+    22, 23, 135, 139, 445, 3389, 5985, 5986,
+    1433, 3306, 5432, 6379, 27017, 5900,
+}
+_PORT_NAMES: Dict[int, str] = {
+    22:    "SSH",
+    23:    "Telnet",
+    135:   "RPC",
+    139:   "NetBIOS",
+    445:   "SMB",
+    3389:  "RDP",
+    5985:  "WinRM-HTTP",
+    5986:  "WinRM-HTTPS",
+    1433:  "MSSQL",
+    3306:  "MySQL",
+    5432:  "PostgreSQL",
+    6379:  "Redis",
+    27017: "MongoDB",
+    5900:  "VNC",
 }
 
 
 def _cov(values: List[float]) -> float:
-    """Coefficient of variation."""
-    if len(values) < 2:
-        return 1.0
-    mean = sum(values) / len(values)
-    if mean == 0:
-        return 1.0
-    var = sum((x - mean) ** 2 for x in values) / len(values)
-    return math.sqrt(var) / mean
+    """Coefficient of variation (population std / mean).  Returns inf for degenerate inputs."""
+    n = len(values)
+    if n < 2:
+        return float("inf")
+    mean = sum(values) / n
+    if mean == 0.0:
+        return float("inf")
+    variance = sum((x - mean) ** 2 for x in values) / n
+    return math.sqrt(variance) / mean
 
 
 def analyze(ctx: CaptureContext) -> None:
     config = load_rules()
 
-    # Aggregation structures
-    # Port scan: src_ip → set of (dst_ip, dst_port) contacted via SYN
-    src_port_contacts: Dict[str, Set[Tuple[str, int]]] = defaultdict(set)
-    # ARP: ip → set of MACs
-    arp_ip_macs: Dict[str, Set[str]] = defaultdict(set)
-    # SYN flood: src_ip → syn count
-    syn_counts: Dict[str, int] = defaultdict(int)
-    # ICMP flood: src_ip → echo req count
-    icmp_echo_counts: Dict[str, int] = defaultdict(int)
-    # Beaconing: (src, dst) → sorted syn timestamps
-    beacon_ts: Dict[str, List[float]] = defaultdict(list)
-    # Lateral movement: list of (src, dst, port, ts)
-    lateral: List[Dict] = []
+    # ── Configurable thresholds (with hard-coded defaults) ────────────────────
+    min_ports_scan   = get_threshold(config, "SCAN-001", "min_unique_ports",  20)
+    min_syns_flood   = get_threshold(config, "DOS-001",  "min_syns_per_src",  200)
+    min_icmp_flood   = get_threshold(config, "DOS-002",  "min_echo_requests", 100)
+    min_beacon_conns = get_threshold(config, "C2-001",   "min_connections",   8)
+    max_beacon_jitter= get_threshold(config, "C2-001",   "max_jitter",        0.15)
+    min_beacon_iv    = get_threshold(config, "C2-001",   "min_interval_sec",  5)
+    max_beacon_iv    = get_threshold(config, "C2-001",   "max_interval_sec",  3600)
+    min_lat_attempts = get_threshold(config, "LAT-001",  "min_attempts",      5)
+    cfg_sens_ports   = get_threshold(config, "LAT-001",  "sensitive_ports",   None)
+    sensitive_ports: Set[int] = set(cfg_sens_ports) if cfg_sens_ports else _SENSITIVE_PORTS
 
-    sensitive_ports: Set[int] = set(get_threshold(config, "LAT-001", "sensitive_ports",
-                                                   list(_SENSITIVE_PORT_NAMES.keys())))
+    # ── Per-packet aggregation structures ─────────────────────────────────────
+
+    # SCAN-001: src_ip → {dst_port: first_syn_pkt_num}
+    scan_ports: Dict[str, Dict[int, int]] = defaultdict(dict)
+
+    # ARP-001: arp_sender_ip → {mac_address}
+    arp_ip_macs: Dict[str, Set[str]] = defaultdict(set)
+    # ARP-001: arp_sender_ip → first pkt num seen
+    arp_first_pkt: Dict[str, int] = {}
+
+    # DOS-001: src_ip → [pkt_num, ...]   (pure SYNs, no ACK)
+    syn_flood_pkts: Dict[str, List[int]] = defaultdict(list)
+
+    # DOS-002: src_ip → [pkt_num, ...]   (ICMP echo request type=8)
+    icmp_flood_pkts: Dict[str, List[int]] = defaultdict(list)
+
+    # C2-001: (src_ip, dst_ip) → [(ts, pkt_num), ...]   internal→external SYNs
+    beacon_data: Dict[Tuple[str, str], List[Tuple[float, int]]] = defaultdict(list)
+
+    # LAT-001: src_ip → {(dst_ip, dst_port): [pkt_num, ...]}
+    lat_data: Dict[str, Dict[Tuple[str, int], List[int]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
 
     for pkt in ctx.packets:
-        src, dst = pkt.src_ip, pkt.dst_ip
+        src = pkt.src_ip
+        dst = pkt.dst_ip
         if not src or not dst:
             continue
 
-        # ARP spoofing
+        # ── ARP spoofing ──────────────────────────────────────────────────────
         if pkt.has_arp:
-            sender_ip = pkt.extras.get("arp.src.proto_ipv4", "")
-            sender_mac = pkt.extras.get("arp.src.hw_mac", "")
+            sender_ip  = pkt.extras.get("arp.src.proto_ipv4", "") or src
+            sender_mac = pkt.extras.get("arp.src.hw_mac", "").lower()
             if sender_ip and sender_mac:
-                arp_ip_macs[sender_ip].add(sender_mac.lower())
+                arp_ip_macs[sender_ip].add(sender_mac)
+                if sender_ip not in arp_first_pkt:
+                    arp_first_pkt[sender_ip] = pkt.num
 
-        # TCP SYN-based detections
-        if pkt.tcp_flags_syn and not pkt.tcp_flags_ack:
-            syn_counts[src] += 1
-            dst_port = pkt.dst_port
-            src_port_contacts[src].add((dst, dst_port))
+        # ── TCP SYN (no ACK) — covers scan, flood, beacon, lateral ───────────
+        if pkt.ip_proto == 6 and pkt.tcp_flags_syn and not pkt.tcp_flags_ack:
+            # SCAN-001: record first pkt per dst_port for this source
+            if pkt.dst_port > 0 and pkt.dst_port not in scan_ports[src]:
+                scan_ports[src][pkt.dst_port] = pkt.num
 
-            # C2 beaconing tracking (internal → external only)
-            if _is_private(src) and not _is_private(dst):
-                flow_key = f"{src}→{dst}"
-                beacon_ts[flow_key].append(pkt.ts)
+            # DOS-001: accumulate all SYN packets per source
+            syn_flood_pkts[src].append(pkt.num)
 
-            # Lateral movement
-            if _is_private(src) and _is_private(dst) and dst_port in sensitive_ports:
-                lateral.append({"src": src, "dst": dst, "port": dst_port, "ts": pkt.ts})
+            src_priv = _is_private(src)
+            dst_priv = _is_private(dst)
 
-        # ICMP echo request flood
-        if pkt.has_icmp and pkt.extras.get("icmp.type") == "8":
-            icmp_echo_counts[src] += 1
+            # C2-001: internal → external
+            if src_priv and not dst_priv:
+                beacon_data[(src, dst)].append((pkt.ts, pkt.num))
 
-    # ── Port scan ─────────────────────────────────────────────────────────────
-    min_ports = get_threshold(config, "SCAN-001", "min_unique_ports", 20)
-    critical_ports = get_threshold(config, "SCAN-001", "critical_at", 100)
-    scanners = []
-    for src, contacts in src_port_contacts.items():
-        if len(contacts) >= min_ports:
-            unique_dsts = len({c[0] for c in contacts})
-            unique_ports = len({c[1] for c in contacts})
-            scanners.append({
-                "src_ip": src,
-                "unique_ports": unique_ports,
-                "unique_targets": unique_dsts,
-                "contacts": contacts,
-            })
-    scanners.sort(key=lambda x: -x["unique_ports"])
+            # LAT-001: internal → internal on sensitive port
+            if src_priv and dst_priv and pkt.dst_port in sensitive_ports:
+                lat_data[src][(dst, pkt.dst_port)].append(pkt.num)
 
-    if scanners:
-        top = scanners[0]
-        sev = Severity.CRITICAL if top["unique_ports"] >= critical_ports else Severity.HIGH
-        # First few packet numbers for evidence
-        ev_pkts = [
-            pkt.num for pkt in ctx.packets
-            if pkt.src_ip == top["src_ip"] and pkt.tcp_flags_syn
-               and not pkt.tcp_flags_ack
-        ][:20]
+        # ── ICMP echo request (type 8) ────────────────────────────────────────
+        if pkt.has_icmp and pkt.ip_proto == 1 and pkt.extras.get("icmp.type") == "8":
+            icmp_flood_pkts[src].append(pkt.num)
+
+    # =========================================================================
+    # SCAN-001: Port scan — emit one finding per scanning source IP
+    # =========================================================================
+    scanners_summary: List[Dict[str, Any]] = []
+
+    for src_ip, port_map in scan_ports.items():
+        if len(port_map) < min_ports_scan:
+            continue
+
+        sorted_ports   = sorted(port_map.keys())
+        # packet_nums of first SYN to each port (ordered by port number)
+        ev_pkts        = [port_map[p] for p in sorted_ports]
+        sample_strs    = [f"{src_ip}:{p}" for p in sorted_ports[:20]]
+
+        # Determine earliest timestamp for timeline
+        pkt_set        = set(ev_pkts[:20])
+        first_ts       = min(
+            (pkt.ts for pkt in ctx.packets if pkt.num in pkt_set),
+            default=0.0,
+        )
+
+        sev = (
+            Severity.CRITICAL
+            if len(port_map) >= get_threshold(config, "SCAN-001", "critical_at", 100)
+            else Severity.HIGH
+        )
+
+        ctx.timeline.append(TimelineEvent(
+            ts=first_ts,
+            event_type="port_scan_detected",
+            src_ip=src_ip,
+            dst_ip="",
+            label=f"Port scan from {src_ip} ({len(port_map)} ports)",
+            detail=f"First 10 ports: {', '.join(str(p) for p in sorted_ports[:10])}",
+            severity=sev,
+            packet_num=ev_pkts[0] if ev_pkts else 0,
+            protocol="TCP",
+        ))
+
         ctx.findings.append(build_finding(
             rule_id="SCAN-001",
-            severity=sev, confidence=Confidence.HIGH,
+            severity=sev,
+            confidence=Confidence.HIGH,
             category="reconnaissance",
-            title=f"Port Scan Detected — {len(scanners)} Scanner(s)",
+            title=f"Port Scan Detected from {src_ip} ({len(port_map)} unique ports)",
             description=(
-                f"{len(scanners)} source(s) contacted an unusually high number of ports. "
-                f"Top: {top['src_ip']} probed {top['unique_ports']} unique ports "
-                f"across {top['unique_targets']} target(s)."
+                f"Source {src_ip} contacted {len(port_map)} unique destination port(s) "
+                "via TCP SYN packets, indicating automated port scanning."
             ),
             explanation=(
-                "A host contacting many ports in rapid succession is performing automated "
-                "port scanning. Scanners map open services for subsequent exploitation. "
-                f"{top['src_ip']} is the most active scanner by port count. "
-                "This is a strong indicator of network reconnaissance."
+                "A host contacting a large number of distinct TCP ports in rapid succession "
+                "is performing automated port scanning. Port scans are used to enumerate "
+                "open services on target hosts, typically as a precursor to exploitation. "
+                f"{src_ip} sent SYN packets to {len(port_map)} unique ports across the "
+                "observed capture window."
             ),
             possible_causes=[
-                "Unauthorized network reconnaissance (external attacker)",
-                "Internal security scanner (Nmap, Nessus) — verify authorization",
-                "Compromised internal host performing lateral reconnaissance",
-                "Automated vulnerability scanner or worm",
+                "Unauthorized network reconnaissance (external attacker or compromised host)",
+                "Automated network scanner: nmap, masscan, zmap",
+                "Authorized internal vulnerability assessment — verify scheduling",
+                "Worm or automated malware performing self-propagation discovery",
             ],
             recommended_actions=[
-                "Identify if the source IP is an authorized scanner",
-                "Block unauthorized scanning sources at firewall",
-                "Deploy IDS/IPS rules for port scan detection (Snort/Suricata)",
-                "Investigate source host for compromise if internal",
+                "Verify whether a scheduled and authorized scan is in progress",
+                "Block the source IP at the perimeter firewall if unauthorized",
+                "Review firewall logs for the full scope of scanning activity",
+                "Correlate with HTTP/TLS findings for follow-on exploitation evidence",
+                "Alert SOC for immediate investigation if unauthorized",
             ],
-            affected_hosts=[top["src_ip"]],
+            affected_hosts=[src_ip],
             affected_flows=[],
             evidence=Evidence(
+                packet_nums=ev_pkts[:50],
+                host_ips=[src_ip],
+                time_first=first_ts,
                 metrics={
-                    "scanner_count": len(scanners),
-                    "top_scanner": top["src_ip"],
-                    "unique_ports": top["unique_ports"],
-                    "unique_targets": top["unique_targets"],
+                    "unique_ports_contacted": len(port_map),
+                    "port_range_min":         sorted_ports[0],
+                    "port_range_max":         sorted_ports[-1],
+                    "threshold":              min_ports_scan,
                 },
-                samples=[f"{top['src_ip']} → port {p}" for _, p in list(top["contacts"])[:10]],
-                packet_nums=ev_pkts,
-                host_ips=[s["src_ip"] for s in scanners[:5]],
+                samples=sample_strs[:20],
             ),
-            mitre_keys=["port_scan"],
-        ))
-        ctx.timeline.append(TimelineEvent(
-            ts=0.0, event_type="port_scan",
-            src_ip=top["src_ip"], dst_ip="",
-            label=f"Port Scan: {top['src_ip']} ({top['unique_ports']} ports)",
-            detail=f"{top['src_ip']} probed {top['unique_ports']} ports on {top['unique_targets']} targets",
-            severity=sev, protocol="TCP",
+            mitre_keys=["reconnaissance", "active-scanning", "network-service-discovery"],
+            tags=["scan", "port-scan", "tcp", "reconnaissance"],
         ))
 
-    # ── ARP spoofing ──────────────────────────────────────────────────────────
-    arp_spoof = {ip: macs for ip, macs in arp_ip_macs.items() if len(macs) > 1}
-    if arp_spoof:
-        spoofed_list = [f"{ip} → {', '.join(macs)}" for ip, macs in list(arp_spoof.items())[:5]]
+        scanners_summary.append({
+            "src_ip":        src_ip,
+            "unique_ports":  len(port_map),
+        })
+
+    # =========================================================================
+    # ARP-001: ARP spoofing — one finding per conflicted IP address
+    # =========================================================================
+    arp_spoof_summary: List[Dict[str, Any]] = []
+
+    for ip_addr, macs in arp_ip_macs.items():
+        if len(macs) < 2:
+            continue
+
+        mac_list   = sorted(macs)
+        first_pkt  = arp_first_pkt.get(ip_addr, 0)
+        # collect all ARP packet nums for this IP
+        arp_pkts   = [
+            pkt.num for pkt in ctx.packets
+            if pkt.has_arp
+            and (pkt.extras.get("arp.src.proto_ipv4", "") or pkt.src_ip) == ip_addr
+        ]
+        first_ts   = next(
+            (pkt.ts for pkt in ctx.packets if pkt.num == first_pkt),
+            0.0,
+        )
+
+        ctx.timeline.append(TimelineEvent(
+            ts=first_ts,
+            event_type="arp_spoof_detected",
+            src_ip=ip_addr,
+            dst_ip="",
+            label=f"ARP spoofing: {ip_addr} has {len(macs)} MACs",
+            detail=f"MACs: {', '.join(mac_list)}",
+            severity=Severity.HIGH,
+            packet_num=first_pkt,
+            protocol="ARP",
+        ))
+
         ctx.findings.append(build_finding(
             rule_id="ARP-001",
-            severity=Severity.CRITICAL, confidence=Confidence.HIGH,
-            category="network",
-            title=f"ARP Cache Poisoning — {len(arp_spoof)} IP(s) with Multiple MACs",
+            severity=Severity.HIGH,
+            confidence=Confidence.HIGH,
+            category="network-attack",
+            title=f"ARP Spoofing Detected: {ip_addr} claims {len(macs)} MAC Addresses",
             description=(
-                f"{len(arp_spoof)} IP address(es) advertised with multiple MAC addresses: "
-                f"{'; '.join(spoofed_list[:3])}."
+                f"IP address {ip_addr} was observed with {len(macs)} distinct hardware "
+                f"(MAC) addresses in ARP traffic: {', '.join(mac_list)}."
             ),
             explanation=(
-                "ARP cache poisoning (ARP spoofing) occurs when an attacker sends gratuitous "
-                "ARP replies associating their MAC address with another host's IP. "
-                "Victims update their ARP caches and send traffic to the attacker, "
-                "enabling man-in-the-middle interception of all LAN traffic to that IP. "
-                "This is the mechanism behind SSLstrip, credential harvesting, and session hijacking."
+                "ARP spoofing (ARP cache poisoning) occurs when an attacker sends forged "
+                "ARP replies associating their MAC address with a legitimate IP. Victims "
+                "update their caches and forward traffic to the attacker, enabling MitM "
+                "interception, session hijacking, and credential capture. Observing "
+                "multiple distinct MACs for a single IP is the primary detection signal."
             ),
             possible_causes=[
-                "Active ARP cache poisoning / MITM attack on the LAN",
-                "Legitimate VRRP/HSRP gateway failover (verify with timestamps)",
-                "MAC address change after NIC replacement (check timing)",
+                "Active ARP poisoning attack (arpspoof, bettercap, ettercap)",
+                "Man-in-the-middle attack targeting LAN traffic",
+                "Legitimate VRRP/HSRP gateway failover (verify against topology)",
+                "NIC replacement or virtual machine MAC address change",
+                "Duplicate IP address misconfiguration",
             ],
             recommended_actions=[
                 "Enable Dynamic ARP Inspection (DAI) on managed switches",
-                "Implement 802.1X port authentication to prevent rogue devices",
-                "Deploy ARP monitoring tools (arpwatch) for alerting",
-                "Segment network to limit ARP broadcast domains",
+                "Verify the network topology to rule out legitimate failover",
+                "Identify the legitimate MAC for the IP and block the rogue MAC at the switch",
+                "Capture and inspect traffic through the suspected MitM host",
+                "Deploy arpwatch or equivalent ARP monitoring for ongoing alerting",
             ],
-            affected_hosts=list(arp_spoof.keys()),
+            affected_hosts=[ip_addr],
             affected_flows=[],
             evidence=Evidence(
-                metrics={"poisoned_ip_count": len(arp_spoof)},
-                samples=spoofed_list,
-                host_ips=list(arp_spoof.keys())[:10],
+                packet_nums=arp_pkts[:50],
+                host_ips=[ip_addr],
+                time_first=first_ts,
+                metrics={
+                    "ip_address": ip_addr,
+                    "mac_count":  len(macs),
+                },
+                samples=[f"{ip_addr} → MAC: {mac}" for mac in mac_list],
             ),
-            mitre_keys=["arp_spoofing"],
+            mitre_keys=["credential-access", "adversary-in-the-middle", "arp-cache-poisoning"],
+            tags=["arp", "spoofing", "mitm", "layer2"],
         ))
-        for ip in list(arp_spoof.keys())[:3]:
-            ctx.timeline.append(TimelineEvent(
-                ts=0.0, event_type="arp_spoof",
-                src_ip=ip, dst_ip="",
-                label=f"ARP Spoofing: {ip}",
-                detail=f"{ip} seen with MACs: {', '.join(list(arp_spoof[ip])[:3])}",
-                severity=Severity.CRITICAL, protocol="ARP",
-            ))
 
-    # ── SYN flood ─────────────────────────────────────────────────────────────
-    min_syns = get_threshold(config, "DOS-001", "min_syns_per_src", 200)
-    syn_floods = {ip: c for ip, c in syn_counts.items() if c >= min_syns}
-    if syn_floods:
-        top_syn = sorted(syn_floods.items(), key=lambda x: -x[1])
+        arp_spoof_summary.append({"ip": ip_addr, "macs": mac_list})
+
+    # =========================================================================
+    # DOS-001: SYN flood — one finding per flooding source
+    # =========================================================================
+    syn_flood_summary: List[Dict[str, Any]] = []
+
+    for src_ip, pkt_list in syn_flood_pkts.items():
+        if len(pkt_list) < min_syns_flood:
+            continue
+
+        pkt_set  = set(pkt_list[:200])
+        ts_vals  = [pkt.ts for pkt in ctx.packets if pkt.num in pkt_set]
+
         ctx.findings.append(build_finding(
             rule_id="DOS-001",
-            severity=Severity.CRITICAL, confidence=Confidence.HIGH,
-            category="dos",
-            title=f"SYN Flood Attack — {sum(syn_floods.values())} SYNs from {len(syn_floods)} Source(s)",
+            severity=Severity.CRITICAL,
+            confidence=Confidence.HIGH,
+            category="denial-of-service",
+            title=f"SYN Flood from {src_ip} ({len(pkt_list)} SYN packets)",
             description=(
-                f"{len(syn_floods)} source(s) sent excessive TCP SYN packets. "
-                f"Top: {top_syn[0][0]} sent {top_syn[0][1]} SYNs."
+                f"Source {src_ip} sent {len(pkt_list)} TCP SYN packets without "
+                "completing the three-way handshake, consistent with a SYN flood DoS attack."
             ),
             explanation=(
-                "A SYN flood is a denial-of-service attack where the attacker sends a large "
-                "number of SYN packets without completing handshakes. Each half-open connection "
-                "consumes kernel memory in the connection table until timeout. "
-                "Sufficient volume exhausts the table, refusing new legitimate connections."
+                "A SYN flood exhausts the target's TCP connection backlog by sending "
+                "large volumes of SYN packets and never completing handshakes. Each "
+                "half-open connection consumes kernel memory until the SYN timeout "
+                "expires. Sufficient volume prevents legitimate clients from connecting."
             ),
             possible_causes=[
-                "External SYN flood DoS attack against public-facing server",
-                "Spoofed-source SYN flood amplification",
-                "Internal compromised host participating in DDoS botnet",
+                "Deliberate TCP SYN flood denial-of-service attack",
+                "Botnet coordinating a volumetric DoS campaign",
+                "Spoofed-source SYN packets amplifying the effective rate",
+                "Network scanner issuing rapid SYNs (possible false positive)",
             ],
             recommended_actions=[
-                "Enable TCP SYN cookies: sysctl -w net.ipv4.tcp_syncookies=1",
-                "Rate-limit new connection SYN packets per source IP at firewall",
-                "Reduce tcp_synack_retries: sysctl -w net.ipv4.tcp_synack_retries=2",
-                "Consider upstream DDoS mitigation service (Cloudflare, Akamai)",
+                "Enable TCP SYN cookies on affected servers",
+                "Rate-limit new TCP SYN packets per source IP at the firewall",
+                "Reduce tcp_synack_retries to limit half-open connection lifetime",
+                "Engage upstream provider or DDoS mitigation service if external",
+                "Monitor server connection table utilization and response times",
             ],
-            affected_hosts=[ip for ip, _ in top_syn[:5]],
+            affected_hosts=[src_ip],
             affected_flows=[],
             evidence=Evidence(
+                packet_nums=pkt_list[:50],
+                host_ips=[src_ip],
+                time_first=min(ts_vals) if ts_vals else 0.0,
+                time_last=max(ts_vals) if ts_vals else 0.0,
                 metrics={
-                    "syn_flood_sources": len(syn_floods),
-                    "total_syn_packets": sum(syn_floods.values()),
-                    "top_sources": {ip: c for ip, c in top_syn[:5]},
+                    "syn_packet_count": len(pkt_list),
+                    "threshold":        min_syns_flood,
                 },
-                host_ips=[ip for ip, _ in top_syn[:5]],
+                samples=[f"SYN from {src_ip} pkt#{n}" for n in pkt_list[:10]],
             ),
-            mitre_keys=["dos_syn_flood"],
+            mitre_keys=["impact", "network-denial-of-service", "direct-network-flood"],
+            tags=["dos", "syn-flood", "tcp", "denial-of-service"],
         ))
 
-    # ── ICMP flood ────────────────────────────────────────────────────────────
-    min_icmp = get_threshold(config, "DOS-002", "min_echo_requests", 100)
-    icmp_floods = {ip: c for ip, c in icmp_echo_counts.items() if c >= min_icmp}
-    if icmp_floods:
-        top_icmp = sorted(icmp_floods.items(), key=lambda x: -x[1])
+        syn_flood_summary.append({"src_ip": src_ip, "count": len(pkt_list)})
+
+    # =========================================================================
+    # DOS-002: ICMP echo flood — one finding per flooding source
+    # =========================================================================
+    icmp_flood_summary: List[Dict[str, Any]] = []
+
+    for src_ip, pkt_list in icmp_flood_pkts.items():
+        if len(pkt_list) < min_icmp_flood:
+            continue
+
+        pkt_set  = set(pkt_list[:200])
+        ts_vals  = [pkt.ts for pkt in ctx.packets if pkt.num in pkt_set]
+
         ctx.findings.append(build_finding(
             rule_id="DOS-002",
-            severity=Severity.HIGH, confidence=Confidence.HIGH,
-            category="dos",
-            title=f"ICMP Flood — {sum(icmp_floods.values())} Echo Requests",
+            severity=Severity.HIGH,
+            confidence=Confidence.HIGH,
+            category="denial-of-service",
+            title=f"ICMP Echo Flood from {src_ip} ({len(pkt_list)} echo requests)",
             description=(
-                f"{len(icmp_floods)} source(s) sent excessive ICMP Echo Requests. "
-                f"Top: {top_icmp[0][0]} sent {top_icmp[0][1]} pings."
+                f"Source {src_ip} sent {len(pkt_list)} ICMP echo (ping) requests, "
+                "consistent with an ICMP flood denial-of-service attack."
             ),
             explanation=(
-                "A ping flood sends ICMP Echo Requests faster than the target can process. "
-                "This consumes both bandwidth and CPU on the target. "
-                "High volumes can also indicate ICMP-based network discovery sweeps."
+                "An ICMP flood sends a high volume of echo request packets to saturate "
+                "the target's bandwidth or CPU. High-rate ICMP floods can degrade or "
+                "completely deny service by consuming all available network or processing "
+                "resources on the target host. Very high rates may also indicate a smurf "
+                "amplification attack using broadcast addresses."
             ),
             possible_causes=[
-                "Ping flood DoS attack against target",
-                "Network discovery sweep (ping sweep across subnet)",
-                "Monitoring system with excessive check intervals",
+                "Ping flood / ICMP DoS attack targeting network availability",
+                "Smurf attack exploiting broadcast amplification",
+                "Misconfigured monitoring system with excessive polling rate",
+                "Network discovery sweep (ping sweep) across a subnet",
             ],
             recommended_actions=[
-                "Rate-limit ICMP at border firewall",
-                "Block ICMP Echo from untrusted sources if not operationally required",
-                "For internal sweeps, verify authorization",
+                "Rate-limit or block inbound ICMP echo requests at the firewall",
+                "Verify whether the source is an authorized monitoring system",
+                "Enable ICMP rate limiting on the target host OS",
+                "Contact upstream provider for traffic filtering if attack is external",
             ],
-            affected_hosts=[ip for ip, _ in top_icmp[:5]],
+            affected_hosts=[src_ip],
             affected_flows=[],
             evidence=Evidence(
-                metrics={"icmp_flood_sources": len(icmp_floods),
-                         "total_echo_requests": sum(icmp_floods.values())},
-                host_ips=[ip for ip, _ in top_icmp[:5]],
+                packet_nums=pkt_list[:50],
+                host_ips=[src_ip],
+                time_first=min(ts_vals) if ts_vals else 0.0,
+                time_last=max(ts_vals) if ts_vals else 0.0,
+                metrics={
+                    "icmp_echo_count": len(pkt_list),
+                    "threshold":       min_icmp_flood,
+                },
+                samples=[f"ICMP echo from {src_ip} pkt#{n}" for n in pkt_list[:10]],
             ),
-            mitre_keys=["dos_icmp_flood"],
+            mitre_keys=["impact", "network-denial-of-service", "direct-network-flood"],
+            tags=["dos", "icmp-flood", "icmp", "denial-of-service"],
         ))
 
-    # ── C2 beaconing ──────────────────────────────────────────────────────────
-    min_conns = get_threshold(config, "C2-001", "min_connections", 8)
-    max_jitter = get_threshold(config, "C2-001", "max_jitter", 0.15)
-    min_interval = get_threshold(config, "C2-001", "min_interval_sec", 5)
-    max_interval = get_threshold(config, "C2-001", "max_interval_sec", 3600)
+        icmp_flood_summary.append({"src_ip": src_ip, "count": len(pkt_list)})
 
-    beacon_suspects = []
-    for flow_key, timestamps in beacon_ts.items():
-        if len(timestamps) < min_conns:
+    # =========================================================================
+    # C2-001: C2 beaconing — one finding per (src_ip, dst_ip) pair
+    # =========================================================================
+    beacon_summary: List[Dict[str, Any]] = []
+
+    for (src_ip, dst_ip), entries in beacon_data.items():
+        if len(entries) < min_beacon_conns:
             continue
-        timestamps_sorted = sorted(timestamps)
-        intervals = [timestamps_sorted[i+1] - timestamps_sorted[i]
-                     for i in range(len(timestamps_sorted)-1)]
-        intervals = [x for x in intervals if min_interval <= x <= max_interval]
-        if len(intervals) < min_conns - 1:
+
+        # Sort by timestamp and extract parallel lists
+        entries_sorted  = sorted(entries, key=lambda e: e[0])
+        timestamps      = [e[0] for e in entries_sorted]
+        pkt_nums        = [e[1] for e in entries_sorted]
+
+        # Compute inter-connection intervals
+        intervals = [
+            timestamps[i + 1] - timestamps[i]
+            for i in range(len(timestamps) - 1)
+        ]
+
+        # Filter to beacon-range intervals only
+        valid_iv = [
+            iv for iv in intervals
+            if min_beacon_iv <= iv <= max_beacon_iv
+        ]
+        if len(valid_iv) < min_beacon_conns - 1:
             continue
-        mean_interval = sum(intervals) / len(intervals)
-        jitter = _cov(intervals)
-        if jitter <= max_jitter:
-            src, dst = flow_key.split("→")
-            beacon_suspects.append({
-                "src_ip": src, "dst_ip": dst,
-                "interval_sec": round(mean_interval, 1),
-                "jitter": round(jitter, 3),
-                "connection_count": len(timestamps),
-                "first_ts": timestamps_sorted[0],
-                "last_ts": timestamps_sorted[-1],
-            })
 
-    beacon_suspects.sort(key=lambda x: x["jitter"])
+        jitter       = _cov(valid_iv)
+        if jitter > max_beacon_jitter:
+            continue
 
-    if beacon_suspects:
-        top = beacon_suspects[0]
+        avg_interval = sum(valid_iv) / len(valid_iv)
+        conn_count   = len(timestamps)
+
+        ctx.timeline.append(TimelineEvent(
+            ts=timestamps[0],
+            event_type="c2_beacon_detected",
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            label=f"C2 beaconing: {src_ip} → {dst_ip}",
+            detail=(
+                f"connections={conn_count} "
+                f"interval={avg_interval:.1f}s "
+                f"jitter={jitter:.3f}"
+            ),
+            severity=Severity.CRITICAL,
+            packet_num=pkt_nums[0],
+            protocol="TCP",
+        ))
+
         ctx.findings.append(build_finding(
             rule_id="C2-001",
-            severity=Severity.CRITICAL, confidence=Confidence.MEDIUM,
-            category="c2",
-            title=f"C2 Beaconing Suspected — {len(beacon_suspects)} Regular Flow(s)",
+            severity=Severity.CRITICAL,
+            confidence=Confidence.MEDIUM,
+            category="command-and-control",
+            title=(
+                f"C2 Beaconing: {src_ip} → {dst_ip} "
+                f"(~{avg_interval:.0f}s interval, {jitter:.1%} jitter)"
+            ),
             description=(
-                f"{len(beacon_suspects)} flow(s) show highly regular connection intervals. "
-                f"Most regular: {top['src_ip']} → {top['dst_ip']} "
-                f"every ~{top['interval_sec']}s (jitter={top['jitter']*100:.1f}%, "
-                f"{top['connection_count']} connections)."
+                f"Internal host {src_ip} made {conn_count} periodic TCP connections "
+                f"to external host {dst_ip} with an average interval of "
+                f"{avg_interval:.1f}s and a coefficient of variation of {jitter:.3f} "
+                f"(threshold ≤ {max_beacon_jitter}), indicating automated C2 beaconing."
             ),
             explanation=(
-                "Command & Control (C2) implants typically beacon home at regular intervals "
-                "to receive commands or exfiltrate data. Unlike human traffic, C2 beacons "
-                "show extremely low variance in connection timing (jitter < 15%). "
-                f"The flow {top['src_ip']} → {top['dst_ip']} has only "
-                f"{top['jitter']*100:.1f}% jitter over {top['connection_count']} connections — "
-                "consistent with automated C2 callback behavior."
+                "Command-and-control implants beacon to their C2 servers at regular "
+                "intervals to check for tasking or exfiltrate data. Unlike human-driven "
+                "traffic, beaconing exhibits very low timing variance. A coefficient of "
+                "variation (std/mean of inter-connection intervals) below 15% over at "
+                "least 8 connections is a reliable statistical indicator of automated "
+                "beacon behavior."
             ),
             possible_causes=[
-                "Remote Access Trojan (RAT) or implant beaconing to C2 server",
-                "Cobalt Strike, Empire, Metasploit stage-0 beaconing",
-                "Legitimate monitoring agent with fixed check interval",
-                "Scheduled task or cron job making regular network calls",
+                "Malware implant or RAT beaconing to command-and-control server",
+                "Post-exploitation framework (Cobalt Strike, Empire, Metasploit) callback",
+                "Legitimate monitoring or heartbeat agent with fixed poll interval",
+                "Scheduled task or cron job making regular network requests",
             ],
             recommended_actions=[
-                "Isolate the source host immediately for forensic investigation",
-                "Block the destination IP at perimeter firewall",
-                "Capture full session content for C2 protocol analysis",
-                "Run EDR/AV scan on source host and check for persistence",
-                "Submit destination IP to threat intelligence platforms",
+                "Immediately isolate the internal host from the network",
+                "Block the external destination IP at the perimeter firewall",
+                "Collect memory and disk forensics from the beaconing host",
+                "Identify the process responsible for the outbound connections",
+                "Submit the destination IP/domain to threat intelligence platforms",
+                "Initiate incident response and hunt for lateral movement",
             ],
-            affected_hosts=[b["src_ip"] for b in beacon_suspects[:5]],
-            affected_flows=[f"{b['src_ip']}→{b['dst_ip']}" for b in beacon_suspects[:5]],
+            affected_hosts=[src_ip, dst_ip],
+            affected_flows=[f"{src_ip}→{dst_ip}"],
             evidence=Evidence(
+                packet_nums=pkt_nums[:50],
+                host_ips=[src_ip, dst_ip],
+                time_first=timestamps[0],
+                time_last=timestamps[-1],
                 metrics={
-                    "beacon_count": len(beacon_suspects),
-                    "top_beacon_interval_sec": top["interval_sec"],
-                    "top_beacon_jitter": top["jitter"],
-                    "top_beacon_connections": top["connection_count"],
+                    "interval_sec":     round(avg_interval, 2),
+                    "jitter":           round(jitter, 4),
+                    "connection_count": conn_count,
+                    "min_interval_sec": round(min(valid_iv), 2),
+                    "max_interval_sec": round(max(valid_iv), 2),
                 },
                 samples=[
-                    f"{b['src_ip']}→{b['dst_ip']} every {b['interval_sec']}s (jitter={b['jitter']*100:.1f}%)"
-                    for b in beacon_suspects[:5]
+                    f"{src_ip} → {dst_ip} interval={iv:.1f}s"
+                    for iv in valid_iv[:10]
                 ],
-                time_first=top["first_ts"],
-                time_last=top["last_ts"],
-                host_ips=[b["src_ip"] for b in beacon_suspects[:5]],
             ),
-            mitre_keys=["c2_beaconing"],
-        ))
-        ctx.timeline.append(TimelineEvent(
-            ts=top["first_ts"], event_type="c2_beacon",
-            src_ip=top["src_ip"], dst_ip=top["dst_ip"],
-            label=f"C2 Beacon: {top['src_ip']} → {top['dst_ip']}",
-            detail=(
-                f"Regular callbacks every {top['interval_sec']}s, "
-                f"jitter={top['jitter']*100:.1f}%, {top['connection_count']} connections"
-            ),
-            severity=Severity.CRITICAL, protocol="TCP",
+            mitre_keys=["command-and-control", "application-layer-protocol"],
+            tags=["c2", "beaconing", "periodic", "malware"],
         ))
 
-    # ── Lateral movement ──────────────────────────────────────────────────────
-    min_lat = get_threshold(config, "LAT-001", "min_attempts", 5)
-    if len(lateral) >= min_lat:
-        unique_srcs = {lm["src"] for lm in lateral}
-        unique_dsts = {lm["dst"] for lm in lateral}
-        ports_used = {lm["port"] for lm in lateral}
-        port_names = [_SENSITIVE_PORT_NAMES.get(p, str(p)) for p in ports_used]
+        beacon_summary.append({
+            "src_ip":        src_ip,
+            "dst_ip":        dst_ip,
+            "interval_sec":  round(avg_interval, 2),
+            "jitter":        round(jitter, 4),
+            "connection_count": conn_count,
+        })
+
+    # =========================================================================
+    # LAT-001: Lateral movement — one finding per internal source IP
+    # =========================================================================
+    lateral_summary: List[Dict[str, Any]] = []
+
+    for src_ip, targets in lat_data.items():
+        # Count total SYN attempts across all (dst, port) pairs
+        total_attempts = sum(len(pkts) for pkts in targets.values())
+        if total_attempts < min_lat_attempts:
+            continue
+
+        all_pkt_nums  = [n for pkts in targets.values() for n in pkts]
+        unique_dsts   = list(dict.fromkeys(dst for (dst, _) in targets.keys()))
+        ports_hit     = sorted({port for (_, port) in targets.keys()})
+        port_labels   = [f"{p}/{_PORT_NAMES.get(p, str(p))}" for p in ports_hit]
+
+        # Build detailed samples: "src→dst:port(SVC) xN pkt#FIRST"
+        samples: List[str] = []
+        for (dst_ip, dst_port), pkts in sorted(
+            targets.items(), key=lambda kv: -len(kv[1])
+        )[:20]:
+            svc = _PORT_NAMES.get(dst_port, str(dst_port))
+            samples.append(
+                f"{src_ip} → {dst_ip}:{dst_port} ({svc}) x{len(pkts)} pkt#{pkts[0]}"
+            )
+
+        ts_vals = [
+            pkt.ts for pkt in ctx.packets
+            if pkt.num in set(all_pkt_nums[:200])
+        ]
+
         ctx.findings.append(build_finding(
             rule_id="LAT-001",
-            severity=Severity.CRITICAL, confidence=Confidence.MEDIUM,
-            category="lateral_movement",
-            title=f"Lateral Movement — {len(lateral)} Internal Admin Port Attempts",
+            severity=Severity.HIGH,
+            confidence=Confidence.MEDIUM,
+            category="lateral-movement",
+            title=(
+                f"Lateral Movement from {src_ip}: "
+                f"{total_attempts} attempts on "
+                f"{', '.join(port_labels[:6])}"
+            ),
             description=(
-                f"{len(unique_srcs)} internal host(s) attempted connections to "
-                f"{len(unique_dsts)} internal target(s) on sensitive ports: "
-                f"{', '.join(port_names[:5])}."
+                f"Internal host {src_ip} made {total_attempts} TCP SYN attempt(s) to "
+                f"sensitive administrative ports ({', '.join(port_labels)}) on "
+                f"{len(unique_dsts)} internal host(s), indicating possible lateral movement."
             ),
             explanation=(
-                "An attacker who has compromised an internal host typically moves laterally "
-                "by probing other internal systems via administrative protocols. "
-                "Connections from workstations or servers to SMB (445), RDP (3389), "
-                "SSH (22), or database ports on other internal hosts are a strong "
-                "indicator of post-exploitation lateral movement."
+                "Lateral movement occurs when an attacker with a foothold on one internal "
+                "host probes other internal systems via administrative protocols. Sensitive "
+                "ports such as SSH (22), RDP (3389), SMB (445), and database services "
+                "are prime pivot targets. Automated probing across multiple internal hosts "
+                "strongly suggests post-exploitation tooling or worm-like propagation."
             ),
             possible_causes=[
-                "Attacker pivoting through compromised internal host",
-                "Automated worm spreading via SMB (WannaCry, NotPetya pattern)",
-                "Penetration tester performing authorized lateral movement testing",
-                "Legitimate IT admin using bulk management scripts",
+                "Compromised internal host running automated lateral movement tooling",
+                "Ransomware or worm spreading via SMB or RDP (WannaCry, NotPetya pattern)",
+                "Post-exploitation framework performing network enumeration",
+                "Authorized internal vulnerability scan or penetration test",
+                "Misconfigured management agent generating mass connection attempts",
             ],
             recommended_actions=[
-                "Implement micro-segmentation: restrict lateral access by role",
-                "Deploy host-based firewall rules blocking admin ports between workstations",
-                "Enable Windows Firewall and audit successful/failed logon events",
-                "Review who initiated traffic from the source host(s)",
-                "Check for Pass-the-Hash or Pass-the-Ticket credential abuse",
+                "Immediately isolate the source host and perform forensic analysis",
+                "Check for successful authentications from the source on target services",
+                "Apply micro-segmentation to restrict lateral admin-port access",
+                "Rotate credentials for all services contacted from the source host",
+                "Hunt for additional compromised hosts showing similar traffic patterns",
+                "Check for Pass-the-Hash, Pass-the-Ticket, or credential dumping",
             ],
-            affected_hosts=list(unique_srcs | unique_dsts)[:10],
+            affected_hosts=[src_ip] + unique_dsts[:19],
             affected_flows=[],
             evidence=Evidence(
+                packet_nums=all_pkt_nums[:50],
+                host_ips=[src_ip] + unique_dsts[:19],
+                time_first=min(ts_vals) if ts_vals else 0.0,
+                time_last=max(ts_vals) if ts_vals else 0.0,
                 metrics={
-                    "total_attempts": len(lateral),
-                    "unique_sources": len(unique_srcs),
-                    "unique_targets": len(unique_dsts),
-                    "protocols_targeted": port_names,
+                    "total_attempts":        total_attempts,
+                    "unique_targets":        len(unique_dsts),
+                    "sensitive_ports_hit":   ports_hit,
+                    "min_attempts_threshold": min_lat_attempts,
                 },
-                samples=[
-                    f"{lm['src']} → {lm['dst']}:{lm['port']} ({_SENSITIVE_PORT_NAMES.get(lm['port'], str(lm['port']))})"
-                    for lm in lateral[:10]
-                ],
-                host_ips=list(unique_srcs)[:5],
-                time_first=min(lm["ts"] for lm in lateral),
-                time_last=max(lm["ts"] for lm in lateral),
+                samples=samples[:20],
             ),
-            mitre_keys=["lateral_movement", "smb_lateral", "rdp_lateral"],
+            mitre_keys=[
+                "lateral-movement",
+                "remote-services",
+                "network-service-discovery",
+            ],
+            tags=["lateral-movement", "smb", "rdp", "ssh", "internal-scan"],
         ))
 
-    # Store security stats
+        lateral_summary.append({
+            "src_ip":       src_ip,
+            "total_attempts": total_attempts,
+            "unique_targets": len(unique_dsts),
+            "ports":        ports_hit,
+        })
+
+    # =========================================================================
+    # Store aggregated security stats on the context
+    # =========================================================================
     ctx.security_stats = {
-        "port_scanners": [
-            {"src_ip": s["src_ip"], "unique_ports": s["unique_ports"],
-             "unique_targets": s["unique_targets"]}
-            for s in scanners[:20]
-        ],
-        "arp_spoofing": [{"ip": ip, "macs": list(macs)} for ip, macs in arp_spoof.items()],
-        "syn_flood_sources": [{"src_ip": ip, "count": c} for ip, c in sorted(syn_floods.items(), key=lambda x: -x[1])[:10]],
-        "icmp_flood_sources": [{"src_ip": ip, "count": c} for ip, c in sorted(icmp_floods.items(), key=lambda x: -x[1])[:10]],
-        "beacon_suspects": beacon_suspects[:20],
-        "lateral_movement": lateral[:50],
+        "port_scanners":     scanners_summary,
+        "arp_spoofing":      arp_spoof_summary,
+        "syn_flood_sources": syn_flood_summary,
+        "icmp_flood_sources": icmp_flood_summary,
+        "beacon_suspects":   beacon_summary,
+        "lateral_movement":  lateral_summary,
     }
