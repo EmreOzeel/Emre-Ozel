@@ -2,7 +2,7 @@ import axios from 'axios'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 120000, // 2 minutes for large PCAP uploads
+  timeout: 300000, // 5 minutes for large PCAP analysis
 })
 
 // Attach token to every request

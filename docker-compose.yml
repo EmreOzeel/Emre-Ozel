@@ -8,18 +8,17 @@ services:
     container_name: pcap-backend
     restart: unless-stopped
     environment:
-      - GIN_MODE=release
       - JWT_SECRET=${JWT_SECRET:-change-this-secret-in-production}
       - DEFAULT_USER=${DEFAULT_USER:-admin}
       - DEFAULT_PASS=${DEFAULT_PASS:-admin123}
-      - DB_PATH=/data/pcap_analyzer.db
+      - DB_PATH=/data/pcap.db
       - UPLOAD_DIR=/data/uploads
     volumes:
       - pcap-data:/data
     networks:
       - pcap-net
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
