@@ -63,7 +63,7 @@ def _finding_to_dict(f: Finding) -> Dict[str, Any]:
     }
 
 
-def _session_to_dict(s: SessionRecord) -> Dict[str, Any]:
+def _session_to_dict(s: SessionRecord, flow_story: str = "") -> Dict[str, Any]:
     return {
         "stream_id": s.stream_id,
         "src_ip": s.src_ip, "src_port": s.src_port,
@@ -78,6 +78,7 @@ def _session_to_dict(s: SessionRecord) -> Dict[str, Any]:
         "handshake_rtt_ms": round(s.handshake_rtt_ms, 3),
         "duration_sec": round(s.last_ts - s.syn_ts, 3) if s.syn_ts else 0,
         "flow_key": s.flow_key,
+        "interpretation": flow_story,
     }
 
 
@@ -206,7 +207,7 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
         "total": sum(1 for f in ctx.findings if not f.suppressed),
     }
 
-    # Build sessions list sorted by bytes
+    # Build sessions list sorted by bytes; attach flow interpretations
     sessions_sorted = sorted(
         ctx.sessions.values(),
         key=lambda s: -(s.bytes_sent + s.bytes_recv),
@@ -239,7 +240,10 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
             "duplicate_acks": sum(s.dup_acks for s in ctx.sessions.values()),
             "zero_windows": sum(s.zero_windows for s in ctx.sessions.values()),
             "out_of_order": sum(s.out_of_order for s in ctx.sessions.values()),
-            "sessions": [_session_to_dict(s) for s in sessions_sorted],
+            "sessions": [
+                _session_to_dict(s, ctx.flow_stories.get(s.flow_key, ""))
+                for s in sessions_sorted
+            ],
         },
 
         # DNS

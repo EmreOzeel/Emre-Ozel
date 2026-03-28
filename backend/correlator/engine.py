@@ -215,32 +215,221 @@ def _host_story(ctx: CaptureContext, ip: str) -> str:
     return " ".join(lines)
 
 
+# ── Well-known port → service label ──────────────────────────────────────────
+_WELL_KNOWN: Dict[int, str] = {
+    20: "FTP-data", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
+    53: "DNS", 67: "DHCP", 68: "DHCP", 80: "HTTP", 110: "POP3",
+    143: "IMAP", 179: "BGP", 443: "HTTPS", 445: "SMB", 465: "SMTPS",
+    514: "Syslog", 587: "SMTP-submission", 636: "LDAPS", 993: "IMAPS",
+    995: "POP3S", 1194: "OpenVPN", 1433: "MSSQL", 1521: "Oracle-DB",
+    3306: "MySQL", 3389: "RDP", 5060: "SIP", 5432: "PostgreSQL",
+    5900: "VNC", 5985: "WinRM-HTTP", 5986: "WinRM-HTTPS",
+    6379: "Redis", 8080: "HTTP-alt", 8443: "HTTPS-alt",
+    8888: "HTTP-alt", 9200: "Elasticsearch", 27017: "MongoDB",
+}
+
+
+def _service_label(port: int, has_tls: bool = False) -> str:
+    if port in _WELL_KNOWN:
+        return _WELL_KNOWN[port]
+    if has_tls and port in (443, 8443):
+        return "HTTPS"
+    if 1024 > port > 0:
+        return f"port/{port} (privileged)"
+    return f"port/{port}"
+
+
 def _flow_story(ctx: CaptureContext, flow_key: str) -> str:
     fl = ctx.flows.get(flow_key)
     if not fl:
         return ""
 
-    proto = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(fl.proto, str(fl.proto))
-    lines = [
-        f"{proto} flow {fl.src_ip}:{fl.src_port} → {fl.dst_ip}:{fl.dst_port}:"
-    ]
-    lines.append(
-        f"{fl.total_packets:,} packets, {_format_bytes(fl.total_bytes)}, "
-        f"duration {_format_dur(fl.duration)}."
-    )
-    if fl.retransmissions:
-        lines.append(f"{fl.retransmissions} retransmissions.")
-    if fl.avg_rtt_ms:
-        lines.append(f"Average RTT: {fl.avg_rtt_ms:.1f}ms.")
+    proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(fl.proto, f"proto/{fl.proto}")
+    svc = _service_label(fl.dst_port, fl.has_tls)
+    parts: List[str] = []
+
+    # ── What is this flow? ────────────────────────────────────────────────────
+    # Enrich with TLS context
+    tls_hs = None
     if fl.has_tls:
-        hs = next((h for h in ctx.tls_handshakes if h.stream_id == fl.tcp_stream), None)
-        if hs:
-            lines.append(
-                f"TLS encrypted to {hs.sni or 'unknown'} "
-                f"({hs.tls_version}, JA3={hs.ja3[:8] if hs.ja3 else 'N/A'})."
+        tls_hs = next((h for h in ctx.tls_handshakes if h.stream_id == fl.tcp_stream), None)
+
+    # Enrich with HTTP context
+    http_txs = [tx for tx in ctx.http_transactions if tx.stream_id == fl.tcp_stream] if fl.has_http else []
+
+    if tls_hs and tls_hs.sni:
+        dest_label = f"{tls_hs.sni} ({fl.dst_ip}:{fl.dst_port}, {tls_hs.tls_version or 'TLS'})"
+    elif http_txs:
+        host = http_txs[0].host or fl.dst_ip
+        dest_label = f"{host} ({fl.dst_ip}:{fl.dst_port}, HTTP)"
+    else:
+        dest_label = f"{fl.dst_ip}:{fl.dst_port} ({svc})"
+
+    what = (
+        f"**What:** {proto_name} connection from {fl.src_ip}:{fl.src_port} "
+        f"to {dest_label}."
+    )
+    parts.append(what)
+
+    # ── Traffic volume & direction ────────────────────────────────────────────
+    vol_parts = [
+        f"{fl.total_packets:,} packets, {_format_bytes(fl.total_bytes)} total",
+        f"duration {_format_dur(fl.duration)}",
+    ]
+    if fl.fwd_bytes and fl.rev_bytes:
+        ratio = fl.fwd_bytes / max(fl.fwd_bytes + fl.rev_bytes, 1)
+        if ratio > 0.85:
+            direction_note = "mostly upload (client → server)"
+        elif ratio < 0.15:
+            direction_note = "mostly download (server → client)"
+        else:
+            direction_note = "bidirectional"
+        vol_parts.append(direction_note)
+    if fl.avg_rtt_ms > 0:
+        vol_parts.append(f"avg RTT {fl.avg_rtt_ms:.1f}ms")
+    parts.append("Volume: " + ", ".join(vol_parts) + ".")
+
+    # ── HTTP request context ──────────────────────────────────────────────────
+    if http_txs:
+        sample = http_txs[0]
+        req_line = f"{sample.method} {sample.uri[:80]}"
+        if len(http_txs) > 1:
+            req_line += f" (+ {len(http_txs) - 1} more requests)"
+        codes = {}
+        for tx in http_txs:
+            if tx.status_code:
+                codes[tx.status_code] = codes.get(tx.status_code, 0) + 1
+        codes_str = ", ".join(f"HTTP {c} ×{n}" for c, n in sorted(codes.items()))
+        parts.append(f"HTTP: {req_line}. Responses: {codes_str or 'unknown'}.")
+
+    # ── TLS certificate / version notes ──────────────────────────────────────
+    if tls_hs:
+        tls_notes = []
+        if tls_hs.tls_version and tls_hs.tls_version in ("TLSv1", "TLSv1.1", "SSLv3"):
+            tls_notes.append(f"uses deprecated {tls_hs.tls_version}")
+        if tls_hs.cert_expired:
+            tls_notes.append("server certificate is expired")
+        if tls_hs.cert_self_signed:
+            tls_notes.append("server uses a self-signed certificate")
+        if tls_hs.cert_mismatch:
+            tls_notes.append("certificate CN does not match SNI")
+        if tls_notes:
+            parts.append("TLS issues: " + "; ".join(tls_notes) + ".")
+        elif tls_hs.cipher_suite:
+            parts.append(f"TLS cipher: {tls_hs.cipher_suite}.")
+
+    # ── Why it matters ────────────────────────────────────────────────────────
+    why_notes: List[str] = []
+
+    # Large external transfers
+    import ipaddress as _ip
+    def _is_priv(addr: str) -> bool:
+        try:
+            return _ip.ip_address(addr).is_private
+        except ValueError:
+            return False
+
+    src_priv = _is_priv(fl.src_ip)
+    dst_priv = _is_priv(fl.dst_ip)
+
+    if src_priv and not dst_priv and fl.fwd_bytes > 10 * 1024 * 1024:
+        why_notes.append(
+            f"large outbound transfer of {_format_bytes(fl.fwd_bytes)} to an external host "
+            "— monitor for data exfiltration"
+        )
+    elif not src_priv and dst_priv and fl.rev_bytes > 50 * 1024 * 1024:
+        why_notes.append(
+            f"large inbound transfer of {_format_bytes(fl.rev_bytes)} from an external host"
+        )
+
+    # Sensitive service access
+    sensitive = {22: "SSH", 23: "Telnet", 3389: "RDP", 445: "SMB",
+                 1433: "MSSQL", 3306: "MySQL", 5432: "PostgreSQL",
+                 6379: "Redis", 27017: "MongoDB", 5900: "VNC"}
+    if fl.dst_port in sensitive:
+        why_notes.append(
+            f"connection to sensitive service {sensitive[fl.dst_port]} — "
+            "verify authorization"
+        )
+
+    # High retransmission rate
+    total_pkts = fl.total_packets or 1
+    retrans_rate = fl.retransmissions / total_pkts
+    if retrans_rate > 0.10:
+        why_notes.append(
+            f"high retransmission rate ({fl.retransmissions}/{total_pkts} pkts, "
+            f"{retrans_rate*100:.0f}%) — significant packet loss on this path"
+        )
+    elif fl.retransmissions > 5:
+        why_notes.append(f"{fl.retransmissions} retransmissions — possible congestion")
+
+    if why_notes:
+        parts.append("**Why it matters:** " + "; ".join(why_notes) + ".")
+
+    # ── Root cause assessment ─────────────────────────────────────────────────
+    root_cause_parts: List[str] = []
+
+    # Classify overall behavior
+    session = next(
+        (s for s in ctx.sessions.values() if s.flow_key == flow_key), None
+    )
+    if session:
+        if session.has_syn and not session.has_synack:
+            root_cause_parts.append(
+                "The TCP handshake was never completed (SYN sent, no SYN-ACK received). "
+                "The target host may be offline, the port is filtered by a firewall, "
+                "or the service is not listening."
+            )
+        elif session.has_rst:
+            root_cause_parts.append(
+                "The connection was reset (RST). The server actively refused the connection "
+                "or an intermediate device (firewall, load balancer) terminated it."
             )
 
-    return " ".join(lines)
+    if fl.has_http and http_txs:
+        errors = [tx for tx in http_txs if tx.status_code >= 400]
+        if len(errors) == len(http_txs) and errors:
+            root_cause_parts.append(
+                f"All HTTP requests returned error codes "
+                f"({', '.join(str(tx.status_code) for tx in errors[:3])}). "
+                "The resource may not exist (404), access may be denied (403), "
+                "or the server is overloaded (5xx)."
+            )
+
+    if retrans_rate > 0.10:
+        root_cause_parts.append(
+            "High packet loss suggests network congestion, a faulty link, "
+            "a duplex mismatch, or a saturated uplink."
+        )
+
+    if tls_hs and tls_hs.cert_expired:
+        root_cause_parts.append(
+            "Expired certificate: the server's TLS certificate has passed its validity date. "
+            "This may cause client warnings and broken connections."
+        )
+
+    if not root_cause_parts:
+        # Normal flow — describe purpose
+        if fl.has_tls and tls_hs and tls_hs.sni:
+            root_cause_parts.append(
+                f"Normal encrypted session to {tls_hs.sni}. "
+                "Traffic content is not visible due to TLS encryption."
+            )
+        elif fl.has_http and http_txs:
+            root_cause_parts.append("Normal HTTP web or API traffic.")
+        elif fl.dst_port == 53:
+            root_cause_parts.append("Standard DNS resolution traffic.")
+        elif fl.dst_port in (22,):
+            root_cause_parts.append("Interactive SSH session or automated remote command.")
+        else:
+            root_cause_parts.append(
+                f"Application-layer traffic on {svc}. "
+                "No anomalies detected in packet-level metrics."
+            )
+
+    parts.append("**Root cause:** " + " ".join(root_cause_parts))
+
+    return "\n\n".join(parts)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────

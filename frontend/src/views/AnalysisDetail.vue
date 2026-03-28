@@ -144,6 +144,29 @@
               </el-table-column>
             </el-table>
           </el-card>
+
+          <!-- Flow interpretations for top flows -->
+          <el-card shadow="never" class="mt-4" v-if="Object.keys(data.flow_stories || {}).length">
+            <template #header><span class="card-title">Flow Interpretations (top flows by volume)</span></template>
+            <div class="flow-stories">
+              <el-collapse accordion>
+                <el-collapse-item
+                  v-for="(story, flowKey) in data.flow_stories"
+                  :key="flowKey"
+                  :name="flowKey"
+                >
+                  <template #title>
+                    <span class="flow-key-label">{{ flowKey }}</span>
+                  </template>
+                  <div class="flow-story-body">
+                    <div v-for="(block, bi) in story.split('\n\n')" :key="bi" class="interp-block">
+                      <span v-html="renderMarkdown(block)"></span>
+                    </div>
+                  </div>
+                </el-collapse-item>
+              </el-collapse>
+            </div>
+          </el-card>
         </el-tab-pane>
 
         <!-- ── Tab 4: Protocols ──────────────────────────────────────────── -->
@@ -316,30 +339,44 @@
             <stat-card label="Zero Windows" :value="formatNum(data.tcp?.zero_windows)" type="warning" />
           </div>
           <el-card shadow="never" class="mt-4">
-            <template #header><span class="card-title">TCP Sessions (sorted by bytes)</span></template>
-            <el-table :data="data.tcp?.sessions" size="small" stripe>
-              <el-table-column prop="stream_id" label="Stream" width="80" />
-              <el-table-column label="Source" min-width="150">
+            <template #header><span class="card-title">TCP Sessions (sorted by bytes — expand row for interpretation)</span></template>
+            <el-table :data="data.tcp?.sessions" size="small" stripe row-key="stream_id">
+              <el-table-column type="expand">
+                <template #default="{ row }">
+                  <div class="session-interpretation" v-if="row.interpretation">
+                    <div v-for="(block, bi) in row.interpretation.split('\n\n')" :key="bi" class="interp-block">
+                      <span v-html="renderMarkdown(block)"></span>
+                    </div>
+                  </div>
+                  <div class="session-interpretation" v-else style="color:#909399;font-style:italic">
+                    No interpretation available for this session.
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column prop="stream_id" label="Stream" width="75" />
+              <el-table-column label="Source" min-width="145">
                 <template #default="{ row }">{{ row.src_ip }}:{{ row.src_port }}</template>
               </el-table-column>
-              <el-table-column label="Destination" min-width="150">
+              <el-table-column label="Destination" min-width="145">
                 <template #default="{ row }">{{ row.dst_ip }}:{{ row.dst_port }}</template>
               </el-table-column>
-              <el-table-column prop="state" label="State" width="120">
+              <el-table-column prop="state" label="State" width="115">
                 <template #default="{ row }">
                   <el-tag :type="stateType(row.state)" size="small">{{ row.state }}</el-tag>
                 </template>
               </el-table-column>
               <el-table-column label="Bytes" sortable>
-                <template #default="{ row }">{{ formatBytes(row.bytes) }}</template>
+                <template #default="{ row }">{{ formatBytes((row.bytes_sent || 0) + (row.bytes_recv || 0)) }}</template>
               </el-table-column>
-              <el-table-column prop="packets" label="Pkts" width="80" sortable />
-              <el-table-column prop="retrans" label="Retrans" width="80" sortable>
+              <el-table-column label="Pkts" width="75" sortable>
+                <template #default="{ row }">{{ (row.packets_sent || 0) + (row.packets_recv || 0) }}</template>
+              </el-table-column>
+              <el-table-column prop="retransmissions" label="Retrans" width="80" sortable>
                 <template #default="{ row }">
-                  <span :class="{ 'text-danger': row.retrans > 5 }">{{ row.retrans }}</span>
+                  <span :class="{ 'text-danger': row.retransmissions > 5 }">{{ row.retransmissions }}</span>
                 </template>
               </el-table-column>
-              <el-table-column label="Duration" width="90">
+              <el-table-column label="Duration" width="85">
                 <template #default="{ row }">{{ row.duration_sec }}s</template>
               </el-table-column>
             </el-table>
@@ -368,12 +405,30 @@
                 <span class="finding-title">{{ issue.title }}</span>
                 <span class="finding-count" v-if="issue.count">× {{ formatNum(issue.count) }}</span>
               </div>
+
+              <!-- Brief description -->
               <p class="finding-desc">{{ issue.description }}</p>
+
               <!-- Score + confidence -->
               <div class="finding-meta" v-if="issue.score != null">
                 <el-tag size="small" type="danger" plain>Score {{ issue.score?.toFixed(1) }}</el-tag>
-                <el-tag size="small" plain>{{ issue.confidence }}</el-tag>
+                <el-tag size="small" plain>Confidence: {{ issue.confidence }}</el-tag>
               </div>
+
+              <!-- Full explanation (what is happening + why it matters) -->
+              <div class="finding-explanation" v-if="issue.explanation">
+                <div class="interp-label">What is happening</div>
+                <p>{{ issue.explanation }}</p>
+              </div>
+
+              <!-- Root cause / possible causes -->
+              <div class="finding-causes" v-if="issue.possible_causes?.length">
+                <div class="interp-label">Likely root causes</div>
+                <ul class="causes-list">
+                  <li v-for="(c, ci) in issue.possible_causes" :key="ci">{{ c }}</li>
+                </ul>
+              </div>
+
               <!-- MITRE ATT&CK badges -->
               <div class="mitre-badges" v-if="issue.mitre?.length">
                 <a
@@ -386,13 +441,16 @@
                   {{ m.technique_id }}: {{ m.technique_name }}
                 </a>
               </div>
+
               <!-- Evidence samples -->
               <div class="finding-evidence" v-if="issue.evidence?.samples?.length">
+                <div class="interp-label">Evidence</div>
                 <code v-for="(s, si) in issue.evidence.samples.slice(0, 5)" :key="si">{{ s }}</code>
               </div>
-              <!-- Recommendations -->
+
+              <!-- Recommended actions -->
               <div class="finding-actions" v-if="issue.recommended_actions?.length">
-                <div class="actions-label">Recommended Actions:</div>
+                <div class="actions-label">Recommended Actions</div>
                 <ul>
                   <li v-for="(act, ai) in issue.recommended_actions" :key="ai">{{ act }}</li>
                 </ul>
@@ -702,4 +760,61 @@ export default { components: { KvTable, StatCard } }
 .host-story { background: #f5f7fa; border-radius: 4px; padding: 10px 14px; }
 .story-ip { font-weight: 700; font-size: 13px; color: #409eff; }
 .host-story p { margin: 4px 0 0; font-size: 13px; color: #606266; line-height: 1.6; }
+
+/* ── Interpretation / analysis blocks ── */
+.interp-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #909399;
+  margin: 10px 0 4px;
+}
+.finding-explanation {
+  background: #f0f9ff;
+  border-left: 3px solid #409eff;
+  padding: 8px 12px;
+  border-radius: 0 4px 4px 0;
+  margin: 8px 0;
+  font-size: 13px;
+  color: #303133;
+  line-height: 1.7;
+}
+.finding-explanation p { margin: 0; }
+.finding-causes {
+  background: #fdf6ec;
+  border-left: 3px solid #e6a23c;
+  padding: 8px 12px;
+  border-radius: 0 4px 4px 0;
+  margin: 8px 0;
+}
+.causes-list { margin: 0; padding-left: 18px; font-size: 13px; color: #606266; line-height: 1.7; }
+.causes-list li { margin: 2px 0; }
+
+/* ── Session interpretation (expand row) ── */
+.session-interpretation {
+  padding: 12px 16px;
+  background: #fafafa;
+  font-size: 13px;
+  color: #303133;
+  line-height: 1.7;
+}
+.interp-block {
+  margin-bottom: 8px;
+}
+.interp-block strong { color: #303133; }
+.interp-block p { margin: 2px 0; }
+
+/* ── Flow stories (conversations tab) ── */
+.flow-stories { font-size: 13px; }
+.flow-key-label {
+  font-family: monospace;
+  font-size: 12px;
+  color: #409eff;
+}
+.flow-story-body {
+  padding: 8px 4px;
+  color: #303133;
+  line-height: 1.7;
+}
 </style>
