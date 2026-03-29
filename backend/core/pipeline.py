@@ -13,6 +13,7 @@ from profiler.host import build_profiles
 from correlator.engine import correlate
 from detection.engine import finalize
 from core.nlg import generate_executive_summary, generate_technical_summary
+from core.interpret import interpret_session, assess_capture_quality, generate_bullet_summary
 from models import (
     CaptureContext, Finding, Evidence, HostProfile,
     DnsTransaction, HttpTransaction, TlsHandshake,
@@ -63,7 +64,7 @@ def _finding_to_dict(f: Finding) -> Dict[str, Any]:
     }
 
 
-def _session_to_dict(s: SessionRecord, flow_story: str = "") -> Dict[str, Any]:
+def _session_to_dict(s: SessionRecord, interp: Dict[str, Any] = None, flow_story: str = "") -> Dict[str, Any]:
     return {
         "stream_id": s.stream_id,
         "src_ip": s.src_ip, "src_port": s.src_port,
@@ -78,7 +79,21 @@ def _session_to_dict(s: SessionRecord, flow_story: str = "") -> Dict[str, Any]:
         "handshake_rtt_ms": round(s.handshake_rtt_ms, 3),
         "duration_sec": round(s.last_ts - s.syn_ts, 3) if s.syn_ts else 0,
         "flow_key": s.flow_key,
-        "interpretation": flow_story,
+        # Rich interpretation fields
+        "protocol_guess": interp.get("protocol_guess", "") if interp else "",
+        "handshake_status": interp.get("handshake_status", "") if interp else "",
+        "handshake_label": interp.get("handshake_label", "") if interp else "",
+        "close_behavior": interp.get("close_behavior", "") if interp else "",
+        "close_label": interp.get("close_label", "") if interp else "",
+        "confidence": interp.get("confidence", "") if interp else "",
+        "confidence_note": interp.get("confidence_note", "") if interp else "",
+        "asymmetry_type": interp.get("asymmetry_type", "") if interp else "",
+        "asymmetry_note": interp.get("asymmetry_note", "") if interp else "",
+        "quality_notes": interp.get("quality_notes", []) if interp else [],
+        "interp_what": interp.get("what", "") if interp else flow_story,
+        "interp_why": interp.get("why_matters", "") if interp else "",
+        "interp_root_cause": interp.get("root_cause", "") if interp else "",
+        "interp_check_next": interp.get("check_next", []) if interp else [],
     }
 
 
@@ -196,21 +211,34 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
     ctx.executive_summary = generate_executive_summary(ctx)
     ctx.technical_summary = generate_technical_summary(ctx)
 
+    # ── 7. Interpretation layer ───────────────────────────────────────────────
+    # Per-session rich interpretations
+    session_interpretations: Dict[int, Dict] = {}
+    for sess in ctx.sessions.values():
+        session_interpretations[sess.stream_id] = interpret_session(sess, ctx)
+
+    # Capture quality assessment
+    capture_assessment = assess_capture_quality(ctx)
+
+    # Bullet summary
+    bullet_summary = generate_bullet_summary(ctx)
+
     ctx.analysis_time_sec = round(time.time() - t0, 2)
 
-    # ── 7. Serialize to JSON-safe dict ────────────────────────────────────────
+    # ── 8. Serialize to JSON-safe dict ────────────────────────────────────────
+    sev_val = lambda f: f.severity.value if hasattr(f.severity, "value") else str(f.severity)
     issue_counts = {
-        "critical": sum(1 for f in ctx.findings if f.severity == "critical" and not f.suppressed),
-        "high": sum(1 for f in ctx.findings if f.severity == "high" and not f.suppressed),
-        "medium": sum(1 for f in ctx.findings if f.severity == "medium" and not f.suppressed),
-        "warning": sum(1 for f in ctx.findings if f.severity in ("high", "medium") and not f.suppressed),
-        "total": sum(1 for f in ctx.findings if not f.suppressed),
+        "critical": sum(1 for f in ctx.findings if sev_val(f) == "critical" and not f.suppressed),
+        "high":     sum(1 for f in ctx.findings if sev_val(f) == "high" and not f.suppressed),
+        "medium":   sum(1 for f in ctx.findings if sev_val(f) == "medium" and not f.suppressed),
+        "warning":  sum(1 for f in ctx.findings if sev_val(f) in ("high", "medium") and not f.suppressed),
+        "total":    sum(1 for f in ctx.findings if not f.suppressed),
     }
 
-    # Build sessions list sorted by bytes; attach flow interpretations
+    # Sessions sorted by bytes; attach rich interpretations
     sessions_sorted = sorted(
         ctx.sessions.values(),
-        key=lambda s: -(s.bytes_sent + s.bytes_recv),
+        key=lambda s: -((s.bytes_sent or 0) + (s.bytes_recv or 0)),
     )[:200]
 
     # Top hosts by anomaly score
@@ -222,9 +250,13 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
         "packets_analyzed": ctx.packets_analyzed,
         "analysis_time_sec": ctx.analysis_time_sec,
 
+        # Interpretation layer (new)
+        "bullet_summary": bullet_summary,
+        "capture_assessment": capture_assessment,
+
         # Protocol stats
         "protocol_stats": ctx.protocol_stats,
-        "ip_endpoints": ctx.tcp_conversations[:50],   # use tshark stats for endpoints
+        "ip_endpoints": ctx.tcp_conversations[:50],
         "tcp_conversations": ctx.tcp_conversations[:50],
         "expert_info": ctx.expert_info[:50],
 
@@ -237,11 +269,16 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
                 1 for s in ctx.sessions.values()
                 if s.has_syn and not s.has_synack
             ),
+            "midstream": sum(1 for s in ctx.sessions.values() if not s.has_syn),
             "duplicate_acks": sum(s.dup_acks for s in ctx.sessions.values()),
             "zero_windows": sum(s.zero_windows for s in ctx.sessions.values()),
             "out_of_order": sum(s.out_of_order for s in ctx.sessions.values()),
             "sessions": [
-                _session_to_dict(s, ctx.flow_stories.get(s.flow_key, ""))
+                _session_to_dict(
+                    s,
+                    interp=session_interpretations.get(s.stream_id),
+                    flow_story=ctx.flow_stories.get(s.flow_key, ""),
+                )
                 for s in sessions_sorted
             ],
         },
