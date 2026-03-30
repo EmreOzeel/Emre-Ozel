@@ -100,6 +100,29 @@ PACKET_FIELDS: List[str] = [
 _FIELD_SEP = "\t"   # tab — tshark default, guaranteed to work across all versions
 
 
+def check_tshark() -> None:
+    """
+    Verify tshark is installed and functional.
+    Raises RuntimeError with install instructions if not available.
+    """
+    import shutil
+    if shutil.which("tshark") is None:
+        raise RuntimeError(
+            "tshark is required for packet analysis but was not found on this system.\n"
+            "Install it with:\n"
+            "  apt-get update && apt-get install -y tshark wireshark-common\n"
+            "Then restart the backend container."
+        )
+    result = subprocess.run(
+        ["tshark", "--version"], capture_output=True, text=True, timeout=10, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tshark is installed but failed to execute (exit code {result.returncode}).\n"
+            "Try reinstalling: apt-get install --reinstall tshark wireshark-common"
+        )
+
+
 def _run(cmd: List[str], timeout: int = 120) -> str:
     try:
         result = subprocess.run(

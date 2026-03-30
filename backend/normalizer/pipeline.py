@@ -13,7 +13,7 @@ from models import (
     DnsTransaction, HttpTransaction, TlsHandshake, TCPState,
 )
 from normalizer.tshark import (
-    get_file_info, get_protocol_hierarchy, get_ip_endpoints,
+    check_tshark, get_file_info, get_protocol_hierarchy, get_ip_endpoints,
     get_tcp_conversations, get_expert_info, get_packets,
 )
 
@@ -646,19 +646,35 @@ def _build_tls_handshakes(packets: List[PacketRecord]) -> List[TlsHandshake]:
 
 # ── Main normalization pipeline ───────────────────────────────────────────────
 
+_MAX_PACKETS = 50_000
+
+
 def normalize(pcap_path: str) -> CaptureContext:
     """
     Full normalization pipeline.
     Phase 1: tshark statistics (no limit)
     Phase 2: per-packet fields (up to 50k)
+
+    Raises RuntimeError if tshark is missing or if the file cannot be parsed.
     """
+    # ── 0. Dependency check ───────────────────────────────────────────────────
+    check_tshark()
+
     ctx = CaptureContext()
 
-    # Phase 1: statistics
+    # ── Phase 1: statistics ───────────────────────────────────────────────────
     raw_info = get_file_info(pcap_path)
+    file_total = int(raw_info.get("total_packets", 0))
+
+    if file_total == 0:
+        raise RuntimeError(
+            "tshark could not read any packets from the capture file. "
+            "The file may be empty, corrupted, or in an unsupported format."
+        )
+
     ctx.file_info = FileInfo(
         file_size_bytes=int(raw_info.get("file_size_bytes", 0)),
-        total_packets=int(raw_info.get("total_packets", 0)),
+        total_packets=file_total,
         duration_sec=float(raw_info.get("duration_sec", 0)),
         first_packet=raw_info.get("first_packet", ""),
         last_packet=raw_info.get("last_packet", ""),
@@ -674,9 +690,28 @@ def normalize(pcap_path: str) -> CaptureContext:
     ctx.tcp_conversations = get_tcp_conversations(pcap_path)
     ctx.expert_info = get_expert_info(pcap_path)
 
-    # Phase 2: per-packet (capped at 50k)
-    raw_packets = get_packets(pcap_path, max_packets=50_000)
+    # ── Phase 2: per-packet (capped at 50k) ──────────────────────────────────
+    raw_packets = get_packets(pcap_path, max_packets=_MAX_PACKETS)
     ctx.packets_analyzed = len(raw_packets)
+
+    if ctx.packets_analyzed == 0:
+        raise RuntimeError(
+            f"tshark reported {file_total:,} packets in the file but returned no parseable "
+            "packet data. This usually means all field names were rejected by this version "
+            "of tshark. Check backend logs for '[tshark] attempt' lines showing which fields "
+            "were removed."
+        )
+
+    # Packet count sanity check (only when the whole file was read, not truncated at 50k)
+    if file_total <= _MAX_PACKETS:
+        parse_ratio = ctx.packets_analyzed / file_total
+        if parse_ratio < 0.5:
+            raise RuntimeError(
+                f"Packet parsing produced inconsistent results: "
+                f"file contains {file_total:,} packets but only {ctx.packets_analyzed:,} "
+                f"({parse_ratio:.0%}) were parsed. "
+                "The capture may be truncated or the tshark field extraction failed."
+            )
 
     # Normalize each packet
     for rp in raw_packets:
