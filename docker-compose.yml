@@ -28,6 +28,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      network: host
     container_name: pcap-frontend
     restart: unless-stopped
     ports:
