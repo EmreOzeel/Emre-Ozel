@@ -246,20 +246,58 @@ def get_expert_info(path: str) -> List[Dict]:
 def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
     """
     Extract per-packet fields using tshark -T fields.
-    Returns list of dicts mapping field_name → raw_string_value.
+    Auto-detects and removes invalid field names so one bad field never
+    silences the entire capture. Returns list of dicts mapping field → value.
     """
-    cmd = [
-        "tshark", "-r", path,
-        "-c", str(max_packets),
-        "-T", "fields",
-        "-E", "separator=\t",    # tab separator — tshark default, always works
-        "-E", "occurrence=f",    # first occurrence only
-        "-E", "aggregator=|",    # multi-value separator within a field
-    ]
-    for f in PACKET_FIELDS:
-        cmd += ["-e", f]
+    fields = list(PACKET_FIELDS)
 
-    out = _run(cmd, timeout=180)
+    for attempt in range(4):
+        cmd = [
+            "tshark", "-r", path,
+            "-c", str(max_packets),
+            "-T", "fields",
+            "-E", "separator=\t",
+            "-E", "occurrence=f",
+            "-E", "aggregator=|",
+        ]
+        for f in fields:
+            cmd += ["-e", f]
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=180, check=False,
+        )
+
+        stderr = result.stderr or ""
+
+        # Parse invalid field names from tshark stderr and retry without them
+        if "aren't valid" in stderr or "are not valid" in stderr:
+            invalid: set = set()
+            in_block = False
+            for line in stderr.splitlines():
+                if "aren't valid" in line or "are not valid" in line:
+                    in_block = True
+                    continue
+                if in_block:
+                    candidate = line.strip()
+                    if not candidate:
+                        break
+                    if re.match(r'^[\w.]+$', candidate):
+                        invalid.add(candidate)
+            if invalid:
+                print(f"[tshark] attempt {attempt+1}: removing {len(invalid)} invalid fields: {sorted(invalid)}")
+                fields = [f for f in fields if f not in invalid]
+                continue  # retry with cleaned field list
+
+        # Non-zero exit without invalid-field error = root warning or other issue;
+        # stdout may still contain packet data so fall through.
+        if result.returncode != 0 and result.stdout.strip():
+            print(f"[tshark] rc={result.returncode} but stdout has data, continuing")
+
+        out = result.stdout
+        break
+    else:
+        out = ""
+
     lines = out.splitlines()
     packets = []
     for line in lines:
@@ -268,9 +306,10 @@ def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
             continue
         d: Dict[str, str] = {}
         for i, val in enumerate(values):
-            if i < len(PACKET_FIELDS) and val:
-                d[PACKET_FIELDS[i]] = val
+            if i < len(fields) and val:
+                d[fields[i]] = val
         if d:
             packets.append(d)
-    print(f"[tshark] get_packets: {len(lines)} lines → {len(packets)} parsed packets (sep=tab)")
+
+    print(f"[tshark] get_packets: {len(lines)} lines → {len(packets)} parsed packets (fields={len(fields)})")
     return packets
