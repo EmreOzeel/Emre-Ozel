@@ -132,13 +132,8 @@ const queryTypeRows = computed<KvRow[]>(() => {
   min-width: 100px;
 }
 
-.chip.warn {
-  border-color: #f0c040;
-}
-
-.chip.danger {
-  border-color: #f56c6c;
-}
+.chip.warn  { border-color: #f0c040; }
+.chip.danger { border-color: #f56c6c; }
 
 .chip-val {
   display: block;
@@ -147,13 +142,8 @@ const queryTypeRows = computed<KvRow[]>(() => {
   color: #303133;
 }
 
-.chip.warn .chip-val {
-  color: #e6a23c;
-}
-
-.chip.danger .chip-val {
-  color: #f56c6c;
-}
+.chip.warn  .chip-val { color: #e6a23c; }
+.chip.danger .chip-val { color: #f56c6c; }
 
 .chip-lbl {
   font-size: 11px;
@@ -169,9 +159,7 @@ const queryTypeRows = computed<KvRow[]>(() => {
 }
 
 @media (max-width: 900px) {
-  .grid-2 {
-    grid-template-columns: 1fr;
-  }
+  .grid-2 { grid-template-columns: 1fr; }
 }
 
 .grid-card {
@@ -188,9 +176,7 @@ const queryTypeRows = computed<KvRow[]>(() => {
   margin-bottom: 10px;
 }
 
-.warn-title {
-  color: #e6a23c;
-}
+.warn-title { color: #e6a23c; }
 
 .mono {
   font-family: monospace;

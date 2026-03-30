@@ -1,25 +1,25 @@
 <template>
   <div class="protocols-tab">
     <el-table :data="sortedProtocols" stripe size="small">
-      <el-table-column label="Protocol" min-width="120">
+      <el-table-column label="Protocol" min-width="140">
         <template #default="{ row }">
           <span class="proto-name">{{ row.name }}</span>
         </template>
       </el-table-column>
 
-      <el-table-column label="Packets" width="100" align="right">
+      <el-table-column label="Packets" width="110" align="right">
         <template #default="{ row }">
           {{ row.count.toLocaleString() }}
         </template>
       </el-table-column>
 
-      <el-table-column label="Share" width="90" align="right">
+      <el-table-column label="Percentage" width="100" align="right">
         <template #default="{ row }">
           {{ pct(row.count) }}%
         </template>
       </el-table-column>
 
-      <el-table-column label="Distribution" min-width="200">
+      <el-table-column label="Distribution" min-width="180">
         <template #default="{ row }">
           <div class="bar-track">
             <div class="bar-fill" :style="{ width: barWidth(row.count) }" />
@@ -56,8 +56,7 @@ function pct(count: number): string {
 
 function barWidth(count: number): string {
   if (!props.totalPackets) return '0%'
-  const p = Math.min((count / props.totalPackets) * 100, 100)
-  return p.toFixed(2) + '%'
+  return Math.min((count / props.totalPackets) * 100, 100).toFixed(2) + '%'
 }
 </script>
 
