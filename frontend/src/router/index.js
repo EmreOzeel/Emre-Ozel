@@ -20,7 +20,7 @@ const routes = [
       {
         path: 'analysis/:id',
         name: 'AnalysisDetail',
-        component: () => import('../views/AnalysisDetail.vue'),
+        component: () => import('../views/analysis/AnalysisDetail.vue'),
       },
       {
         path: 'history',
