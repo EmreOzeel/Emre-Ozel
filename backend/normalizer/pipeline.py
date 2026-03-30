@@ -201,10 +201,28 @@ def _build_flows(packets: List[PacketRecord]) -> Dict[str, FlowRecord]:
 
 def _build_sessions(packets: List[PacketRecord]) -> Dict[int, SessionRecord]:
     sessions: Dict[int, SessionRecord] = {}
+    # Fallback: when tcp.stream is absent, group by bidirectional 4-tuple
+    _fallback_map: Dict[str, int] = {}
+    _next_fallback = -100_000
+
     for pkt in packets:
         if pkt.tcp_stream < 0:
-            continue
-        sid = pkt.tcp_stream
+            # Only create fallback sessions for actual TCP packets
+            if pkt.ip_proto != 6:
+                continue
+            if not (pkt.src_ip and pkt.dst_ip and pkt.src_port and pkt.dst_port):
+                continue
+            # Assign a stable synthetic stream ID based on the 4-tuple
+            a = (pkt.src_ip, pkt.src_port)
+            b = (pkt.dst_ip, pkt.dst_port)
+            lo, hi = (a, b) if a <= b else (b, a)
+            fkey = f"{lo[0]}:{lo[1]}|{hi[0]}:{hi[1]}"
+            if fkey not in _fallback_map:
+                _fallback_map[fkey] = _next_fallback
+                _next_fallback -= 1
+            sid = _fallback_map[fkey]
+        else:
+            sid = pkt.tcp_stream
         if sid not in sessions:
             sessions[sid] = SessionRecord(
                 stream_id=sid,

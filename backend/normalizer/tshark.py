@@ -121,7 +121,7 @@ def get_file_info(path: str) -> Dict[str, Any]:
     patterns = {
         "total_packets": r"Number of packets:\s+(\d+)",
         "duration_sec": r"Capture duration:\s+([\d.]+)",
-        "file_size_bytes": r"File size:\s+([\d]+)",
+        "file_size_bytes": r"File size:\s+([\d,]+)",
         "first_packet": r"First packet time:\s+(.+)",
         "last_packet": r"Last packet time:\s+(.+)",
         "encapsulation": r"Data link type:\s+(.+)",

@@ -362,12 +362,45 @@ def assess_capture_quality(ctx: CaptureContext) -> Dict[str, Any]:
     total = len(sessions)
 
     if total == 0:
+        # Distinguish: (a) no TCP traffic, (b) TCP present but sessions not reconstructed
+        proto_stats = getattr(ctx, "protocol_stats", {})
+        tcp_pkts = proto_stats.get("tcp", 0)
+        udp_pkts = proto_stats.get("udp", 0)
+        icmp_pkts = proto_stats.get("icmp", 0)
+        arp_pkts = proto_stats.get("arp", 0)
+
+        if tcp_pkts > 0:
+            issue_msg = (
+                f"TCP traffic detected ({tcp_pkts:,} packets in protocol hierarchy) "
+                "but no TCP sessions could be reconstructed — tcp.stream field was absent "
+                "in all packets. Sessions have been grouped by IP 4-tuple as a fallback; "
+                "if you see 0 sessions, the capture may contain only TCP headers with no "
+                "usable port information."
+            )
+        elif udp_pkts > 0:
+            parts = [f"UDP: {udp_pkts:,} packets"]
+            if icmp_pkts:
+                parts.append(f"ICMP: {icmp_pkts:,} packets")
+            if arp_pkts:
+                parts.append(f"ARP: {arp_pkts:,} packets")
+            issue_msg = (
+                f"No TCP traffic found. Capture contains: {', '.join(parts)}. "
+                "TCP session analysis does not apply. Check the DNS and Protocol tabs "
+                "for UDP-based protocol analysis."
+            )
+        else:
+            present = [p for p in ("arp", "icmp", "eth", "ip") if proto_stats.get(p, 0) > 0]
+            issue_msg = (
+                "No TCP or UDP sessions found. Capture appears to contain only "
+                + (f"{', '.join(present).upper()} traffic." if present else "non-IP or empty traffic.")
+            )
+
         return {
             "quality": "unknown",
-            "quality_label": "Unknown",
-            "issues": ["No TCP sessions found. Capture may be non-TCP traffic or empty."],
+            "quality_label": "Unknown — No TCP Sessions",
+            "issues": [issue_msg],
             "reliable": [],
-            "low_confidence": ["All TCP-based conclusions"],
+            "low_confidence": ["All TCP-based conclusions — no sessions to analyze"],
             "inferred": [],
             "observed": ["Raw packet fields (IP headers, timestamps, byte counts)"],
             "midstream_count": 0,
@@ -535,6 +568,29 @@ def generate_bullet_summary(ctx: CaptureContext) -> List[str]:
             f"Capture contains {fi.total_packets:,} packets "
             f"({_fmt_bytes(fi.file_size_bytes)})."
         )
+
+    # Protocol presence summary when no TCP sessions
+    if not sessions:
+        proto_stats = getattr(ctx, "protocol_stats", {})
+        tcp_pkts = proto_stats.get("tcp", 0)
+        udp_pkts = proto_stats.get("udp", 0)
+        icmp_pkts = proto_stats.get("icmp", 0)
+        arp_pkts = proto_stats.get("arp", 0)
+        if tcp_pkts > 0:
+            bullets.append(
+                f"TCP traffic present ({tcp_pkts:,} packets) but no sessions could be "
+                "reconstructed from the capture — tcp.stream field was absent in all packets."
+            )
+        elif udp_pkts > 0:
+            bullets.append(
+                f"No TCP sessions found. Capture is UDP-dominant ({udp_pkts:,} packets). "
+                "TCP session analysis does not apply to this capture."
+            )
+        elif icmp_pkts or arp_pkts:
+            bullets.append(
+                f"No TCP/UDP sessions found. Capture contains ICMP/ARP traffic only "
+                f"({icmp_pkts:,} ICMP, {arp_pkts:,} ARP packets)."
+            )
 
     # Dominant flow
     if sessions:
