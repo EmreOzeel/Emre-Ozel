@@ -1,21 +1,17 @@
 FROM python:3.11-slim
 
-# Install tshark + capinfos (wireshark-common)
-RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections && \
-    apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        tshark \
-        wireshark-common \
-    && rm -rf /var/lib/apt/lists/*
-
-# Allow tshark to run as non-root (tshark binary is setuid via dpkg-statoverride)
-RUN dpkg-statoverride --update --add root wireshark 0750 /usr/bin/dumpcap || true
+# tshark is NOT installed at build time because apt-get often fails
+# due to network restrictions in the build environment.
+# Instead, entrypoint.sh installs it at container startup when needed.
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 8000
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
