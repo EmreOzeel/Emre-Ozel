@@ -97,7 +97,7 @@ PACKET_FIELDS: List[str] = [
     "ldap.requestName",
 ]
 
-_FIELD_SEP = "\x1f"   # unit separator (safe in network captures)
+_FIELD_SEP = "\t"   # tab — tshark default, guaranteed to work across all versions
 
 
 def _run(cmd: List[str], timeout: int = 120) -> str:
@@ -107,8 +107,11 @@ def _run(cmd: List[str], timeout: int = 120) -> str:
             capture_output=True, text=True,
             timeout=timeout, check=False,
         )
+        if result.returncode != 0 and result.stderr:
+            print(f"[tshark] cmd={cmd[0]} rc={result.returncode} stderr={result.stderr[:200]}")
         return result.stdout
     except subprocess.TimeoutExpired:
+        print(f"[tshark] TIMEOUT: {' '.join(cmd[:4])}")
         return ""
     except FileNotFoundError:
         raise RuntimeError("tshark not found. Install wireshark-cli.")
@@ -147,13 +150,23 @@ def get_file_info(path: str) -> Dict[str, Any]:
 
 
 def get_protocol_hierarchy(path: str) -> Dict[str, int]:
-    """Parse tshark -z io,phs output into {protocol: frame_count}."""
+    """Parse tshark -z io,phs output into {protocol: frame_count}.
+    Handles both tshark output formats:
+      Old: '  tcp  1234  123456 bytes'
+      New: '  tcp  frames:1234 bytes:123456'
+    """
     out = _run(["tshark", "-q", "-z", "io,phs", "-r", path])
     result: Dict[str, int] = {}
     for line in out.splitlines():
+        # New format: "  tcp   frames:1234 bytes:..."
+        m = re.match(r"\s+([\w.]+)\s+frames:(\d+)", line)
+        if m:
+            result[m.group(1).lower()] = int(m.group(2))
+            continue
+        # Old format: "  tcp   1234   123456"
         m = re.match(r"\s+([\w.]+)\s+(\d+)\s+", line)
         if m:
-            result[m.group(1)] = int(m.group(2))
+            result[m.group(1).lower()] = int(m.group(2))
     return result
 
 
@@ -239,16 +252,17 @@ def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
         "tshark", "-r", path,
         "-c", str(max_packets),
         "-T", "fields",
-        "-E", f"separator={_FIELD_SEP}",
+        "-E", "separator=\t",    # tab separator — tshark default, always works
         "-E", "occurrence=f",    # first occurrence only
-        "-E", "aggregator=|",    # multi-value separator
+        "-E", "aggregator=|",    # multi-value separator within a field
     ]
     for f in PACKET_FIELDS:
         cmd += ["-e", f]
 
     out = _run(cmd, timeout=180)
+    lines = out.splitlines()
     packets = []
-    for line in out.splitlines():
+    for line in lines:
         values = line.split(_FIELD_SEP)
         if len(values) < 4:
             continue
@@ -258,4 +272,5 @@ def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
                 d[PACKET_FIELDS[i]] = val
         if d:
             packets.append(d)
+    print(f"[tshark] get_packets: {len(lines)} lines → {len(packets)} parsed packets (sep=tab)")
     return packets
