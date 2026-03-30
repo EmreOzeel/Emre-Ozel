@@ -5,6 +5,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      network: host
     container_name: pcap-backend
     restart: unless-stopped
     environment:

@@ -1,9 +1,8 @@
 FROM python:3.11-slim
 
 # Install tshark + capinfos (wireshark-common)
-# Pre-answer tshark debconf prompt to avoid interactive prompt blocking install
-RUN apt-get update --allow-releaseinfo-change && \
-    echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections && \
+RUN echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections && \
+    apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         tshark \
         wireshark-common \
