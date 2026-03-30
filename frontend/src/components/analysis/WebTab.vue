@@ -151,13 +151,8 @@ function statusClass(code: string): string {
   min-width: 110px;
 }
 
-.chip.warn {
-  border-color: #f0c040;
-}
-
-.chip.danger {
-  border-color: #f56c6c;
-}
+.chip.warn  { border-color: #f0c040; }
+.chip.danger { border-color: #f56c6c; }
 
 .chip-val {
   display: block;
@@ -166,13 +161,8 @@ function statusClass(code: string): string {
   color: #303133;
 }
 
-.chip.warn .chip-val {
-  color: #e6a23c;
-}
-
-.chip.danger .chip-val {
-  color: #f56c6c;
-}
+.chip.warn  .chip-val { color: #e6a23c; }
+.chip.danger .chip-val { color: #f56c6c; }
 
 .chip-lbl {
   font-size: 11px;
@@ -188,9 +178,7 @@ function statusClass(code: string): string {
 }
 
 @media (max-width: 900px) {
-  .grid-2 {
-    grid-template-columns: 1fr;
-  }
+  .grid-2 { grid-template-columns: 1fr; }
 }
 
 .grid-card {
@@ -200,9 +188,7 @@ function statusClass(code: string): string {
   padding: 14px;
 }
 
-.grid-full {
-  grid-column: 1 / -1;
-}
+.grid-full { grid-column: 1 / -1; }
 
 .card-title {
   font-size: 13px;
@@ -211,31 +197,10 @@ function statusClass(code: string): string {
   margin-bottom: 10px;
 }
 
-.mono {
-  font-family: monospace;
-  font-size: 12px;
-}
+.mono { font-family: monospace; font-size: 12px; }
+.uri-cell, .ua-cell { word-break: break-all; }
 
-.uri-cell,
-.ua-cell {
-  word-break: break-all;
-}
-
-.status-ok {
-  font-family: monospace;
-  font-weight: 600;
-  color: #67c23a;
-}
-
-.status-4xx {
-  font-family: monospace;
-  font-weight: 600;
-  color: #e6a23c;
-}
-
-.status-5xx {
-  font-family: monospace;
-  font-weight: 600;
-  color: #f56c6c;
-}
+.status-ok  { font-family: monospace; font-weight: 600; color: #67c23a; }
+.status-4xx { font-family: monospace; font-weight: 600; color: #e6a23c; }
+.status-5xx { font-family: monospace; font-weight: 600; color: #f56c6c; }
 </style>

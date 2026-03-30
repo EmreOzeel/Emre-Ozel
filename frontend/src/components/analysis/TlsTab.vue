@@ -23,7 +23,7 @@
         </div>
       </div>
 
-      <!-- Deprecated TLS warning -->
+      <!-- Deprecated TLS warning alert -->
       <el-alert
         v-if="tls.deprecated_count > 0"
         type="warning"
@@ -31,8 +31,8 @@
         show-icon
       >
         <template #title>
-          {{ tls.deprecated_count }} connection{{ tls.deprecated_count === 1 ? '' : 's' }} use deprecated TLS (1.0/1.1).
-          These provide insufficient encryption.
+          {{ tls.deprecated_count }} connection{{ tls.deprecated_count === 1 ? '' : 's' }}
+          use deprecated TLS (1.0/1.1). These provide insufficient encryption.
         </template>
       </el-alert>
 
@@ -42,14 +42,17 @@
         <div class="grid-card">
           <div class="card-title">TLS Versions</div>
           <el-table :data="versionRows" size="small" stripe>
-            <el-table-column label="Version" min-width="140">
+            <el-table-column label="Version" min-width="160">
               <template #default="{ row }">
-                <span :class="isDeprecated(row.key) ? 'deprecated-version' : 'version-ok'">
+                <span :class="isDeprecated(row.key) ? 'version-deprecated' : 'version-ok'">
                   {{ row.key }}
                 </span>
-                <el-tag v-if="isDeprecated(row.key)" size="small" type="danger" style="margin-left:6px">
-                  Deprecated
-                </el-tag>
+                <el-tag
+                  v-if="isDeprecated(row.key)"
+                  size="small"
+                  type="danger"
+                  style="margin-left: 6px"
+                >Deprecated</el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="value" label="Streams" width="80" align="right" />
@@ -142,13 +145,8 @@ function isDeprecated(version: string): boolean {
   min-width: 110px;
 }
 
-.chip.warn {
-  border-color: #f0c040;
-}
-
-.chip.danger {
-  border-color: #f56c6c;
-}
+.chip.warn  { border-color: #f0c040; }
+.chip.danger { border-color: #f56c6c; }
 
 .chip-val {
   display: block;
@@ -157,13 +155,8 @@ function isDeprecated(version: string): boolean {
   color: #303133;
 }
 
-.chip.warn .chip-val {
-  color: #e6a23c;
-}
-
-.chip.danger .chip-val {
-  color: #f56c6c;
-}
+.chip.warn  .chip-val { color: #e6a23c; }
+.chip.danger .chip-val { color: #f56c6c; }
 
 .chip-lbl {
   font-size: 11px;
@@ -179,9 +172,7 @@ function isDeprecated(version: string): boolean {
 }
 
 @media (max-width: 900px) {
-  .grid-2 {
-    grid-template-columns: 1fr;
-  }
+  .grid-2 { grid-template-columns: 1fr; }
 }
 
 .grid-card {
@@ -198,20 +189,8 @@ function isDeprecated(version: string): boolean {
   margin-bottom: 10px;
 }
 
-.mono {
-  font-family: monospace;
-  font-size: 12px;
-}
+.mono { font-family: monospace; font-size: 12px; }
 
-.deprecated-version {
-  font-family: monospace;
-  font-weight: 600;
-  color: #f56c6c;
-}
-
-.version-ok {
-  font-family: monospace;
-  font-weight: 600;
-  color: #67c23a;
-}
+.version-deprecated { font-family: monospace; font-weight: 600; color: #f56c6c; }
+.version-ok         { font-family: monospace; font-weight: 600; color: #67c23a; }
 </style>

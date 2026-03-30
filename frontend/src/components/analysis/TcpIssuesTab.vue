@@ -83,7 +83,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="State" width="90">
+        <el-table-column label="State" width="100">
           <template #default="{ row }">
             <el-tag :type="stateType(row.state)" size="small">{{ row.state || '—' }}</el-tag>
           </template>
@@ -95,7 +95,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="Retrans" width="80" sortable :sort-method="(a, b) => a.retransmissions - b.retransmissions">
+        <el-table-column label="Retrans" width="80" sortable>
           <template #default="{ row }">
             <span :class="row.retransmissions > 5 ? 'retrans-high' : ''">
               {{ row.retransmissions || 0 }}
@@ -181,13 +181,8 @@ function fmtBytes(b: number): string {
   min-width: 90px;
 }
 
-.chip.warn {
-  border-color: #f0c040;
-}
-
-.chip.danger {
-  border-color: #f56c6c;
-}
+.chip.warn  { border-color: #f0c040; }
+.chip.danger { border-color: #f56c6c; }
 
 .chip-val {
   display: block;
@@ -196,13 +191,8 @@ function fmtBytes(b: number): string {
   color: #303133;
 }
 
-.chip.warn .chip-val {
-  color: #e6a23c;
-}
-
-.chip.danger .chip-val {
-  color: #f56c6c;
-}
+.chip.warn  .chip-val { color: #e6a23c; }
+.chip.danger .chip-val { color: #f56c6c; }
 
 .chip-lbl {
   font-size: 11px;
@@ -211,13 +201,7 @@ function fmtBytes(b: number): string {
   display: block;
 }
 
-.mono {
-  font-family: monospace;
-  font-size: 12px;
-}
+.mono { font-family: monospace; font-size: 12px; }
 
-.retrans-high {
-  color: #f56c6c;
-  font-weight: 700;
-}
+.retrans-high { color: #f56c6c; font-weight: 700; }
 </style>
