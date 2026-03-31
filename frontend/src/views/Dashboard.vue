@@ -138,6 +138,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
+import { classifyAnalysisError } from '../utils/analysisErrors'
 
 const router = useRouter()
 
@@ -219,7 +220,8 @@ async function uploadFile(file) {
             resolve()
           } else if (status === 'failed') {
             clearInterval(poller)
-            reject(new Error(statusRes.data.error || 'Analysis failed'))
+            const info = classifyAnalysisError(statusRes.data.error)
+            reject(new Error(`${info.title}: ${info.message} ${info.hint}`))
           }
         } catch (e) {
           // ignore transient poll errors

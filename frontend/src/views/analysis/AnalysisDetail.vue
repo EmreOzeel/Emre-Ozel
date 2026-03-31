@@ -9,12 +9,27 @@
     </template>
 
     <template v-else-if="analysis">
-      <!-- Header -->
+      <!-- Header always visible for any non-loading, non-network-error state -->
       <AnalysisHeader :analysis="analysis" :data="analysis.data" />
 
-      <!-- No data yet -->
+      <!-- Analysis job failed — show friendly classified error -->
+      <el-alert
+        v-if="analysisFailure"
+        type="error"
+        :title="analysisFailure.title"
+        show-icon
+        :closable="false"
+        style="margin-bottom: 16px"
+      >
+        <template #default>
+          <p style="margin: 4px 0 0">{{ analysisFailure.message }}</p>
+          <p style="margin: 6px 0 0; color: #909399; font-size: 13px">{{ analysisFailure.hint }}</p>
+        </template>
+      </el-alert>
+
+      <!-- Still running / pending with no data yet -->
       <el-empty
-        v-if="!analysis.data"
+        v-else-if="!analysis.data"
         description="Analysis is not yet complete or produced no data."
       />
 
@@ -120,9 +135,10 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAnalysisDetail } from '@/composables/useAnalysisDetail'
+import { classifyAnalysisError } from '@/utils/analysisErrors'
 
 // Components
 import AnalysisHeader      from '@/components/analysis/AnalysisHeader.vue'
@@ -150,6 +166,13 @@ const {
 } = useAnalysisDetail()
 
 onMounted(() => fetch(route.params.id as string))
+
+// When the analysis job itself failed, map the raw error to a friendly message.
+// This is separate from `error` (which is set only on network/fetch failures).
+const analysisFailure = computed(() => {
+  if (!analysis.value || analysis.value.status !== 'failed') return null
+  return classifyAnalysisError(analysis.value.error)
+})
 </script>
 
 <style scoped>

@@ -3,11 +3,14 @@ Low-level tshark CLI wrapper.
 Returns raw dicts from capinfos / tshark -z / tshark -T fields.
 Nothing above this layer touches subprocess output.
 """
+import dataclasses
+import logging
 import subprocess
 import re
-import csv
 import io
 from typing import List, Dict, Any, Optional
+
+log = logging.getLogger(__name__)
 
 
 # ── Field list extracted for every packet ─────────────────────────────────────
@@ -100,13 +103,26 @@ PACKET_FIELDS: List[str] = [
 _FIELD_SEP = "\t"   # tab — tshark default, guaranteed to work across all versions
 
 
+@dataclasses.dataclass
+class PacketParseResult:
+    """Diagnostic result returned by get_packets()."""
+    packets: List[Dict[str, str]]
+    raw_line_count: int          # total non-empty lines tshark produced
+    malformed_line_count: int    # lines with 1–3 fields (possible sep/format failure)
+    fields_used: List[str]       # final field list after any invalid-field removal
+    invalid_fields_removed: List[str]  # fields rejected by this tshark version
+    attempts: int                # extraction attempts (>1 means retry happened)
+
+
 def check_tshark() -> None:
     """
     Verify tshark is installed and functional.
+    Logs tshark binary path and version string on success.
     Raises RuntimeError with install instructions if not available.
     """
     import shutil
-    if shutil.which("tshark") is None:
+    path = shutil.which("tshark")
+    if path is None:
         raise RuntimeError(
             "tshark is required for packet analysis but was not found on this system.\n"
             "Install it with:\n"
@@ -121,6 +137,9 @@ def check_tshark() -> None:
             f"tshark is installed but failed to execute (exit code {result.returncode}).\n"
             "Try reinstalling: apt-get install --reinstall tshark wireshark-common"
         )
+    version_line = (result.stdout or "").splitlines()[0] if result.stdout else "(unknown version)"
+    log.info("[tshark] path=%s  version=%s", path, version_line)
+    print(f"[tshark] check_tshark: path={path}  version={version_line}")
 
 
 def _run(cmd: List[str], timeout: int = 120) -> str:
@@ -266,15 +285,23 @@ def get_expert_info(path: str) -> List[Dict]:
     return sorted(counts.values(), key=lambda x: -x["count"])[:50]
 
 
-def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
+def get_packets(path: str, max_packets: int = 50_000) -> PacketParseResult:
     """
     Extract per-packet fields using tshark -T fields.
     Auto-detects and removes invalid field names so one bad field never
-    silences the entire capture. Returns list of dicts mapping field → value.
+    silences the entire capture.
+
+    Returns a PacketParseResult with parsed packets plus extraction diagnostics
+    (raw line count, malformed line count, invalid fields removed, attempt count).
+    Callers should inspect these diagnostics to decide whether the extraction is
+    reliable enough to proceed with analysis.
     """
     fields = list(PACKET_FIELDS)
+    all_invalid_removed: List[str] = []
+    attempts = 0
 
     for attempt in range(4):
+        attempts = attempt + 1
         cmd = [
             "tshark", "-r", path,
             "-c", str(max_packets),
@@ -307,25 +334,33 @@ def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
                     if re.match(r'^[\w.]+$', candidate):
                         invalid.add(candidate)
             if invalid:
-                print(f"[tshark] attempt {attempt+1}: removing {len(invalid)} invalid fields: {sorted(invalid)}")
+                log.warning("[tshark] attempt %d: removing %d invalid fields: %s",
+                            attempts, len(invalid), sorted(invalid))
+                print(f"[tshark] attempt {attempts}: removing {len(invalid)} invalid fields: {sorted(invalid)}")
+                all_invalid_removed.extend(sorted(invalid))
                 fields = [f for f in fields if f not in invalid]
                 continue  # retry with cleaned field list
 
         # Non-zero exit without invalid-field error = root warning or other issue;
         # stdout may still contain packet data so fall through.
         if result.returncode != 0 and result.stdout.strip():
-            print(f"[tshark] rc={result.returncode} but stdout has data, continuing")
+            log.warning("[tshark] rc=%d but stdout has data — continuing", result.returncode)
 
         out = result.stdout
         break
     else:
         out = ""
 
-    lines = out.splitlines()
-    packets = []
+    lines = [ln for ln in out.splitlines() if ln]   # strip blank lines
+    raw_line_count = len(lines)
+    malformed_line_count = 0
+    packets: List[Dict[str, str]] = []
+
     for line in lines:
         values = line.split(_FIELD_SEP)
         if len(values) < 4:
+            # Line has too few fields — separator mismatch or tshark format change
+            malformed_line_count += 1
             continue
         d: Dict[str, str] = {}
         for i, val in enumerate(values):
@@ -334,5 +369,20 @@ def get_packets(path: str, max_packets: int = 50_000) -> List[Dict[str, str]]:
         if d:
             packets.append(d)
 
-    print(f"[tshark] get_packets: {len(lines)} lines → {len(packets)} parsed packets (fields={len(fields)})")
-    return packets
+    log.info(
+        "[tshark] get_packets: raw_lines=%d malformed=%d parsed=%d fields=%d attempts=%d invalid_removed=%s",
+        raw_line_count, malformed_line_count, len(packets), len(fields), attempts, all_invalid_removed,
+    )
+    print(
+        f"[tshark] get_packets: raw_lines={raw_line_count} malformed={malformed_line_count} "
+        f"parsed={len(packets)} fields={len(fields)} attempts={attempts}"
+    )
+
+    return PacketParseResult(
+        packets=packets,
+        raw_line_count=raw_line_count,
+        malformed_line_count=malformed_line_count,
+        fields_used=list(fields),
+        invalid_fields_removed=sorted(set(all_invalid_removed)),
+        attempts=attempts,
+    )

@@ -3,18 +3,21 @@ Normalization pipeline: raw tshark dicts → CaptureContext with typed models.
 This is the only layer that interprets raw tshark field strings.
 """
 from __future__ import annotations
+import logging
 import math
 import hashlib
 from collections import defaultdict
 from typing import Dict, List, Optional
+
+log = logging.getLogger(__name__)
 
 from models import (
     CaptureContext, FileInfo, PacketRecord, FlowRecord, SessionRecord,
     DnsTransaction, HttpTransaction, TlsHandshake, TCPState,
 )
 from normalizer.tshark import (
-    check_tshark, get_file_info, get_protocol_hierarchy, get_ip_endpoints,
-    get_tcp_conversations, get_expert_info, get_packets,
+    check_tshark, PacketParseResult, get_file_info, get_protocol_hierarchy,
+    get_ip_endpoints, get_tcp_conversations, get_expert_info, get_packets,
 )
 
 
@@ -691,30 +694,59 @@ def normalize(pcap_path: str) -> CaptureContext:
     ctx.expert_info = get_expert_info(pcap_path)
 
     # ── Phase 2: per-packet (capped at 50k) ──────────────────────────────────
-    raw_packets = get_packets(pcap_path, max_packets=_MAX_PACKETS)
-    ctx.packets_analyzed = len(raw_packets)
+    parse = get_packets(pcap_path, max_packets=_MAX_PACKETS)
+    ctx.packets_analyzed = len(parse.packets)
 
-    if ctx.packets_analyzed == 0:
-        raise RuntimeError(
-            f"tshark reported {file_total:,} packets in the file but returned no parseable "
-            "packet data. This usually means all field names were rejected by this version "
-            "of tshark. Check backend logs for '[tshark] attempt' lines showing which fields "
-            "were removed."
+    if parse.invalid_fields_removed:
+        log.warning(
+            "[normalize] %d tshark field(s) rejected by this tshark version: %s",
+            len(parse.invalid_fields_removed), parse.invalid_fields_removed,
         )
 
-    # Packet count sanity check (only when the whole file was read, not truncated at 50k)
-    if file_total <= _MAX_PACKETS:
-        parse_ratio = ctx.packets_analyzed / file_total
-        if parse_ratio < 0.5:
+    # ── Extraction reliability checks ─────────────────────────────────────────
+    #
+    # Signal 1 — zero output lines
+    #   tshark ran but produced nothing despite a non-empty file.
+    #   Almost always means all field names were rejected after 4 retries.
+    if parse.raw_line_count == 0:
+        detail = (
+            f" Rejected fields: {parse.invalid_fields_removed}."
+            if parse.invalid_fields_removed else ""
+        )
+        raise RuntimeError(
+            f"tshark reported {file_total:,} packets but produced no output after "
+            f"{parse.attempts} attempt(s).{detail} "
+            "The tshark version on this system may be incompatible with the expected field set."
+        )
+
+    # Signal 2 — high malformed-line rate
+    #   Most output lines have fewer than 4 tab-separated fields.
+    #   This happens when the field separator is not working (wrong tshark version
+    #   ignoring -E separator=\t) or when tshark error text bleeds into stdout.
+    malformed_rate = parse.malformed_line_count / parse.raw_line_count
+    if malformed_rate > 0.7:
+        raise RuntimeError(
+            f"Packet extraction is unreliable: {parse.malformed_line_count:,} of "
+            f"{parse.raw_line_count:,} output lines ({malformed_rate:.0%}) had fewer than "
+            "4 fields. The tshark field separator may not be functioning correctly on this "
+            "system. Check backend logs for details."
+        )
+
+    # Signal 3 — essential field absence
+    #   frame.number must be present in virtually every parsed packet row.
+    #   If it is missing from the majority of rows the field-to-column mapping is broken.
+    if parse.packets:
+        essential_present = sum(1 for p in parse.packets if "frame.number" in p)
+        essential_rate = essential_present / len(parse.packets)
+        if essential_rate < 0.5:
             raise RuntimeError(
-                f"Packet parsing produced inconsistent results: "
-                f"file contains {file_total:,} packets but only {ctx.packets_analyzed:,} "
-                f"({parse_ratio:.0%}) were parsed. "
-                "The capture may be truncated or the tshark field extraction failed."
+                f"Essential field 'frame.number' is absent from {1 - essential_rate:.0%} of "
+                f"{len(parse.packets):,} parsed packets. The field-to-column mapping is broken. "
+                "This is usually caused by a tshark version mismatch or a corrupt capture."
             )
 
     # Normalize each packet
-    for rp in raw_packets:
+    for rp in parse.packets:
         pkt = _normalize_packet(rp)
         if pkt:
             ctx.packets.append(pkt)
