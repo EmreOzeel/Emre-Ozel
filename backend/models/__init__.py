@@ -441,3 +441,8 @@ class CaptureContext:
     # Metadata
     packets_analyzed: int = 0
     analysis_time_sec: float = 0.0
+    # Extraction diagnostics — populated by normalizer, surfaced in API output.
+    # Keys: tshark_path, tshark_version, validation_profile, raw_line_count,
+    #       malformed_line_count, malformed_rate, essential_rate,
+    #       invalid_fields_removed, extraction_attempts, fields_used_count.
+    extraction_diagnostics: Dict[str, Any] = field(default_factory=dict)

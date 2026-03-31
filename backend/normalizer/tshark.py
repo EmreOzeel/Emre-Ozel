@@ -114,20 +114,33 @@ class PacketParseResult:
     attempts: int                # extraction attempts (>1 means retry happened)
 
 
-def check_tshark() -> None:
+_INSTALL_HINT = (
+    "Install tshark for your platform:\n"
+    "  Debian/Ubuntu:        apt-get install -y tshark\n"
+    "  RHEL / Rocky / Alma:  dnf install -y wireshark-cli\n"
+    "  Arch Linux:           pacman -S wireshark-cli\n"
+    "  macOS:                brew install wireshark\n"
+    "After installing, restart the backend."
+)
+
+
+def check_tshark() -> tuple:
     """
     Verify tshark is installed and functional.
-    Logs tshark binary path and version string on success.
-    Raises RuntimeError with install instructions if not available.
+
+    Returns:
+        (binary_path: str, version_line: str)
+
+    Logs tshark path and version on success.
+    Raises RuntimeError with distro-neutral install instructions if not found
+    or if the binary exits non-zero.
     """
     import shutil
     path = shutil.which("tshark")
     if path is None:
         raise RuntimeError(
-            "tshark is required for packet analysis but was not found on this system.\n"
-            "Install it with:\n"
-            "  apt-get update && apt-get install -y tshark wireshark-common\n"
-            "Then restart the backend container."
+            "tshark is required for packet analysis but was not found.\n"
+            + _INSTALL_HINT
         )
     result = subprocess.run(
         ["tshark", "--version"], capture_output=True, text=True, timeout=10, check=False,
@@ -135,11 +148,13 @@ def check_tshark() -> None:
     if result.returncode != 0:
         raise RuntimeError(
             f"tshark is installed but failed to execute (exit code {result.returncode}).\n"
-            "Try reinstalling: apt-get install --reinstall tshark wireshark-common"
+            "Try reinstalling tshark and restarting the backend.\n"
+            + _INSTALL_HINT
         )
     version_line = (result.stdout or "").splitlines()[0] if result.stdout else "(unknown version)"
     log.info("[tshark] path=%s  version=%s", path, version_line)
     print(f"[tshark] check_tshark: path={path}  version={version_line}")
+    return path, version_line
 
 
 def _run(cmd: List[str], timeout: int = 120) -> str:

@@ -1,6 +1,9 @@
 /**
  * Maps raw backend error strings to user-friendly messages.
  * Raw Python exceptions must never be shown directly in the UI.
+ *
+ * Install hints are distro-neutral — no package names that are specific
+ * to a single Linux distribution (e.g. wireshark-common is Debian-only).
  */
 
 export type AnalysisErrorCode =
@@ -26,17 +29,23 @@ interface ErrorPattern {
   hint: string
 }
 
+const INSTALL_HINT =
+  'Install tshark: Debian/Ubuntu: apt-get install -y tshark  |  ' +
+  'RHEL/Rocky/Alma: dnf install -y wireshark-cli  |  ' +
+  'macOS: brew install wireshark'
+
 const ERROR_PATTERNS: ErrorPattern[] = [
   {
     patterns: [
       /tshark is required/i,
       /not found on this system/i,
       /tshark not found/i,
+      /was not found/i,
     ],
     code: 'tshark_missing',
     title: 'tshark Not Installed',
-    message: 'Packet analysis requires tshark, which is not installed on the server.',
-    hint: 'Run: apt-get install -y tshark wireshark-common  — then restart the backend.',
+    message: 'Packet analysis requires tshark, which is not installed on this server.',
+    hint: INSTALL_HINT,
   },
   {
     patterns: [
@@ -44,9 +53,9 @@ const ERROR_PATTERNS: ErrorPattern[] = [
       /failed to execute/i,
     ],
     code: 'tshark_broken',
-    title: 'tshark Error',
+    title: 'tshark Execution Error',
     message: 'tshark is installed but failed to run correctly.',
-    hint: 'Try: apt-get install --reinstall tshark wireshark-common',
+    hint: 'Try reinstalling tshark and restarting the backend.',
   },
   {
     patterns: [
@@ -57,35 +66,37 @@ const ERROR_PATTERNS: ErrorPattern[] = [
     ],
     code: 'empty_capture',
     title: 'Cannot Read Capture File',
-    message: 'The capture file could not be read. It may be empty, corrupted, or in an unsupported format.',
+    message:
+      'The capture file could not be read. It may be empty, corrupted, or in an unsupported format.',
     hint: 'Verify the file is a valid .pcap or .pcapng capture and try re-exporting it.',
   },
   {
     patterns: [
       /produced no output/i,
       /no parseable packet data/i,
-      /field names were rejected/i,
       /incompatible with the expected field set/i,
     ],
     code: 'zero_output',
     title: 'Packet Extraction Failed',
-    message: 'tshark could not extract packet data from this file.',
-    hint: 'This is usually a tshark version incompatibility. Check backend logs for rejected field names.',
+    message: 'tshark ran but returned no packet data.',
+    hint:
+      'This is usually a tshark version incompatibility. ' +
+      'Check the server logs for rejected field names.',
   },
   {
     patterns: [
       /extraction is unreliable/i,
-      /malformed.*field/i,
       /field separator/i,
       /field-to-column mapping/i,
-      /essential field.*absent/i,
+      /frame\.number.*absent/i,
     ],
     code: 'unreliable_extraction',
     title: 'Unreliable Packet Extraction',
     message:
       'Packet extraction produced inconsistent results and was stopped to prevent inaccurate analysis.',
     hint:
-      'The capture may be truncated, or the tshark version on this server is not compatible with the expected field set.',
+      'The capture may be truncated, or the tshark version on this server is not ' +
+      'compatible with the field set. Check the server logs for details.',
   },
 ]
 

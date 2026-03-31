@@ -250,6 +250,10 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
         "packets_analyzed": ctx.packets_analyzed,
         "analysis_time_sec": ctx.analysis_time_sec,
 
+        # Structured extraction diagnostics — always present so downstream tools
+        # and the expert-info UI can display them without guessing.
+        "extraction_diagnostics": ctx.extraction_diagnostics,
+
         # Interpretation layer (new)
         "bullet_summary": bullet_summary,
         "capture_assessment": capture_assessment,

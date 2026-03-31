@@ -142,7 +142,8 @@ class TestNormalizeValidation:
         """Return a context-manager stack that patches all tshark calls."""
         from contextlib import ExitStack
         stack = ExitStack()
-        stack.enter_context(patch(f"{self._PATCH_BASE}.check_tshark"))
+        stack.enter_context(patch(f"{self._PATCH_BASE}.check_tshark",
+                                  return_value=("/usr/bin/tshark", "TShark 4.2.0 (test)")))
         stack.enter_context(patch(
             f"{self._PATCH_BASE}.get_file_info",
             return_value={"total_packets": file_total, "duration_sec": 1.0,
@@ -157,7 +158,8 @@ class TestNormalizeValidation:
     def test_zero_packet_file_raises(self):
         """capinfos reports 0 packets → RuntimeError about empty/corrupt file."""
         from normalizer.pipeline import normalize
-        with patch(f"{self._PATCH_BASE}.check_tshark"), \
+        with patch(f"{self._PATCH_BASE}.check_tshark",
+                   return_value=("/usr/bin/tshark", "TShark 4.2.0 (test)")), \
              patch(f"{self._PATCH_BASE}.get_file_info", return_value={"total_packets": 0}):
             with pytest.raises(RuntimeError) as exc:
                 normalize("/fake.pcap")

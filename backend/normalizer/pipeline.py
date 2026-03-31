@@ -19,6 +19,7 @@ from normalizer.tshark import (
     check_tshark, PacketParseResult, get_file_info, get_protocol_hierarchy,
     get_ip_endpoints, get_tcp_conversations, get_expert_info, get_packets,
 )
+from config.validation import get_profile, ValidationProfile
 
 
 def _i(d: dict, key: str, default: int = 0) -> int:
@@ -652,16 +653,26 @@ def _build_tls_handshakes(packets: List[PacketRecord]) -> List[TlsHandshake]:
 _MAX_PACKETS = 50_000
 
 
-def normalize(pcap_path: str) -> CaptureContext:
+def normalize(pcap_path: str, profile_name: str | None = None) -> CaptureContext:
     """
     Full normalization pipeline.
-    Phase 1: tshark statistics (no limit)
-    Phase 2: per-packet fields (up to 50k)
+    Phase 1: tshark statistics (no packet limit)
+    Phase 2: per-packet field extraction (up to 50k packets)
 
-    Raises RuntimeError if tshark is missing or if the file cannot be parsed.
+    Args:
+        pcap_path:    Path to the .pcap/.pcapng file.
+        profile_name: Validation profile — "strict", "balanced" (default), or
+                      "permissive".  Overrides the TSHARK_VALIDATION_PROFILE
+                      environment variable when provided.
+
+    Raises RuntimeError if:
+      - tshark is not installed or fails to run
+      - the capture file has zero packets
+      - extraction quality falls below profile thresholds
     """
-    # ── 0. Dependency check ───────────────────────────────────────────────────
-    check_tshark()
+    # ── 0. Dependency check + profile selection ───────────────────────────────
+    profile: ValidationProfile = get_profile(profile_name)
+    tshark_path, tshark_version = check_tshark()
 
     ctx = CaptureContext()
 
@@ -703,7 +714,39 @@ def normalize(pcap_path: str) -> CaptureContext:
             len(parse.invalid_fields_removed), parse.invalid_fields_removed,
         )
 
-    # ── Extraction reliability checks ─────────────────────────────────────────
+    # ── Compute extraction quality metrics ────────────────────────────────────
+    malformed_rate = (
+        parse.malformed_line_count / parse.raw_line_count
+        if parse.raw_line_count > 0 else 0.0
+    )
+    essential_present = sum(1 for p in parse.packets if "frame.number" in p)
+    essential_rate = essential_present / len(parse.packets) if parse.packets else 1.0
+
+    # Populate diagnostics now so they are always available (even when we raise)
+    ctx.extraction_diagnostics = {
+        "tshark_path": tshark_path,
+        "tshark_version": tshark_version,
+        "validation_profile": profile.name,
+        "raw_line_count": parse.raw_line_count,
+        "malformed_line_count": parse.malformed_line_count,
+        "malformed_rate": round(malformed_rate, 4),
+        "essential_rate": round(essential_rate, 4),
+        "invalid_fields_removed": parse.invalid_fields_removed,
+        "extraction_attempts": parse.attempts,
+        "fields_used_count": len(parse.fields_used),
+    }
+    log.info(
+        "[normalize] profile=%s raw_lines=%d malformed=%.1f%% essential=%.1f%% "
+        "invalid_removed=%d attempts=%d",
+        profile.name,
+        parse.raw_line_count,
+        malformed_rate * 100,
+        essential_rate * 100,
+        len(parse.invalid_fields_removed),
+        parse.attempts,
+    )
+
+    # ── Extraction reliability checks (thresholds from active profile) ────────
     #
     # Signal 1 — zero output lines
     #   tshark ran but produced nothing despite a non-empty file.
@@ -719,31 +762,29 @@ def normalize(pcap_path: str) -> CaptureContext:
             "The tshark version on this system may be incompatible with the expected field set."
         )
 
-    # Signal 2 — high malformed-line rate
-    #   Most output lines have fewer than 4 tab-separated fields.
-    #   This happens when the field separator is not working (wrong tshark version
-    #   ignoring -E separator=\t) or when tshark error text bleeds into stdout.
-    malformed_rate = parse.malformed_line_count / parse.raw_line_count
-    if malformed_rate > 0.7:
+    # Signal 2 — malformed-line rate exceeds profile threshold
+    #   Lines with fewer than 4 tab-separated fields indicate either a broken
+    #   field separator or tshark error text bleeding into stdout.
+    if malformed_rate > profile.max_malformed_rate:
         raise RuntimeError(
-            f"Packet extraction is unreliable: {parse.malformed_line_count:,} of "
-            f"{parse.raw_line_count:,} output lines ({malformed_rate:.0%}) had fewer than "
-            "4 fields. The tshark field separator may not be functioning correctly on this "
-            "system. Check backend logs for details."
+            f"Packet extraction is unreliable ({profile.name} profile): "
+            f"{parse.malformed_line_count:,} of {parse.raw_line_count:,} output lines "
+            f"({malformed_rate:.1%}) had fewer than 4 fields "
+            f"(threshold: {profile.max_malformed_rate:.0%}). "
+            "The tshark field separator may not be functioning correctly. "
+            "Check backend logs for details."
         )
 
-    # Signal 3 — essential field absence
-    #   frame.number must be present in virtually every parsed packet row.
-    #   If it is missing from the majority of rows the field-to-column mapping is broken.
-    if parse.packets:
-        essential_present = sum(1 for p in parse.packets if "frame.number" in p)
-        essential_rate = essential_present / len(parse.packets)
-        if essential_rate < 0.5:
-            raise RuntimeError(
-                f"Essential field 'frame.number' is absent from {1 - essential_rate:.0%} of "
-                f"{len(parse.packets):,} parsed packets. The field-to-column mapping is broken. "
-                "This is usually caused by a tshark version mismatch or a corrupt capture."
-            )
+    # Signal 3 — essential field (frame.number) absence below profile threshold
+    #   frame.number is present in every packet tshark reads.  A low rate means
+    #   the field-to-column mapping is broken.
+    if parse.packets and essential_rate < profile.min_essential_rate:
+        raise RuntimeError(
+            f"Essential field 'frame.number' is absent from "
+            f"{1 - essential_rate:.1%} of {len(parse.packets):,} parsed packets "
+            f"({profile.name} profile requires ≥{profile.min_essential_rate:.0%}). "
+            "The field-to-column mapping is broken — tshark version mismatch or corrupt capture."
+        )
 
     # Normalize each packet
     for rp in parse.packets:
