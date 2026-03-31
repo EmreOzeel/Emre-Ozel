@@ -194,6 +194,12 @@ def analyze(ctx: CaptureContext) -> None:
                 f"{src_ip} sent SYN packets to {len(port_map)} unique ports across the "
                 "observed capture window."
             ),
+            confidence_note=(
+                f"Confidence is HIGH because the signal is unambiguous: {len(port_map)} "
+                "distinct TCP SYN packets from a single source IP, each targeting a "
+                "different destination port. False positives are unlikely unless this is "
+                "an authorized scanner — verify scheduling."
+            ),
             possible_causes=[
                 "Unauthorized network reconnaissance (external attacker or compromised host)",
                 "Automated network scanner: nmap, masscan, zmap",
@@ -280,6 +286,12 @@ def analyze(ctx: CaptureContext) -> None:
                 "update their caches and forward traffic to the attacker, enabling MitM "
                 "interception, session hijacking, and credential capture. Observing "
                 "multiple distinct MACs for a single IP is the primary detection signal."
+            ),
+            confidence_note=(
+                f"Confidence is HIGH because the signal is directly observable in packet "
+                f"headers: {ip_addr} appeared with {len(macs)} different MAC addresses "
+                "in ARP replies. The only benign explanations (VRRP failover, VM migration) "
+                "can be verified against network topology."
             ),
             possible_causes=[
                 "Active ARP poisoning attack (arpspoof, bettercap, ettercap)",
@@ -506,6 +518,12 @@ def analyze(ctx: CaptureContext) -> None:
                 "variation (std/mean of inter-connection intervals) below 15% over at "
                 "least 8 connections is a reliable statistical indicator of automated "
                 "beacon behavior."
+            ),
+            confidence_note=(
+                f"Confidence is MEDIUM because the statistical pattern ({conn_count} "
+                f"connections, CoV={jitter:.3f}) is consistent with beaconing but cannot "
+                "rule out legitimate heartbeat or monitoring agents. Confirmation requires "
+                "process identification on the source host."
             ),
             possible_causes=[
                 "Malware implant or RAT beaconing to command-and-control server",

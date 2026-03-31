@@ -35,6 +35,12 @@ class HostRole(str, Enum):
     UNKNOWN = "unknown"
 
 
+class StorylineLevel(str, Enum):
+    CAPTURE = "capture"
+    HOST = "host"
+    FLOW = "flow"
+
+
 class TCPState(str, Enum):
     SYN_SENT = "syn_sent"
     ESTABLISHED = "established"
@@ -309,13 +315,19 @@ class HostProfile:
     tcp_sessions_initiated: int = 0
     tcp_sessions_accepted: int = 0
     tcp_sessions_failed: int = 0
+    # Connection quality
+    connection_success_ratio: float = 0.0   # successful / total initiated (0..1)
     # Protocol usage (protocol → frame count)
     protocols: Dict[str, int] = field(default_factory=dict)
+    # Protocol usage as percentages (protocol → %)
+    protocol_mix_pct: Dict[str, float] = field(default_factory=dict)
     # Role inference
     role: HostRole = HostRole.UNKNOWN
     is_internal: bool = False
     # Peers
     top_peers: List[Tuple[str, int]] = field(default_factory=list)   # (ip, bytes)
+    # Role of each top peer (ip → role string)
+    peer_roles: Dict[str, str] = field(default_factory=dict)
     # Timing / beaconing
     connection_timestamps: List[float] = field(default_factory=list)
     periodic_interval_sec: float = 0.0    # > 0 if periodic behavior detected
@@ -378,6 +390,8 @@ class Finding:
     title: str
     description: str
     explanation: str
+    # Why is the confidence level set to this value?  Explains signal strength.
+    confidence_note: str = ""
     possible_causes: List[str] = field(default_factory=list)
     recommended_actions: List[str] = field(default_factory=list)
     affected_hosts: List[str] = field(default_factory=list)

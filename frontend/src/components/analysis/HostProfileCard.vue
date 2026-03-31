@@ -25,6 +25,10 @@
           {{ host.tcp_sessions_failed }}
         </span>
       </div>
+      <div class="hstat" v-if="host.tcp_sessions_initiated > 0">
+        <span class="hstat-lbl">Success</span>
+        <span :style="successColor">{{ successPct }}%</span>
+      </div>
     </div>
 
     <!-- Suspicious behaviors -->
@@ -47,19 +51,35 @@
       (jitter={{ host.periodic_jitter.toFixed(2) }}) — possible beaconing
     </div>
 
-    <!-- Top peers -->
+    <!-- Top peers with roles -->
     <div class="top-peers" v-if="host.top_peers?.length">
       <div class="section-label">Top peers</div>
       <div class="peer-row" v-for="p in host.top_peers.slice(0, 4)" :key="p.ip">
         <span class="peer-ip">{{ p.ip }}</span>
+        <span class="peer-role" v-if="host.peer_roles?.[p.ip]">
+          [{{ host.peer_roles[p.ip] }}]
+        </span>
         <span class="peer-bytes">{{ fmt(p.bytes) }}</span>
       </div>
     </div>
 
-    <!-- Top protocols -->
-    <div class="protocols" v-if="Object.keys(host.protocols || {}).length">
-      <div class="section-label">Protocols</div>
-      <div class="proto-chips">
+    <!-- Protocol mix (% bars if available, else counts) -->
+    <div class="protocols" v-if="Object.keys(host.protocol_mix_pct || host.protocols || {}).length">
+      <div class="section-label">Protocol mix</div>
+      <div class="proto-bars" v-if="Object.keys(host.protocol_mix_pct || {}).length">
+        <div
+          v-for="(pct, proto) in topProtoMix"
+          :key="proto"
+          class="proto-bar-row"
+        >
+          <span class="proto-name">{{ proto }}</span>
+          <div class="bar-track">
+            <div class="bar-fill" :style="{ width: pct + '%' }"></div>
+          </div>
+          <span class="proto-pct">{{ pct }}%</span>
+        </div>
+      </div>
+      <div class="proto-chips" v-else>
         <el-tag
           v-for="(cnt, proto) in topProtocols"
           :key="proto"
@@ -84,9 +104,24 @@ const scoreColor = computed(() => {
   return '#67c23a'
 })
 
+const successPct = computed(() =>
+  Math.round((props.host.connection_success_ratio ?? 1) * 100)
+)
+const successColor = computed(() => ({
+  color: successPct.value < 50 ? '#f56c6c' : successPct.value < 80 ? '#e6a23c' : '#67c23a',
+}))
+
 const topProtocols = computed(() => {
   return Object.fromEntries(
     Object.entries(props.host.protocols || {})
+      .sort(([, a], [, b]) => (b as number) - (a as number))
+      .slice(0, 5)
+  )
+})
+
+const topProtoMix = computed(() => {
+  return Object.fromEntries(
+    Object.entries(props.host.protocol_mix_pct || {})
       .sort(([, a], [, b]) => (b as number) - (a as number))
       .slice(0, 5)
   )
@@ -130,8 +165,17 @@ function fmt(b: number): string {
 
 .top-peers, .protocols { margin-top: 8px; }
 .section-label { font-size: 11px; font-weight: 700; color: #909399; text-transform: uppercase; margin-bottom: 4px; }
-.peer-row { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+.peer-row { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 0; }
 .peer-ip { font-family: monospace; color: #409eff; }
-.peer-bytes { color: #606266; }
+.peer-role { font-size: 10px; color: #909399; }
+.peer-bytes { color: #606266; margin-left: auto; }
 .proto-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* Protocol mix bars */
+.proto-bars { display: flex; flex-direction: column; gap: 3px; }
+.proto-bar-row { display: flex; align-items: center; gap: 6px; }
+.proto-name { font-size: 11px; color: #606266; width: 50px; text-align: right; flex-shrink: 0; }
+.bar-track { flex: 1; height: 8px; background: #f0f0f0; border-radius: 4px; overflow: hidden; }
+.bar-fill { height: 100%; background: #409eff; border-radius: 4px; transition: width 0.3s; }
+.proto-pct { font-size: 11px; color: #909399; width: 36px; }
 </style>

@@ -229,6 +229,15 @@ def _detect_high_retransmission(ctx: CaptureContext) -> None:
             "also mask data exfiltration by fragmenting payloads over many "
             "retransmitted segments."
         ),
+        confidence_note=(
+            f"Confidence is {confidence.value.upper()} based on retransmission count "
+            f"({total_retrans:,} retransmissions). "
+            + (
+                "Large sample size (≥200 retransmissions) makes statistical noise unlikely."
+                if total_retrans >= 200
+                else "Moderate sample — verify with longer capture before escalating."
+            )
+        ),
         possible_causes=[
             "Network congestion or bandwidth saturation on a bottleneck link",
             "Packet loss caused by faulty cables, switches, or NICs",

@@ -22,12 +22,50 @@
       <p>{{ finding.explanation }}</p>
     </div>
 
-    <!-- Likely root causes -->
-    <div class="interp-block amber" v-if="finding.possible_causes?.length">
-      <div class="iblock-label">Likely root causes</div>
-      <ul>
-        <li v-for="(c, i) in finding.possible_causes" :key="i">{{ c }}</li>
-      </ul>
+    <!-- Confidence reasoning -->
+    <div class="interp-block slate" v-if="finding.confidence_note">
+      <div class="iblock-label">Confidence reasoning</div>
+      <p>{{ finding.confidence_note }}</p>
+    </div>
+
+    <!-- Evidence block — metrics, time window, packet refs, samples -->
+    <div class="evidence-block" v-if="hasEvidence">
+      <div class="iblock-label">Evidence</div>
+
+      <!-- Metrics table -->
+      <div class="metrics-table" v-if="evidenceMetrics.length">
+        <div class="metric-row" v-for="m in evidenceMetrics" :key="m.key">
+          <span class="metric-key">{{ m.key }}</span>
+          <span class="metric-val">{{ m.value }}</span>
+        </div>
+      </div>
+
+      <!-- Time window -->
+      <div class="evidence-meta" v-if="finding.evidence.time_first">
+        <span class="meta-badge">
+          Window: {{ fmtTs(finding.evidence.time_first) }} – {{ fmtTs(finding.evidence.time_last) }}
+        </span>
+        <span class="meta-badge" v-if="finding.evidence.packet_nums?.length">
+          {{ finding.evidence.packet_nums.length }} packet ref(s)
+        </span>
+        <span class="meta-badge" v-if="finding.evidence.flow_keys?.length">
+          {{ finding.evidence.flow_keys.length }} flow(s)
+        </span>
+      </div>
+
+      <!-- Samples -->
+      <div class="samples-row" v-if="finding.evidence.samples?.length">
+        <code v-for="(s, i) in finding.evidence.samples.slice(0, 6)" :key="i">{{ s }}</code>
+      </div>
+    </div>
+
+    <!-- Affected hosts -->
+    <div class="affected-row" v-if="finding.affected_hosts?.length">
+      <span class="iblock-label">Affected hosts:</span>
+      <el-tag
+        v-for="h in finding.affected_hosts.slice(0, 6)"
+        :key="h" size="small" type="danger" plain
+      >{{ h }}</el-tag>
     </div>
 
     <!-- MITRE ATT&CK -->
@@ -43,19 +81,12 @@
       </a>
     </div>
 
-    <!-- Evidence samples -->
-    <div class="evidence-row" v-if="finding.evidence?.samples?.length">
-      <div class="iblock-label">Evidence</div>
-      <code v-for="(s, i) in finding.evidence.samples.slice(0, 5)" :key="i">{{ s }}</code>
-    </div>
-
-    <!-- Affected hosts -->
-    <div class="affected-row" v-if="finding.affected_hosts?.length">
-      <span class="iblock-label">Affected hosts:</span>
-      <el-tag
-        v-for="h in finding.affected_hosts.slice(0, 6)"
-        :key="h" size="small" type="danger" plain
-      >{{ h }}</el-tag>
+    <!-- Likely root causes -->
+    <div class="interp-block amber" v-if="finding.possible_causes?.length">
+      <div class="iblock-label">Likely root causes</div>
+      <ul>
+        <li v-for="(c, i) in finding.possible_causes" :key="i">{{ c }}</li>
+      </ul>
     </div>
 
     <!-- Recommended actions -->
@@ -86,6 +117,32 @@ const confType = computed(() => {
   if (props.finding.confidence === 'medium') return 'warning'
   return 'info'
 })
+
+const hasEvidence = computed(() => {
+  const ev = props.finding.evidence
+  if (!ev) return false
+  return (
+    Object.keys(ev.metrics || {}).length > 0 ||
+    ev.samples?.length > 0 ||
+    ev.time_first > 0 ||
+    ev.packet_nums?.length > 0
+  )
+})
+
+const evidenceMetrics = computed(() => {
+  const m = props.finding.evidence?.metrics || {}
+  return Object.entries(m).map(([key, value]) => ({
+    key: key.replace(/_/g, ' '),
+    value: typeof value === 'number' && !Number.isInteger(value)
+      ? (value as number).toFixed(4)
+      : String(value),
+  }))
+})
+
+function fmtTs(epoch: number): string {
+  if (!epoch) return '—'
+  return new Date(epoch * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z'
+}
 </script>
 
 <style scoped>
@@ -104,8 +161,9 @@ const confType = computed(() => {
 .finding-desc   { font-size: 13px; color: #606266; margin: 0 0 10px; line-height: 1.6; }
 
 .interp-block { border-radius: 0 4px 4px 0; padding: 8px 12px; margin: 8px 0; font-size: 13px; line-height: 1.7; }
-.interp-block.blue { background: #f0f9ff; border-left: 3px solid #409eff; }
+.interp-block.blue  { background: #f0f9ff; border-left: 3px solid #409eff; }
 .interp-block.amber { background: #fdf6ec; border-left: 3px solid #e6a23c; }
+.interp-block.slate { background: #f4f4f5; border-left: 3px solid #909399; }
 .interp-block p { margin: 0; }
 .interp-block ul { margin: 0; padding-left: 18px; color: #606266; }
 .interp-block li { margin: 2px 0; }
@@ -115,6 +173,39 @@ const confType = computed(() => {
   letter-spacing: .05em; color: #909399; margin-bottom: 4px;
 }
 
+/* ── Evidence block ─────────────────────────────────────────── */
+.evidence-block {
+  background: #fafafa; border: 1px solid #ebeef5; border-radius: 4px;
+  padding: 8px 12px; margin: 8px 0;
+}
+
+.metrics-table { display: grid; grid-template-columns: auto 1fr; gap: 2px 16px; margin-bottom: 6px; }
+.metric-row { display: contents; }
+.metric-key {
+  font-size: 12px; color: #909399; font-family: monospace; white-space: nowrap;
+}
+.metric-val {
+  font-size: 12px; color: #303133; font-weight: 600; font-family: monospace;
+}
+
+.evidence-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }
+.meta-badge {
+  font-size: 11px; color: #606266; background: #ecf5ff;
+  border: 1px solid #c6e2ff; border-radius: 3px; padding: 1px 6px;
+}
+
+.samples-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.samples-row code {
+  background: #f5f7fa; padding: 2px 6px; border-radius: 3px;
+  font-size: 11px; color: #606266; font-family: monospace;
+  max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ── Affected hosts ─────────────────────────────────────────── */
+.affected-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.affected-row .iblock-label { margin-bottom: 0; }
+
+/* ── MITRE ──────────────────────────────────────────────────── */
 .mitre-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 .mitre-badge {
   display: inline-flex; padding: 2px 8px; background: #ecf5ff;
@@ -123,15 +214,7 @@ const confType = computed(() => {
 }
 .mitre-badge:hover { background: #c6e2ff; }
 
-.evidence-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; align-items: center; }
-.evidence-row code {
-  background: #f5f7fa; padding: 2px 6px; border-radius: 3px;
-  font-size: 11px; color: #606266; font-family: monospace;
-}
-
-.affected-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
-.affected-row .iblock-label { margin-bottom: 0; }
-
+/* ── Actions ────────────────────────────────────────────────── */
 .actions-block { background: #f0f9eb; border-radius: 4px; padding: 8px 12px; margin-top: 8px; font-size: 13px; }
 .actions-block ul { margin: 0; padding-left: 18px; color: #529b2e; line-height: 1.8; }
 </style>

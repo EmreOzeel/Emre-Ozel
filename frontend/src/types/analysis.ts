@@ -92,6 +92,8 @@ export interface Finding {
   title: string
   description: string
   explanation: string
+  /** Why is the confidence level set to this value — explains signal strength. */
+  confidence_note: string
   possible_causes: string[]
   recommended_actions: string[]
   affected_hosts: string[]
@@ -170,16 +172,47 @@ export interface HostProfile {
   tcp_sessions_initiated: number
   tcp_sessions_accepted: number
   tcp_sessions_failed: number
+  /** Fraction of initiated connections that succeeded (0–1). */
+  connection_success_ratio: number
   unique_peers: number
   unique_dst_ports: number
   unique_src_ports: number
   protocols: Record<string, number>
+  /** Protocol mix as percentages (protocol → %). */
+  protocol_mix_pct: Record<string, number>
   top_peers: Array<{ ip: string; bytes: number }>
+  /** Role inferred for each top peer (ip → role string). */
+  peer_roles: Record<string, string>
   open_ports: number[]
   anomaly_score: number
   suspicious_behaviors: string[]
   periodic_interval_sec: number
   periodic_jitter: number
+}
+
+// ── Compare mode ──────────────────────────────────────────────────────────────
+
+export interface CompareResult {
+  file_comparison: {
+    a: { filename: string; packets: number; duration_sec: number; size_bytes: number }
+    b: { filename: string; packets: number; duration_sec: number; size_bytes: number }
+  }
+  issue_delta: {
+    critical: number; high: number; total: number
+    a_total: number; b_total: number
+  }
+  new_findings: Finding[]
+  resolved_findings: Finding[]
+  protocol_delta: Record<string, { a: number; b: number; change: string }>
+  tcp_delta: {
+    retransmissions: { a: number; b: number; change: string }
+    zero_windows: { a: number; b: number }
+    failed_handshakes: { a: number; b: number }
+  }
+  dns_delta?: { nxdomain: { a: number; b: number }; avg_rtt_ms: { a: number; b: number } }
+  new_hosts: string[]
+  removed_hosts: string[]
+  comparison_summary: string
 }
 
 // ─── Protocol breakdown ───────────────────────────────────────────────────────

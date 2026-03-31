@@ -161,6 +161,12 @@ def analyze(ctx: CaptureContext) -> None:
                 "(2) misconfigured application or DNS suffix search list, "
                 "(3) C2 infrastructure that has been sinkholed."
             ),
+            confidence_note=(
+                f"Confidence is HIGH because NXDOMAIN responses are definitively captured "
+                f"from the DNS wire protocol (rcode=3). The count of {nxdomain_count} is "
+                "directly observed — this is not a heuristic. The severity assignment "
+                "reflects volume, not detection certainty."
+            ),
             possible_causes=[
                 "DGA malware (Conficker, Emotet, etc.) generating random C2 domain lookups",
                 "Misconfigured DNS search suffix causing failed resolution attempts",
@@ -211,6 +217,12 @@ def analyze(ctx: CaptureContext) -> None:
                 "in DNS query/response labels. Labels are usually short hostnames; very long "
                 "labels (>40 chars) are abnormal and a strong indicator of covert DNS channel. "
                 "Tools like iodine, dnscat2, and dns2tcp use this technique."
+            ),
+            confidence_note=(
+                "Confidence is MEDIUM because long DNS labels are a structural indicator "
+                "but cannot distinguish data encoding from legitimate CDN or DynDNS providers "
+                "that occasionally use long labels. Inspect the actual query names in Evidence "
+                "to assess whether the encoding pattern matches known tunneling tools."
             ),
             possible_causes=[
                 "DNS tunneling for data exfiltration (iodine, dnscat2)",

@@ -119,100 +119,203 @@ def _add_finding_events(ctx: CaptureContext) -> None:
 # ── Storyline generation ──────────────────────────────────────────────────────
 
 def _capture_story(ctx: CaptureContext) -> str:
+    """
+    Event-driven capture narrative.  Tells a temporal story: what happened first,
+    what the dominant activity was, and what anomalies were detected.
+    """
     fi = ctx.file_info
-    lines = []
+    paragraphs: List[str] = []
 
-    total = fi.total_packets
+    # ── Opening: capture overview ─────────────────────────────────────────────
     dur = fi.duration_sec
-    lines.append(
-        f"This capture spans {_format_dur(dur)} and contains {total:,} packets "
-        f"({_format_bytes(fi.file_size_bytes)})."
-    )
-
-    # Protocol composition
-    if ctx.protocol_stats:
-        top = sorted(ctx.protocol_stats.items(), key=lambda x: -x[1])[:4]
-        top_str = ", ".join(f"{p} ({c:,})" for p, c in top)
-        lines.append(f"The dominant protocols are: {top_str}.")
-
-    # DNS activity
-    dns_stats = getattr(ctx, "dns_stats", {})
-    if dns_stats.get("total_queries", 0) > 0:
-        lines.append(
-            f"DNS activity includes {dns_stats['total_queries']:,} queries to "
-            f"{len(dns_stats.get('resolvers', []))} resolver(s), "
-            f"resolving {dns_stats.get('unique_domains', 0)} unique domains."
-        )
-        if dns_stats.get("nxdomain_count", 0) > 10:
-            lines.append(
-                f"There are {dns_stats['nxdomain_count']} NXDOMAIN failures, "
-                "which may indicate misconfigured clients, DGA malware, or C2 activity."
-            )
-
-    # HTTP activity
-    http_stats = getattr(ctx, "http_stats", {})
-    if http_stats.get("total_requests", 0) > 0:
-        lines.append(
-            f"HTTP traffic includes {http_stats['total_requests']:,} requests "
-            f"with {http_stats.get('error_5xx', 0)} server errors and "
-            f"{http_stats.get('error_4xx', 0)} client errors."
-        )
-
-    # TLS
-    tls_stats = getattr(ctx, "tls_stats", {})
-    if tls_stats.get("total_streams", 0) > 0:
-        lines.append(
-            f"TLS traffic includes {tls_stats['total_streams']} encrypted connections "
-            f"to {tls_stats.get('unique_sni', 0)} unique hostnames."
-        )
-
-    # Security summary
-    critical = [f for f in ctx.findings if f.severity == "critical" and not f.suppressed]
-    if critical:
-        lines.append(
-            f"Security analysis flagged {len(critical)} critical finding(s): "
-            f"{'; '.join(f.title for f in critical[:2])}."
+    total = fi.total_packets
+    if dur > 0:
+        opening = (
+            f"This capture spans {_format_dur(dur)} and contains {total:,} packets "
+            f"({_format_bytes(fi.file_size_bytes)})."
         )
     else:
-        lines.append("No critical security anomalies were detected.")
+        opening = (
+            f"This capture contains {total:,} packets ({_format_bytes(fi.file_size_bytes)})."
+        )
 
-    return " ".join(lines)
+    if ctx.protocol_stats:
+        top = sorted(ctx.protocol_stats.items(), key=lambda x: -x[1])[:3]
+        top_str = ", ".join(f"{p} ({c:,} frames)" for p, c in top)
+        opening += f" Dominant protocols: {top_str}."
+    paragraphs.append(opening)
+
+    # ── Temporal markers from timeline ────────────────────────────────────────
+    events = [e for e in ctx.timeline if e.ts > 0]
+    if events:
+        first_event = events[0]
+        last_event = events[-1]
+        finding_events = [e for e in events if e.event_type.startswith("finding_")]
+        proto_events = [e for e in events if not e.event_type.startswith("finding_")]
+
+        temporal_parts: List[str] = []
+        if proto_events:
+            first_proto = proto_events[0]
+            temporal_parts.append(
+                f"The first captured event is a {first_proto.protocol or first_proto.event_type} "
+                f"event from {first_proto.src_ip or 'unknown'}"
+                + (f" to {first_proto.dst_ip}" if first_proto.dst_ip else "")
+                + f" ({first_proto.label})."
+            )
+
+        # DNS-to-connection correlation
+        dns_events = [e for e in proto_events if e.event_type == "dns_query"]
+        tcp_events = [e for e in events if e.event_type == "finding_reconnaissance"]
+        if dns_events and not tcp_events:
+            resolvers = list(dict.fromkeys(e.dst_ip for e in dns_events if e.dst_ip))[:3]
+            temporal_parts.append(
+                f"DNS resolution activity was observed throughout: "
+                f"{len(dns_events)} queries, "
+                f"resolver(s): {', '.join(resolvers) or 'unknown'}."
+            )
+
+        # Scan / anomaly events with temporal context
+        if finding_events:
+            first_anomaly = finding_events[0]
+            temporal_parts.append(
+                f"The first security event occurred at approximately "
+                f"T+{_format_dur(first_anomaly.ts - events[0].ts if events[0].ts > 0 else 0)} "
+                f"into the capture: {first_anomaly.label}."
+            )
+
+        if temporal_parts:
+            paragraphs.append(" ".join(temporal_parts))
+
+    # ── Protocol-layer narrative ──────────────────────────────────────────────
+    proto_parts: List[str] = []
+    dns_stats = getattr(ctx, "dns_stats", {})
+    http_stats = getattr(ctx, "http_stats", {})
+    tls_stats = getattr(ctx, "tls_stats", {})
+
+    if dns_stats.get("total_queries", 0) > 0:
+        nxd = dns_stats.get("nxdomain_count", 0)
+        nxd_str = f", including {nxd} NXDOMAIN failures" if nxd > 0 else ""
+        proto_parts.append(
+            f"DNS: {dns_stats['total_queries']:,} queries to "
+            f"{dns_stats.get('unique_domains', 0)} unique domain(s){nxd_str}."
+        )
+        if nxd > 10:
+            proto_parts.append(
+                f"The {nxd} NXDOMAIN failures may indicate DGA malware, "
+                "misconfigured search suffixes, or a sinkholed C2 domain."
+            )
+
+    if http_stats.get("total_requests", 0) > 0:
+        errs = http_stats.get("error_4xx", 0) + http_stats.get("error_5xx", 0)
+        proto_parts.append(
+            f"HTTP: {http_stats['total_requests']:,} requests"
+            + (f", {errs} error responses" if errs else "")
+            + f", avg latency {http_stats.get('avg_latency_ms', 0):.0f}ms."
+        )
+
+    if tls_stats.get("total_streams", 0) > 0:
+        dep = tls_stats.get("deprecated_count", 0)
+        tls_note = f" — {dep} using deprecated TLS versions" if dep else ""
+        proto_parts.append(
+            f"TLS: {tls_stats['total_streams']} encrypted stream(s) "
+            f"to {tls_stats.get('unique_sni', 0)} unique hostname(s){tls_note}."
+        )
+
+    if proto_parts:
+        paragraphs.append(" ".join(proto_parts))
+
+    # ── Security conclusion ───────────────────────────────────────────────────
+    active = [f for f in ctx.findings if not f.suppressed]
+    critical = [f for f in active if str(f.severity) in ("critical", "Severity.CRITICAL")]
+    high = [f for f in active if str(f.severity) in ("high", "Severity.HIGH")]
+
+    if critical:
+        paragraphs.append(
+            f"CRITICAL: The analysis identified {len(critical)} critical finding(s): "
+            f"{'; '.join(f.title for f in critical[:2])}. "
+            "Immediate investigation is warranted."
+        )
+    elif high:
+        paragraphs.append(
+            f"The analysis found {len(high)} high-severity finding(s): "
+            f"{'; '.join(f.title for f in high[:2])}."
+        )
+    elif active:
+        paragraphs.append(
+            f"The analysis flagged {len(active)} finding(s) — none critical."
+        )
+    else:
+        paragraphs.append("No security anomalies were detected in this capture.")
+
+    return "\n\n".join(paragraphs)
 
 
 def _host_story(ctx: CaptureContext, ip: str) -> str:
+    """
+    Evidence-backed host narrative.
+    Describes role, communication partners (with their roles), protocol mix,
+    connection quality, and any anomalous behaviors observed.
+    """
     profile = ctx.hosts.get(ip)
     if not profile:
         return ""
-    lines = [f"Host {ip} ({profile.role.value}):"]
 
+    parts: List[str] = []
+
+    # ── Role and traffic overview ─────────────────────────────────────────────
+    role_label = profile.role.value if hasattr(profile.role, "value") else profile.role
+    network_type = "internal" if profile.is_internal else "external"
     total_bytes = profile.bytes_sent + profile.bytes_recv
-    lines.append(
-        f"transferred {_format_bytes(total_bytes)} "
-        f"({_format_bytes(profile.bytes_sent)} sent, {_format_bytes(profile.bytes_recv)} received)."
+    parts.append(
+        f"Host {ip} is classified as a **{role_label}** ({network_type}). "
+        f"Total traffic: {_format_bytes(total_bytes)} "
+        f"({_format_bytes(profile.bytes_sent)} sent, {_format_bytes(profile.bytes_recv)} received) "
+        f"to/from {profile.unique_peers} peer(s)."
     )
 
-    if profile.unique_peers:
-        top_peers = profile.top_peers[:3]
-        peer_str = ", ".join(f"{p} ({_format_bytes(b)})" for p, b in top_peers)
-        lines.append(f"Top communication partners: {peer_str}.")
+    # ── Peer relationships with roles ────────────────────────────────────────
+    if profile.top_peers:
+        peer_descs: List[str] = []
+        for peer_ip, peer_bytes in profile.top_peers[:4]:
+            peer_role = profile.peer_roles.get(peer_ip, "unknown")
+            peer_descs.append(f"{peer_ip} [{peer_role}, {_format_bytes(peer_bytes)}]")
+        parts.append(f"Top peers: {', '.join(peer_descs)}.")
 
+    # ── Protocol mix ─────────────────────────────────────────────────────────
+    if profile.protocol_mix_pct:
+        top_protos = sorted(profile.protocol_mix_pct.items(), key=lambda x: -x[1])[:4]
+        proto_str = ", ".join(f"{p} {pct:.0f}%" for p, pct in top_protos)
+        parts.append(f"Protocol mix: {proto_str}.")
+
+    # ── Connection quality ────────────────────────────────────────────────────
     if profile.tcp_sessions_initiated > 0:
-        fail_rate = profile.tcp_sessions_failed / max(profile.tcp_sessions_initiated, 1)
-        lines.append(
-            f"Initiated {profile.tcp_sessions_initiated} TCP connections "
-            f"({fail_rate*100:.0f}% failed)."
+        success_pct = profile.connection_success_ratio * 100
+        fail_count = profile.tcp_sessions_failed
+        parts.append(
+            f"Initiated {profile.tcp_sessions_initiated} TCP connection(s): "
+            f"{success_pct:.0f}% succeeded"
+            + (f", {fail_count} failed" if fail_count > 0 else "")
+            + "."
         )
 
+    # ── Beaconing ────────────────────────────────────────────────────────────
     if profile.periodic_interval_sec > 0:
-        lines.append(
-            f"Exhibits periodic outbound connections every ~{profile.periodic_interval_sec:.0f}s "
-            f"(jitter={profile.periodic_jitter:.2f}) — possible beaconing."
+        parts.append(
+            f"ALERT: Exhibits periodic outbound connections every "
+            f"~{profile.periodic_interval_sec:.0f}s "
+            f"(timing jitter CoV={profile.periodic_jitter:.2f} — "
+            + ("very regular, likely automated)" if profile.periodic_jitter < 0.05 else
+               "low variance, consistent with beaconing)")
+            + "."
         )
 
+    # ── Other suspicious behaviors ────────────────────────────────────────────
     if profile.suspicious_behaviors:
-        lines.append("Suspicious behaviors: " + "; ".join(profile.suspicious_behaviors) + ".")
+        parts.append(
+            "Observed anomalies: " + "; ".join(profile.suspicious_behaviors) + "."
+        )
 
-    return " ".join(lines)
+    return "\n".join(parts)
 
 
 # ── Well-known port → service label ──────────────────────────────────────────

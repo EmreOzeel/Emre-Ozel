@@ -27,6 +27,11 @@ const routes = [
         name: 'History',
         component: () => import('../views/History.vue'),
       },
+      {
+        path: 'compare',
+        name: 'Compare',
+        component: () => import('../views/CompareView.vue'),
+      },
     ]
   },
   {

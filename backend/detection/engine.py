@@ -39,6 +39,7 @@ def build_finding(
     title: str,
     description: str,
     explanation: str,
+    confidence_note: str = "",
     possible_causes: List[str],
     recommended_actions: List[str],
     affected_hosts: List[str],
@@ -60,6 +61,7 @@ def build_finding(
         title=title,
         description=description,
         explanation=explanation,
+        confidence_note=confidence_note,
         possible_causes=possible_causes,
         recommended_actions=recommended_actions,
         affected_hosts=list(dict.fromkeys(affected_hosts)),   # dedup preserve order
