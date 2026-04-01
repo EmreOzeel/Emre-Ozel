@@ -23,6 +23,14 @@
           <el-icon><Tickets /></el-icon>
           <span>Analysis History</span>
         </el-menu-item>
+        <el-menu-item index="/compare">
+          <el-icon><ScaleToOriginal /></el-icon>
+          <span>Compare</span>
+        </el-menu-item>
+        <el-menu-item index="/suppressions">
+          <el-icon><CircleClose /></el-icon>
+          <span>Suppressions</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">

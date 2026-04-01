@@ -34,6 +34,14 @@
       />
 
       <template v-else>
+        <!-- Investigation entry point — shown first when there are critical items -->
+        <StartHerePanel
+          :findings="allActiveFindings"
+          :hosts="topHosts"
+          :tcp-stats="analysis.data.tcp ?? null"
+          @navigate="handleNavigate"
+        />
+
         <!-- Executive summary + stats always visible above tabs -->
         <ExecutiveSummaryCard
           :bullets="analysis.data.bullet_summary ?? []"
@@ -142,6 +150,7 @@ import { classifyAnalysisError } from '@/utils/analysisErrors'
 
 // Components
 import AnalysisHeader      from '@/components/analysis/AnalysisHeader.vue'
+import StartHerePanel      from '@/components/analysis/StartHerePanel.vue'
 import ExecutiveSummaryCard from '@/components/analysis/ExecutiveSummaryCard.vue'
 import FindingsPanel       from '@/components/analysis/FindingsPanel.vue'
 import HostProfileCard     from '@/components/analysis/HostProfileCard.vue'
@@ -160,12 +169,20 @@ const route = useRoute()
 const {
   analysis, loading, error, activeTab,
   findingFilters, conversationFilters,
-  fetch,
+  fetch, navigateTo,
   allActiveFindings, topHosts,
   filteredSessions,
 } = useAnalysisDetail()
 
 onMounted(() => fetch(route.params.id as string))
+
+function handleNavigate(tab: string, filters?: Record<string, string>) {
+  navigateTo(tab, filters)
+  // Scroll tabs into view
+  setTimeout(() => {
+    document.querySelector('.main-tabs')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, 50)
+}
 
 // When the analysis job itself failed, map the raw error to a friendly message.
 // This is separate from `error` (which is set only on network/fetch failures).

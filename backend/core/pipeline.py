@@ -5,7 +5,7 @@ Coordinates: normalizer → analyzers → profiler → correlator → NLG → se
 from __future__ import annotations
 import time
 import dataclasses
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from normalizer.pipeline import normalize
 from analyzers import tcp, dns, http, tls, security, protocols
@@ -184,10 +184,15 @@ def _timeline_to_dict(e: TimelineEvent) -> Dict[str, Any]:
     }
 
 
-def run_pipeline(pcap_path: str) -> Dict[str, Any]:
+def run_pipeline(
+    pcap_path: str,
+    extra_suppressions: Optional[List[Dict]] = None,
+) -> Dict[str, Any]:
     """
     Full analysis pipeline: normalize → analyze → profile → correlate → serialize.
     Returns a JSON-serializable dict.
+
+    extra_suppressions: optional list of DB suppression dicts to merge with YAML.
     """
     t0 = time.time()
 
@@ -209,7 +214,7 @@ def run_pipeline(pcap_path: str) -> Dict[str, Any]:
     correlate(ctx)
 
     # ── 5. Finalize findings (suppression + sort) ─────────────────────────────
-    finalize(ctx)
+    finalize(ctx, extra_suppressions=extra_suppressions)
 
     # ── 6. NLG summaries ─────────────────────────────────────────────────────
     ctx.executive_summary = generate_executive_summary(ctx)

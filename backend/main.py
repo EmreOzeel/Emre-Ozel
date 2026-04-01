@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from config import settings
-from database import get_db, init_db, UserModel, AnalysisModel
+from database import get_db, init_db, UserModel, AnalysisModel, SuppressionRuleModel
 from auth import verify_password, create_token, get_current_user, seed_admin
 from jobs.queue import enqueue, start_worker, stop_worker
 
@@ -222,6 +222,58 @@ def export_analysis(
     )
 
 
+# ── Suppression Rules ─────────────────────────────────────────────────────────
+
+class SuppressionCreate(BaseModel):
+    rule_id: Optional[str] = None
+    src_ip: Optional[str] = None
+    dst_ip: Optional[str] = None
+    reason: str = ""
+
+
+@app.get("/api/suppressions")
+def list_suppressions(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    rows = db.query(SuppressionRuleModel).order_by(SuppressionRuleModel.created_at.desc()).all()
+    return [_suppression_dict(r) for r in rows]
+
+
+@app.post("/api/suppressions", status_code=201)
+def create_suppression(
+    req: SuppressionCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    if not req.rule_id and not req.src_ip and not req.dst_ip:
+        raise HTTPException(400, "At least one of rule_id, src_ip, or dst_ip must be specified")
+    rule = SuppressionRuleModel(
+        rule_id=req.rule_id or None,
+        src_ip=req.src_ip or None,
+        dst_ip=req.dst_ip or None,
+        reason=req.reason,
+        created_by=current_user.id,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return _suppression_dict(rule)
+
+
+@app.delete("/api/suppressions/{rule_id}", status_code=204)
+def delete_suppression(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    rule = db.query(SuppressionRuleModel).filter(SuppressionRuleModel.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Suppression rule not found")
+    db.delete(rule)
+    db.commit()
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -239,6 +291,18 @@ def _get_or_404(db: Session, analysis_id: str, user_id: int) -> AnalysisModel:
     if not row:
         raise HTTPException(404, "Analysis not found")
     return row
+
+
+def _suppression_dict(r: SuppressionRuleModel) -> dict:
+    return {
+        "id": r.id,
+        "rule_id": r.rule_id,
+        "src_ip": r.src_ip,
+        "dst_ip": r.dst_ip,
+        "reason": r.reason,
+        "created_by": r.created_by,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
 
 
 def _summary(row: AnalysisModel) -> dict:

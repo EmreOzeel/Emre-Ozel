@@ -96,6 +96,16 @@
         <li v-for="(a, i) in finding.recommended_actions" :key="i">{{ a }}</li>
       </ul>
     </div>
+
+    <!-- Quick suppress -->
+    <div class="suppress-row" v-if="!finding.suppressed && finding.rule_id">
+      <el-button size="small" plain type="info" @click="emit('suppress', finding)">
+        Suppress this rule ({{ finding.rule_id }})
+      </el-button>
+    </div>
+    <div class="suppressed-badge" v-if="finding.suppressed">
+      <el-tag type="info" size="small" effect="plain">Suppressed</el-tag>
+    </div>
   </div>
 </template>
 
@@ -104,6 +114,7 @@ import { computed } from 'vue'
 import type { Finding } from '@/types/analysis'
 
 const props = defineProps<{ finding: Finding }>()
+const emit = defineEmits<{ (e: 'suppress', finding: Finding): void }>()
 
 const sevType = computed(() => {
   const m: Record<string, string> = {
@@ -217,4 +228,8 @@ function fmtTs(epoch: number): string {
 /* ── Actions ────────────────────────────────────────────────── */
 .actions-block { background: #f0f9eb; border-radius: 4px; padding: 8px 12px; margin-top: 8px; font-size: 13px; }
 .actions-block ul { margin: 0; padding-left: 18px; color: #529b2e; line-height: 1.8; }
+
+/* ── Suppress ───────────────────────────────────────────────── */
+.suppress-row { margin-top: 10px; }
+.suppressed-badge { margin-top: 8px; }
 </style>

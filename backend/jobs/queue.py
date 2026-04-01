@@ -32,9 +32,32 @@ def enqueue(db: DBSession, analysis_id: str) -> None:
 
 
 def _run_one(analysis_id: str, pcap_path: str) -> Dict[str, Any]:
-    """Execute full analysis pipeline for one job. Returns result dict."""
+    """Execute full analysis pipeline for one job. Returns result dict.
+
+    Loads any active DB suppression rules so they are applied during analysis.
+    """
     from core.pipeline import run_pipeline
-    return run_pipeline(pcap_path)
+    from database import SessionLocal, SuppressionRuleModel
+    extra_suppressions = []
+    db = SessionLocal()
+    try:
+        rows = db.query(SuppressionRuleModel).all()
+        extra_suppressions = [
+            {
+                k: v for k, v in {
+                    "rule_id": r.rule_id,
+                    "src_ip": r.src_ip,
+                    "dst_ip": r.dst_ip,
+                }.items()
+                if v is not None
+            }
+            for r in rows
+        ]
+    except Exception:
+        log.warning("Could not load DB suppressions — using YAML only")
+    finally:
+        db.close()
+    return run_pipeline(pcap_path, extra_suppressions=extra_suppressions or None)
 
 
 class AnalysisWorker(threading.Thread):

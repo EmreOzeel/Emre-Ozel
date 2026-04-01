@@ -80,10 +80,19 @@ def _is_private(ip: str) -> bool:
         return False
 
 
-def finalize(ctx: CaptureContext) -> None:
-    """Apply suppression rules and sort findings by score descending."""
+def finalize(ctx: CaptureContext, extra_suppressions: Optional[List[Dict]] = None) -> None:
+    """Apply suppression rules and sort findings by score descending.
+
+    extra_suppressions: list of rule dicts (rule_id, src_ip, dst_ip) loaded
+    from the database at job time, merged with the static YAML suppressions.
+    """
     config = load_rules()
     suppressions = load_suppressions()
+    if extra_suppressions:
+        suppressions = suppressions + [
+            s for s in extra_suppressions
+            if isinstance(s, dict)
+        ]
     whitelist = config.get("whitelisted_ips", []) or []
     apply_suppressions(ctx.findings, suppressions, whitelist)
     ctx.findings.sort(key=lambda f: (-f.score, f.severity))

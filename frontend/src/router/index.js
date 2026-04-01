@@ -32,6 +32,11 @@ const routes = [
         name: 'Compare',
         component: () => import('../views/CompareView.vue'),
       },
+      {
+        path: 'suppressions',
+        name: 'Suppressions',
+        component: () => import('../views/SuppressionsView.vue'),
+      },
     ]
   },
   {

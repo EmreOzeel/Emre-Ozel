@@ -30,6 +30,7 @@ export interface UseAnalysisDetailReturn {
   conversationFilters: Ref<ConversationFilters>
   // Actions
   fetch: (id: string) => Promise<void>
+  navigateTo: (tab: string, filters?: Record<string, string>) => void
   // Computed
   criticalFindings: ComputedRef<Finding[]>
   warningFindings: ComputedRef<Finding[]>
@@ -142,6 +143,23 @@ export function useAnalysisDetail(): UseAnalysisDetailReturn {
     analysis.value?.data?.tcp?.failed_handshakes ?? 0
   )
 
+  function navigateTo(tab: string, filters?: Record<string, string>): void {
+    activeTab.value = tab as TabName
+
+    if (filters) {
+      // Apply to the right filter object based on tab
+      if (tab === 'findings' || tab === 'security') {
+        if (filters.severity !== undefined) findingFilters.value.severity = filters.severity
+        if (filters.category !== undefined) findingFilters.value.category = filters.category
+        if (filters.search !== undefined) findingFilters.value.search = filters.search
+      } else if (tab === 'conversations') {
+        if (filters.handshake !== undefined) conversationFilters.value.handshake = filters.handshake
+        if (filters.protocol !== undefined) conversationFilters.value.protocol = filters.protocol
+        if (filters.search !== undefined) conversationFilters.value.search = filters.search
+      }
+    }
+  }
+
   return {
     analysis,
     loading,
@@ -150,6 +168,7 @@ export function useAnalysisDetail(): UseAnalysisDetailReturn {
     findingFilters,
     conversationFilters,
     fetch,
+    navigateTo,
     criticalFindings,
     warningFindings,
     allActiveFindings,

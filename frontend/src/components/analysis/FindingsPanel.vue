@@ -49,19 +49,45 @@
               v-for="f in bySeverity[sev]"
               :key="f.id"
               :finding="f"
+              @suppress="openSuppressDialog"
             />
           </div>
         </div>
       </div>
     </template>
+    <!-- Suppress dialog -->
+    <el-dialog v-model="suppressDialog.visible" title="Suppress Rule" width="440px" :close-on-click-modal="false">
+      <p class="suppress-desc">
+        Creating a suppression for <el-tag size="small" type="warning">{{ suppressDialog.ruleId }}</el-tag>.
+        This will hide matching findings in future analyses.
+      </p>
+      <el-form :model="suppressDialog" label-width="80px">
+        <el-form-item label="Src IP">
+          <el-input v-model="suppressDialog.srcIp" placeholder="leave blank to match any" clearable />
+        </el-form-item>
+        <el-form-item label="Dst IP">
+          <el-input v-model="suppressDialog.dstIp" placeholder="leave blank to match any" clearable />
+        </el-form-item>
+        <el-form-item label="Reason">
+          <el-input v-model="suppressDialog.reason" placeholder="Why is this a false positive?" />
+        </el-form-item>
+      </el-form>
+      <el-alert v-if="suppressDialog.error" type="error" :title="suppressDialog.error" :closable="false" style="margin-top:8px" />
+      <template #footer>
+        <el-button @click="suppressDialog.visible = false">Cancel</el-button>
+        <el-button type="primary" :loading="suppressDialog.saving" @click="submitSuppress">Suppress</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, reactive } from 'vue'
 import { CircleCheck } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import FindingCard from './FindingCard.vue'
-import type { Finding, FindingFilters } from '@/types/analysis'
+import api from '@/api'
+import type { Finding } from '@/types/analysis'
 
 // FindingFilters lives in composable but re-declare for prop typing clarity
 interface Filters { severity: string; category: string; search: string }
@@ -70,6 +96,44 @@ const props = defineProps<{
   findings: Finding[]
   filters: Filters
 }>()
+
+const suppressDialog = reactive({
+  visible: false,
+  ruleId: '',
+  srcIp: '',
+  dstIp: '',
+  reason: '',
+  saving: false,
+  error: '',
+})
+
+function openSuppressDialog(finding: Finding) {
+  suppressDialog.ruleId = finding.rule_id ?? ''
+  suppressDialog.srcIp = ''
+  suppressDialog.dstIp = ''
+  suppressDialog.reason = ''
+  suppressDialog.error = ''
+  suppressDialog.visible = true
+}
+
+async function submitSuppress() {
+  suppressDialog.error = ''
+  suppressDialog.saving = true
+  try {
+    await api.post('/suppressions', {
+      rule_id: suppressDialog.ruleId || null,
+      src_ip: suppressDialog.srcIp || null,
+      dst_ip: suppressDialog.dstIp || null,
+      reason: suppressDialog.reason,
+    })
+    suppressDialog.visible = false
+    ElMessage.success('Suppression rule created. It will apply to the next analysis run.')
+  } catch (e: any) {
+    suppressDialog.error = e.response?.data?.detail || 'Failed to create suppression rule.'
+  } finally {
+    suppressDialog.saving = false
+  }
+}
 
 const severityOrder = ['critical', 'high', 'medium', 'low', 'info'] as const
 
@@ -120,4 +184,6 @@ function sevTagType(sev: string): string {
 .sev-group-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .group-count { font-size: 12px; color: #909399; }
 .group-cards { display: flex; flex-direction: column; gap: 10px; }
+
+.suppress-desc { margin: 0 0 14px; font-size: 13px; color: #606266; line-height: 1.6; }
 </style>

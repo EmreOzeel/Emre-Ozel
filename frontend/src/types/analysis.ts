@@ -320,3 +320,13 @@ export interface AnalysisDetail {
   error: string | null
   data: AnalysisData | null
 }
+
+export interface SuppressionRule {
+  id: number
+  rule_id: string | null
+  src_ip: string | null
+  dst_ip: string | null
+  reason: string
+  created_by: number | null
+  created_at: string | null
+}

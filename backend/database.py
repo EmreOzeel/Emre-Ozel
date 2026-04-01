@@ -42,6 +42,22 @@ class AnalysisModel(Base):
     finished_at = Column(DateTime, nullable=True)
 
 
+class SuppressionRuleModel(Base):
+    """
+    Persistent suppression rule — marks matching findings as suppressed.
+    Rules are global (team-wide) — any matching finding from any analysis
+    is suppressed when results are viewed.
+    """
+    __tablename__ = "suppression_rules"
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(String, nullable=True)    # e.g. "SCAN-001" — null = match all
+    src_ip = Column(String, nullable=True)     # null = match any src
+    dst_ip = Column(String, nullable=True)     # null = match any dst
+    reason = Column(String, nullable=False, default="")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 def get_db():
     db = SessionLocal()
     try:
