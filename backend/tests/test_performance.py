@@ -89,16 +89,17 @@ def _make_large_context(n_sessions: int = 1000, n_dns: int = 500) -> CaptureCont
     for i in range(n_dns):
         tx = DnsTransaction(
             txid=i,
+            query_pkt=i * 2,
+            response_pkt=i * 2 + 1,
             client_ip=hosts[i % len(hosts)],
             resolver_ip="8.8.8.8",
             qname=f"host{i}.example.com",
             qtype="A",
-            rcode=0,
+            rcode="NOERROR",
             answers=[f"93.184.{i % 256}.{i % 100}"],
             ts_query=float(i) * 0.01,
         )
         tx.rtt_ms = 5.0
-        tx.answered = True
         ctx.dns_transactions.append(tx)
 
     return ctx
