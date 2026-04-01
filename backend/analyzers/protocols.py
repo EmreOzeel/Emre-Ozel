@@ -4,11 +4,12 @@ Kerberos, LDAP, NTP, SNMP, QUIC, SIP).
 Operates on normalized PacketRecord extras dict.
 """
 from __future__ import annotations
+
 from collections import defaultdict
 from typing import Dict, List
 
-from models import CaptureContext, Evidence, Severity, Confidence, TimelineEvent
 from detection.engine import build_finding
+from models import CaptureContext, Confidence, Evidence, Severity, TimelineEvent
 
 _DHCP_TYPES = {
     "1": "DISCOVER", "2": "OFFER", "3": "REQUEST", "4": "DECLINE",

@@ -5,10 +5,9 @@ Nothing above this layer touches subprocess output.
 """
 import dataclasses
 import logging
-import subprocess
 import re
-import io
-from typing import List, Dict, Any, Optional
+import subprocess
+from typing import Any, Dict, List
 
 log = logging.getLogger(__name__)
 
@@ -288,7 +287,6 @@ def get_tcp_conversations(path: str) -> List[Dict]:
 def get_expert_info(path: str) -> List[Dict]:
     """Run tshark -z expert and parse severity + message."""
     out = _run(["tshark", "-q", "-z", "expert,warn", "-r", path])
-    items: List[Dict] = []
     counts: Dict[str, Dict] = {}
     for line in out.splitlines():
         m = re.match(r"^\s+(Error|Warning|Note|Chat)\s+(.+?)\s+(\d+)", line, re.I)

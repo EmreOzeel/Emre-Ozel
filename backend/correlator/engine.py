@@ -4,8 +4,10 @@ Correlates DNS, TCP, TLS, HTTP events into a unified, sorted timeline
 and generates natural-language storylines.
 """
 from __future__ import annotations
-from typing import List, Dict
-from models import CaptureContext, TimelineEvent, Severity
+
+from typing import Dict, List
+
+from models import CaptureContext, Severity, TimelineEvent
 
 
 def _format_bytes(b: int) -> str:
@@ -148,8 +150,6 @@ def _capture_story(ctx: CaptureContext) -> str:
     # ── Temporal markers from timeline ────────────────────────────────────────
     events = [e for e in ctx.timeline if e.ts > 0]
     if events:
-        first_event = events[0]
-        last_event = events[-1]
         finding_events = [e for e in events if e.event_type.startswith("finding_")]
         proto_events = [e for e in events if not e.event_type.startswith("finding_")]
 

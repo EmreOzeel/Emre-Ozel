@@ -3,23 +3,34 @@ Normalization pipeline: raw tshark dicts → CaptureContext with typed models.
 This is the only layer that interprets raw tshark field strings.
 """
 from __future__ import annotations
+
+import hashlib
 import logging
 import math
-import hashlib
-from collections import defaultdict
 from typing import Dict, List, Optional
 
-log = logging.getLogger(__name__)
-
+from config.validation import ValidationProfile, get_profile
 from models import (
-    CaptureContext, FileInfo, PacketRecord, FlowRecord, SessionRecord,
-    DnsTransaction, HttpTransaction, TlsHandshake, TCPState,
+    CaptureContext,
+    DnsTransaction,
+    FileInfo,
+    FlowRecord,
+    HttpTransaction,
+    PacketRecord,
+    SessionRecord,
+    TCPState,
+    TlsHandshake,
 )
 from normalizer.tshark import (
-    check_tshark, PacketParseResult, get_file_info, get_protocol_hierarchy,
-    get_ip_endpoints, get_tcp_conversations, get_expert_info, get_packets,
+    check_tshark,
+    get_expert_info,
+    get_file_info,
+    get_packets,
+    get_protocol_hierarchy,
+    get_tcp_conversations,
 )
-from config.validation import get_profile, ValidationProfile
+
+log = logging.getLogger(__name__)
 
 
 def _i(d: dict, key: str, default: int = 0) -> int:
@@ -344,7 +355,7 @@ def _build_dns_transactions(packets: List[PacketRecord]) -> List[DnsTransaction]
             if qname:
                 tx.label_entropy = _label_entropy(qname)
                 labels = qname.rstrip(".").split(".")
-                tx.label_length = max(len(l) for l in labels) if labels else 0
+                tx.label_length = max(len(lbl) for lbl in labels) if labels else 0
                 tx.subdomain_depth = max(0, len(labels) - 2)
             pending[key] = tx
         else:

@@ -3,11 +3,10 @@ Normalized intermediate data models for investigation-grade PCAP analysis.
 All analyzers operate on these models, never on raw tshark output.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple
-from enum import Enum
-import hashlib
 
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Tuple
 
 # ── Enumerations ─────────────────────────────────────────────────────────────
 

@@ -5,12 +5,16 @@ HTTP traffic statistics stored as ctx.http_stats.
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
-from typing import Dict, List, Any
+from collections import Counter
+from typing import Any, Dict, List
 
-from detection.engine import build_finding, _is_private
+from detection.engine import build_finding
 from models import (
-    CaptureContext, Evidence, Severity, Confidence, TimelineEvent,
+    CaptureContext,
+    Confidence,
+    Evidence,
+    Severity,
+    TimelineEvent,
 )
 
 # ── Suspicious user-agent substrings (case-insensitive) ──────────────────────
@@ -63,8 +67,7 @@ _4XX_MIN_COUNT    = 20
 
 
 def _top_n(counter: Counter, n: int = 10) -> List[Dict[str, Any]]:
-    return [{"host" if len(item) == 2 else "key": k, "count": v}
-            for k, v in counter.most_common(n)]
+    return [{"key": k, "count": v} for k, v in counter.most_common(n)]
 
 
 def _top_hosts(counter: Counter, n: int = 10) -> List[Dict[str, Any]]:
@@ -171,7 +174,6 @@ def analyze(ctx: CaptureContext) -> None:
             ))
 
         # ── HTTP-002: web attack URI patterns ─────────────────────────────────
-        uri_str = (tx.uri or "") + ("?" + tx.uri if "?" in (tx.uri or "") else "")
         attack_type = None
         for pat in _WEB_ATTACK_PATTERNS:
             if pat.search(tx.uri or ""):

@@ -19,16 +19,15 @@ from __future__ import annotations
 import collections
 from typing import Dict, List, Tuple
 
+from detection.engine import build_finding
 from models import (
     CaptureContext,
+    Confidence,
     Evidence,
     Severity,
-    Confidence,
     TCPState,
     TimelineEvent,
 )
-from detection.engine import build_finding
-
 
 # ── Tuning thresholds ─────────────────────────────────────────────────────────
 

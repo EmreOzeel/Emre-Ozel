@@ -4,15 +4,19 @@ Detects: NXDOMAIN storm, DNS tunneling, DGA/high-entropy, slow DNS,
 unanswered queries, high unique subdomain rate.
 """
 from __future__ import annotations
-import math
+
 from collections import defaultdict
 from typing import Dict, List
 
-from models import (
-    CaptureContext, Evidence, Severity, Confidence, TimelineEvent,
-)
 from detection.engine import build_finding
-from detection.rules import load_rules, get_threshold
+from detection.rules import get_threshold, load_rules
+from models import (
+    CaptureContext,
+    Confidence,
+    Evidence,
+    Severity,
+    TimelineEvent,
+)
 
 
 def _vowel_ratio(s: str) -> float:

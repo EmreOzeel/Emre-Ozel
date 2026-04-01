@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple, Any
+from typing import Any, Dict, List, Set, Tuple
 
-from detection.engine import build_finding, _is_private
-from detection.rules import load_rules, get_threshold
+from detection.engine import _is_private, build_finding
+from detection.rules import get_threshold, load_rules
 from models import (
-    CaptureContext, Evidence, Severity, Confidence, TimelineEvent,
+    CaptureContext,
+    Confidence,
+    Evidence,
+    Severity,
+    TimelineEvent,
 )
 
 # ── Sensitive port definitions ────────────────────────────────────────────────
