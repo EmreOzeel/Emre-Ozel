@@ -10,14 +10,15 @@ Beyond counting finding deltas, this engine detects:
   - New external communicants: IPs that appeared in B that were absent in A
 """
 from __future__ import annotations
-from typing import Dict, Any, List, Set
+
+from typing import Any, Dict, List, Set
 
 _SEV_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 def _pct_change(old: float, new: float) -> str:
     if old == 0:
-        return f"+∞" if new > 0 else "0%"
+        return "+∞" if new > 0 else "0%"
     delta = (new - old) / old * 100
     sign = "+" if delta >= 0 else ""
     return f"{sign}{delta:.1f}%"

@@ -13,11 +13,10 @@ Usage:
 """
 from __future__ import annotations
 
-import struct
 import socket
-from dataclasses import dataclass, field
-from typing import List, Optional
-
+import struct
+from dataclasses import dataclass
+from typing import List
 
 # ── PCAP constants ─────────────────────────────────────────────────────────────
 

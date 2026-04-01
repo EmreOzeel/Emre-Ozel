@@ -9,10 +9,9 @@ from the capture, say so explicitly. Use "observed", "likely", and
 from __future__ import annotations
 
 import ipaddress
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from models import CaptureContext, SessionRecord
-
 
 # ── Port → service label ──────────────────────────────────────────────────────
 _PORT_SERVICE: Dict[int, str] = {

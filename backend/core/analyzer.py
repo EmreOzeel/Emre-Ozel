@@ -1,13 +1,21 @@
 """Main analysis orchestrator — coordinates all analyzers and builds the full result."""
 import time
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
-from core.tshark import (
-    get_file_info, get_protocol_hierarchy, get_ip_endpoints,
-    get_tcp_conversations, get_expert_info, get_packets,
+from analyzers import dns, http, protocols, security, tcp, tls
+from core.nlg import (
+    generate_executive_summary,
+    generate_findings_narrative,
+    generate_technical_summary,
 )
-from analyzers import tcp, dns, http, tls, security, protocols
-from core.nlg import generate_executive_summary, generate_technical_summary, generate_findings_narrative
+from core.tshark import (
+    get_expert_info,
+    get_file_info,
+    get_ip_endpoints,
+    get_packets,
+    get_protocol_hierarchy,
+    get_tcp_conversations,
+)
 
 
 def run_analysis(pcap_path: str) -> Dict[str, Any]:

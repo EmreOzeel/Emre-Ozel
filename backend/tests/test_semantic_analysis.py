@@ -8,20 +8,24 @@ inference, and storyline content.
 Tests build CaptureContext objects directly — no tshark required.
 """
 from __future__ import annotations
-import math
-import time
-from typing import List
+
 import pytest
 
-from models import (
-    CaptureContext, FileInfo, PacketRecord, FlowRecord, SessionRecord,
-    DnsTransaction, TlsHandshake, HostProfile, Evidence,
-    Severity, Confidence, TCPState, HostRole,
-)
-from analyzers import tcp, dns, security, protocols
-from profiler.host import build_profiles
+from analyzers import dns, security, tcp
 from correlator.engine import correlate
-
+from models import (
+    CaptureContext,
+    Confidence,
+    DnsTransaction,
+    Evidence,
+    FileInfo,
+    FlowRecord,
+    PacketRecord,
+    SessionRecord,
+    Severity,
+    TCPState,
+)
+from profiler.host import build_profiles
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

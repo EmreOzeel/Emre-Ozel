@@ -4,16 +4,21 @@ Tests for tshark dependency check and packet-extraction validation.
 All subprocess/filesystem calls are mocked so no tshark binary is required.
 Run with:  pytest backend/tests/test_tshark_validation.py -v
 """
-import sys
 import os
-import pytest
+import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Make sure the backend package root is on sys.path when running from repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from normalizer.tshark import check_tshark, get_packets, PacketParseResult, PACKET_FIELDS
-
+from normalizer.tshark import (
+    PACKET_FIELDS,
+    PacketParseResult,
+    check_tshark,
+    get_packets,
+)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 """MITRE ATT&CK mapping for network-observable techniques."""
-from models import MitreRef
 from typing import List
+
+from models import MitreRef
 
 BASE_URL = "https://attack.mitre.org/techniques"
 

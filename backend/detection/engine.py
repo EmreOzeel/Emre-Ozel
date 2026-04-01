@@ -4,17 +4,25 @@ All findings are built via build_finding() which enforces the full evidence mode
 Analyzers call emit() to register findings into the CaptureContext.
 """
 from __future__ import annotations
-import math
-import uuid
-import ipaddress
-from typing import List, Optional, Dict, Any
-from models import (
-    CaptureContext, Finding, Evidence, MitreRef,
-    Severity, Confidence,
-)
-from detection.mitre import get_mitre
-from detection.rules import load_rules, load_suppressions, apply_suppressions, get_threshold
 
+import ipaddress
+import uuid
+from typing import Dict, List, Optional
+
+from detection.mitre import get_mitre
+from detection.rules import (
+    apply_suppressions,
+    load_rules,
+    load_suppressions,
+)
+from models import (
+    CaptureContext,
+    Confidence,
+    Evidence,
+    Finding,
+    MitreRef,
+    Severity,
+)
 
 # Score table: severity × confidence → numeric score (0–10)
 _SCORE_TABLE: Dict[str, Dict[str, float]] = {

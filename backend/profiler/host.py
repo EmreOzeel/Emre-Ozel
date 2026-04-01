@@ -4,13 +4,16 @@ Determines likely role, top peers, protocol usage, connection ratios,
 beaconing periodicity, and anomaly score.
 """
 from __future__ import annotations
-import math
+
 import ipaddress
+import math
 from collections import defaultdict
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Set, Tuple
 
 from models import (
-    CaptureContext, HostProfile, HostRole, FlowRecord, PacketRecord,
+    CaptureContext,
+    HostProfile,
+    HostRole,
 )
 
 

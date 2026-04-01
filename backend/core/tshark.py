@@ -5,10 +5,9 @@ Two-phase approach:
   Phase 2: per-packet fields (capped at MAX_PACKETS)
 """
 
-import subprocess
-import json
 import re
-from typing import List, Dict, Any, Optional
+import subprocess
+from typing import Any, Dict, List
 
 MAX_PACKETS = 50_000   # hard cap for detail pass
 TSHARK_TIMEOUT = 180   # seconds

@@ -1,17 +1,18 @@
 """Alembic migration environment — reads DATABASE_URL from application settings."""
 from __future__ import annotations
-import sys
+
 import os
+import sys
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 
 # Add backend/ to sys.path so we can import our app modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import settings
-from database import Base   # noqa: E402 — imports all models via Base.metadata
+from database import Base  # noqa: E402 — imports all models via Base.metadata
 
 # Alembic Config object from alembic.ini
 config = context.config

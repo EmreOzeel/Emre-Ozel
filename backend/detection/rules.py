@@ -1,7 +1,9 @@
 """YAML rule loading and suppression engine."""
 import os
+from typing import Any, Dict, List, Optional
+
 import yaml
-from typing import Dict, Any, List, Optional
+
 from models import Finding
 
 _RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "rules")

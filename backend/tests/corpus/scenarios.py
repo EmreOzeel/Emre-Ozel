@@ -18,19 +18,18 @@ on TCP packets (the `if val` filter keeps non-empty strings including "0").
 """
 from __future__ import annotations
 
-import sys
-import os
 import dataclasses
-from typing import Dict, List, Optional, Any
+import os
+import sys
+from typing import Any, Dict, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
+from normalizer.tshark import PACKET_FIELDS, PacketParseResult
 from tests.corpus.pcap_builder import (
-    PcapBuilder, Packet,
-    F_SYN, F_ACK, F_FIN, F_RST, F_PSH,
+    Packet,
+    PcapBuilder,
 )
-from normalizer.tshark import PacketParseResult, PACKET_FIELDS
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

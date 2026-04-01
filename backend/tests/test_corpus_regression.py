@@ -26,18 +26,19 @@ The golden dict uses the following keys (see scenarios.py for full docs):
 """
 from __future__ import annotations
 
-import sys
 import os
+import sys
 import tempfile
-import pytest
 from contextlib import ExitStack
-from unittest.mock import patch
 from typing import Any, Dict
+from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tests.corpus.scenarios import SCENARIOS, Scenario
 from models import TCPState
+from tests.corpus.scenarios import SCENARIOS, Scenario
 
 _BASE = "normalizer.pipeline"
 
@@ -287,8 +288,7 @@ class TestValidationProfiles:
 
     def _scenario_with_malformed(self, total: int, malformed: int):
         """Return a tcp_handshake-based scenario override with custom parse stats."""
-        from tests.corpus.scenarios import _parse_result
-        from normalizer.tshark import PacketParseResult, PACKET_FIELDS
+        from normalizer.tshark import PACKET_FIELDS, PacketParseResult
         s = SCENARIOS["tcp_handshake"]
         good_rows = s.parse_result.packets
         bad_pr = PacketParseResult(

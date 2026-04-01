@@ -4,12 +4,16 @@ TLS traffic statistics stored as ctx.tls_stats.
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from typing import Dict, List, Any, Set
+from collections import Counter
+from typing import Any, Dict, List, Set
 
-from detection.engine import build_finding, _is_private
+from detection.engine import build_finding
 from models import (
-    CaptureContext, Evidence, Severity, Confidence, TimelineEvent,
+    CaptureContext,
+    Confidence,
+    Evidence,
+    Severity,
+    TimelineEvent,
 )
 
 # ── Deprecated TLS/SSL versions ───────────────────────────────────────────────

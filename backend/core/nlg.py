@@ -1,5 +1,6 @@
 """Natural Language Generation — produces human-readable analyst commentary from CaptureContext."""
 from __future__ import annotations
+
 from models import CaptureContext
 
 
