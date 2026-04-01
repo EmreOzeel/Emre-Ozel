@@ -24,7 +24,12 @@ _url = settings.effective_db_url
 _is_sqlite = _url.startswith("sqlite")
 
 if _is_sqlite:
-    os.makedirs(os.path.dirname(settings.DB_PATH), exist_ok=True)
+    # Derive the actual file path from the URL (works for both DATABASE_URL
+    # and DB_PATH fallback). sqlite:////abs/path → /abs/path
+    _db_file = _url.split("sqlite:///")[-1]
+    _db_dir = os.path.dirname(_db_file)
+    if _db_dir:
+        os.makedirs(_db_dir, exist_ok=True)
     engine = create_engine(_url, connect_args={"check_same_thread": False})
 else:
     engine = create_engine(
