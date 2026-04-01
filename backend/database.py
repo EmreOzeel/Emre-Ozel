@@ -3,12 +3,20 @@ SQLAlchemy ORM models and engine factory.
 Supports SQLite (default) and PostgreSQL (set DATABASE_URL).
 """
 import os
+
 from sqlalchemy import (
-    create_engine, Column, Integer, String,
-    Text, DateTime, ForeignKey, Boolean,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.sql import func
+
 from config import settings
 
 # ── Engine factory ─────────────────────────────────────────────────────────────

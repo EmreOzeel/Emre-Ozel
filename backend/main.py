@@ -1,26 +1,30 @@
 """FastAPI application — PCAP Analyzer v3 (async + investigation-grade)."""
 from __future__ import annotations
-import os
-import json
-import uuid
+
 import hashlib
-import shutil
-from datetime import datetime, timezone
+import json
+import os
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from auth import create_token, get_current_user, seed_admin, verify_password
 from config import settings
 from database import (
-    get_db, init_db,
-    UserModel, AnalysisModel, SuppressionRuleModel, FindingTriageModel,
+    AnalysisModel,
+    FindingTriageModel,
+    SuppressionRuleModel,
     TelemetryEventModel,
+    UserModel,
+    get_db,
+    init_db,
 )
-from auth import verify_password, create_token, get_current_user, seed_admin
 from jobs.queue import enqueue, start_worker, stop_worker
 from telemetry import track
 
@@ -366,6 +370,7 @@ def get_report(
     (impact summary + decision guidance only, no raw technical tables).
     """
     from fastapi.responses import Response
+
     from reporting.html_report import generate_html_report
     row = _get_or_404(db, analysis_id, current_user.id)
     if row.status != "completed":

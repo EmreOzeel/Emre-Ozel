@@ -16,24 +16,25 @@ Skip in CI if the perf marker is excluded:
     pytest tests/ -m "not perf"
 """
 from __future__ import annotations
+
 import threading
 import time
 import tracemalloc
+
 import pytest
 
-from models import (
-    CaptureContext, FileInfo, PacketRecord, FlowRecord, SessionRecord,
-    DnsTransaction, TlsHandshake, HostProfile, Evidence,
-    Severity, Confidence, TCPState, HostRole,
-)
-from analyzers import tcp, dns, security, protocols
-from profiler.host import build_profiles
-from correlator.engine import correlate
-from detection.engine import finalize
-from core.pipeline import _host_to_dict, _finding_to_dict
 from core.decision import build_decision_report
 from core.sanity import run_sanity_checks
-
+from detection.engine import finalize
+from models import (
+    CaptureContext,
+    Confidence,
+    DnsTransaction,
+    FileInfo,
+    SessionRecord,
+    Severity,
+)
+from profiler.host import build_profiles
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -167,7 +168,8 @@ def test_large_capture_finalize():
     """
     finalize on 200 findings must complete quickly (< 1 second).
     """
-    from models import Finding, Evidence as Ev
+    from models import Evidence as Ev
+    from models import Finding
     ctx = _make_large_context(n_sessions=200, n_dns=50)
     build_profiles(ctx)
 
@@ -289,8 +291,10 @@ def test_concurrent_decision_reports():
 
     t1 = threading.Thread(target=run_a)
     t2 = threading.Thread(target=run_b)
-    t1.start(); t2.start()
-    t1.join(timeout=5); t2.join(timeout=5)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
 
     assert "a" in results and "b" in results
     assert results["a"]["ranked_causes"][0]["rule_id"] == "SCAN-001"

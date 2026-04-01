@@ -3,24 +3,34 @@ Main analysis pipeline orchestrator.
 Coordinates: normalizer → analyzers → profiler → correlator → NLG → serializer.
 """
 from __future__ import annotations
-import time
+
 import dataclasses
+import time
 from typing import Any, Callable, Dict, List, Optional
 
-from normalizer.pipeline import normalize
-from analyzers import tcp, dns, http, tls, security, protocols
-from profiler.host import build_profiles
+from analyzers import dns, http, protocols, security, tcp, tls
+from core.decision import build_decision_report
+from core.interpret import (
+    assess_capture_quality,
+    generate_bullet_summary,
+    interpret_session,
+)
+from core.nlg import generate_executive_summary, generate_technical_summary
+from core.sanity import run_sanity_checks
 from correlator.engine import correlate
 from detection.engine import finalize
-from core.nlg import generate_executive_summary, generate_technical_summary
-from core.interpret import interpret_session, assess_capture_quality, generate_bullet_summary
-from core.decision import build_decision_report
-from core.sanity import run_sanity_checks
 from models import (
-    CaptureContext, Finding, Evidence, HostProfile,
-    DnsTransaction, HttpTransaction, TlsHandshake,
-    SessionRecord, FlowRecord, TimelineEvent,
+    DnsTransaction,
+    Evidence,
+    Finding,
+    HostProfile,
+    HttpTransaction,
+    SessionRecord,
+    TimelineEvent,
+    TlsHandshake,
 )
+from normalizer.pipeline import normalize
+from profiler.host import build_profiles
 
 
 def _evidence_to_dict(ev: Evidence) -> Dict[str, Any]:
@@ -260,7 +270,9 @@ def run_pipeline(
     ctx.analysis_time_sec = round(time.time() - t0, 2)
 
     # ── 8. Serialize to JSON-safe dict ────────────────────────────────────────
-    sev_val = lambda f: f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+    def sev_val(f: Finding) -> str:
+        return f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+
     issue_counts = {
         "critical": sum(1 for f in ctx.findings if sev_val(f) == "critical" and not f.suppressed),
         "high":     sum(1 for f in ctx.findings if sev_val(f) == "high" and not f.suppressed),

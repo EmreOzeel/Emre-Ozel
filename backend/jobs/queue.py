@@ -9,13 +9,14 @@ Key properties:
   - Scoped suppression filtering: global + user-owned + unexpired only
 """
 from __future__ import annotations
-import threading
-import time
+
 import json
 import logging
+import threading
 import traceback
-from datetime import datetime, timezone
-from typing import Optional, Callable, Dict, Any
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional
+
 from sqlalchemy.orm import Session as DBSession
 
 from config import settings
@@ -54,9 +55,9 @@ def _load_suppressions(user_id: int) -> list[Dict]:
     try:
         rows = (
             db.query(SuppressionRuleModel)
-            .filter(SuppressionRuleModel.is_active == True)
+            .filter(SuppressionRuleModel.is_active.is_(True))
             .filter(
-                (SuppressionRuleModel.expires_at == None) |
+                (SuppressionRuleModel.expires_at.is_(None)) |
                 (SuppressionRuleModel.expires_at > now)
             )
             .filter(
@@ -124,7 +125,7 @@ class AnalysisWorker(threading.Thread):
         log.info("Analysis worker stopped")
 
     def _process_one(self) -> None:
-        from database import SessionLocal, AnalysisModel
+        from database import AnalysisModel, SessionLocal
         db: DBSession = SessionLocal()
         try:
             row = (

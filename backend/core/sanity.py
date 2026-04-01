@@ -13,6 +13,7 @@ Returns a list of SanityIssue dicts included in pipeline output as
   - detail     : optional extra context
 """
 from __future__ import annotations
+
 from typing import Any, Dict, List
 
 
@@ -26,7 +27,6 @@ def run_sanity_checks(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     hosts = result.get("hosts", [])
     dns_stats = result.get("dns", {}) or {}
     tcp_stats = result.get("tcp", {}) or {}
-    security_stats = result.get("security", {}) or {}
 
     host_ips = {h.get("ip") for h in hosts}
 

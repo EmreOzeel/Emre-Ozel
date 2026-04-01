@@ -9,8 +9,9 @@ Takes findings and host profiles from a completed analysis and produces:
 This is intentionally rule-based (no LLM) — deterministic, testable, auditable.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 
 @dataclass

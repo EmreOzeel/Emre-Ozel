@@ -3,10 +3,10 @@ HTML report generator for PCAP analysis results.
 Produces a single self-contained HTML file with embedded CSS — no external deps.
 """
 from __future__ import annotations
+
 import html
 from datetime import datetime
 from typing import Any, Dict, List
-
 
 # ── Severity helpers ──────────────────────────────────────────────────────────
 
