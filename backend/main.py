@@ -1,26 +1,47 @@
 """FastAPI application — PCAP Analyzer v3 (async + investigation-grade)."""
+from __future__ import annotations
 import os
 import json
 import uuid
+import hashlib
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from config import settings
-from database import get_db, init_db, UserModel, AnalysisModel, SuppressionRuleModel
+from database import (
+    get_db, init_db,
+    UserModel, AnalysisModel, SuppressionRuleModel, FindingTriageModel,
+)
 from auth import verify_password, create_token, get_current_user, seed_admin
 from jobs.queue import enqueue, start_worker, stop_worker
 
-app = FastAPI(title="PCAP Analyzer", version="3.0.0")
+# ── PCAP magic bytes ──────────────────────────────────────────────────────────
+# pcap little-endian, pcap big-endian, pcapng
+_PCAP_MAGIC = {b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x0a\x0d\x0d\x0a"}
+
+
+def _check_pcap_magic(data: bytes) -> bool:
+    return data[:4] in _PCAP_MAGIC
+
+
+# ── App factory ───────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="PCAP Analyzer",
+    version="3.0.0",
+    description="Investigation-grade PCAP analysis platform",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,14 +61,106 @@ def shutdown():
     stop_worker()
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Pydantic response schemas ─────────────────────────────────────────────────
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class MeResponse(BaseModel):
+    id: int
+    username: str
+    is_admin: bool
+
+
+class AnalysisSummary(BaseModel):
+    id: str
+    filename: str
+    status: str
+    packet_count: Optional[int]
+    issue_count: Optional[int]
+    critical_count: Optional[int]
+    current_stage: Optional[str]
+    progress_pct: Optional[int]
+    created_at: Optional[str]
+    started_at: Optional[str]
+    finished_at: Optional[str]
+    error: Optional[str]
+
+
+class AnalysisStatusResponse(BaseModel):
+    id: str
+    status: str
+    current_stage: Optional[str]
+    progress_pct: int
+    packet_count: Optional[int]
+    issue_count: Optional[int]
+    critical_count: Optional[int]
+    error: Optional[str]
+    started_at: Optional[str]
+    finished_at: Optional[str]
+
+
+class AnalysisCreateResponse(BaseModel):
+    id: str
+    filename: str
+    status: str
+    message: str
+
+
+class SuppressionResponse(BaseModel):
+    id: int
+    scope: str
+    rule_id: Optional[str]
+    src_ip: Optional[str]
+    dst_ip: Optional[str]
+    analysis_id: Optional[str]
+    reason: str
+    note: Optional[str]
+    is_active: bool
+    expires_at: Optional[str]
+    created_by: Optional[int]
+    created_at: Optional[str]
+
+
+class TriageResponse(BaseModel):
+    id: int
+    analysis_id: str
+    finding_key: str
+    status: str
+    note: Optional[str]
+    analyst_id: Optional[int]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+# ── Request schemas ───────────────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 
-@app.post("/api/auth/login")
+class SuppressionCreate(BaseModel):
+    scope: str = Field(default="user", pattern="^(global|user|analysis)$")
+    rule_id: Optional[str] = None
+    src_ip: Optional[str] = None
+    dst_ip: Optional[str] = None
+    analysis_id: Optional[str] = None
+    reason: str = ""
+    note: Optional[str] = None
+    expires_at: Optional[str] = None   # ISO-8601 string or null
+
+
+class TriageUpdate(BaseModel):
+    status: str = Field(pattern="^(new|acknowledged|in_progress|resolved|false_positive)$")
+    note: Optional[str] = None
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+@app.post("/api/auth/login", response_model=TokenResponse)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(UserModel).filter(UserModel.username == req.username).first()
     if not user or not verify_password(req.password, user.hashed_password):
@@ -56,32 +169,57 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     return {"access_token": token, "token_type": "bearer"}
 
 
-@app.get("/api/auth/me")
+@app.get("/api/auth/me", response_model=MeResponse)
 def me(current_user: UserModel = Depends(get_current_user)):
-    return {"id": current_user.id, "username": current_user.username}
+    return {"id": current_user.id, "username": current_user.username, "is_admin": current_user.is_admin}
 
 
 # ── Analysis CRUD ─────────────────────────────────────────────────────────────
 
-@app.post("/api/analyses", status_code=202)
+@app.post("/api/analyses", status_code=202, response_model=AnalysisCreateResponse)
 async def create_analysis(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Upload a PCAP and enqueue it for async analysis. Returns immediately."""
+    """Upload a PCAP and enqueue it for async analysis."""
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
     ext = Path(file.filename).suffix.lower()
-    if ext not in (".pcap", ".pcapng", ".cap"):
-        raise HTTPException(400, "Only .pcap, .pcapng, .cap files are supported")
+    if ext not in settings.ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type. Allowed: {settings.ALLOWED_EXTENSIONS}")
 
+    # ── File size limit ───────────────────────────────────────────────────────
+    max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(413, f"File exceeds {settings.MAX_UPLOAD_MB} MB limit")
+
+    # ── Magic byte validation ─────────────────────────────────────────────────
+    if len(data) < 4 or not _check_pcap_magic(data):
+        raise HTTPException(400, "File does not appear to be a valid PCAP/PCAPng file")
+
+    # ── Per-user quota ────────────────────────────────────────────────────────
+    if settings.MAX_ANALYSES_PER_USER > 0:
+        existing = db.query(AnalysisModel).filter(
+            AnalysisModel.user_id == current_user.id
+        ).count()
+        if existing >= settings.MAX_ANALYSES_PER_USER:
+            raise HTTPException(
+                429,
+                f"Analysis quota reached ({settings.MAX_ANALYSES_PER_USER}). "
+                "Delete old analyses to continue.",
+            )
+
+    # ── Hash for dedup / cache key ────────────────────────────────────────────
+    file_hash = hashlib.sha256(data).hexdigest()
+
+    # ── Save to disk ──────────────────────────────────────────────────────────
     file_id = str(uuid.uuid4())
     dest = Path(settings.UPLOAD_DIR) / f"{file_id}{ext}"
     try:
-        with dest.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
+        dest.write_bytes(data)
     except Exception as e:
         raise HTTPException(500, f"Failed to save file: {e}")
 
@@ -90,28 +228,27 @@ async def create_analysis(
         user_id=current_user.id,
         filename=file.filename,
         file_path=str(dest),
+        file_hash=file_hash,
         status="pending",
     )
     db.add(analysis)
     db.commit()
-
-    # Enqueue job (worker picks it up within poll_interval seconds)
     enqueue(db, file_id)
 
     return {
         "id": file_id,
         "filename": file.filename,
         "status": "pending",
-        "message": "Analysis enqueued. Poll /api/analyses/{id} for status.",
+        "message": "Analysis enqueued. Poll /api/analyses/{id}/status for progress.",
     }
 
 
-@app.get("/api/analyses")
+@app.get("/api/analyses", response_model=List[AnalysisSummary])
 def list_analyses(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
     limit: int = Query(50, le=200),
-    offset: int = Query(0),
+    offset: int = Query(0, ge=0),
 ):
     rows = (
         db.query(AnalysisModel)
@@ -140,17 +277,19 @@ def get_analysis(
     return result
 
 
-@app.get("/api/analyses/{analysis_id}/status")
+@app.get("/api/analyses/{analysis_id}/status", response_model=AnalysisStatusResponse)
 def get_status(
     analysis_id: str,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Lightweight status-only endpoint for polling."""
+    """Lightweight polling endpoint — returns progress without full result payload."""
     row = _get_or_404(db, analysis_id, current_user.id)
     return {
         "id": row.id,
         "status": row.status,
+        "current_stage": row.current_stage,
+        "progress_pct": row.progress_pct or 0,
         "packet_count": row.packet_count,
         "issue_count": row.issue_count,
         "critical_count": row.critical_count,
@@ -172,6 +311,10 @@ def delete_analysis(
             Path(row.file_path).unlink()
         except OSError:
             pass
+    # Cascade: triage records
+    db.query(FindingTriageModel).filter(
+        FindingTriageModel.analysis_id == analysis_id
+    ).delete()
     db.delete(row)
     db.commit()
 
@@ -181,20 +324,19 @@ def delete_analysis(
 @app.get("/api/analyses/compare")
 def compare_analyses(
     a: str = Query(..., description="ID of baseline analysis"),
-    b: str = Query(..., description="ID of new analysis"),
+    b: str = Query(..., description="ID of incident analysis"),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
     row_a = _get_or_404(db, a, current_user.id)
     row_b = _get_or_404(db, b, current_user.id)
     if row_a.status != "completed" or row_b.status != "completed":
-        raise HTTPException(400, "Both analyses must be completed")
+        raise HTTPException(400, "Both analyses must be completed before comparing")
     try:
         data_a = json.loads(row_a.result_json)
         data_b = json.loads(row_b.result_json)
     except (json.JSONDecodeError, TypeError):
         raise HTTPException(500, "Failed to parse analysis results")
-
     from reporting.compare import compare
     return compare(data_a, data_b)
 
@@ -207,7 +349,7 @@ def get_report(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Generate and download a self-contained HTML report."""
+    """Generate and stream a self-contained HTML report."""
     from fastapi.responses import Response
     from reporting.html_report import generate_html_report
     row = _get_or_404(db, analysis_id, current_user.id)
@@ -215,10 +357,7 @@ def get_report(
         raise HTTPException(400, "Analysis not completed")
     if not row.result_json:
         raise HTTPException(404, "No result data")
-    try:
-        data = json.loads(row.result_json)
-    except json.JSONDecodeError:
-        raise HTTPException(500, "Failed to parse analysis result")
+    data = json.loads(row.result_json)
     html_content = generate_html_report(data, analysis_id, row.filename)
     safe_name = row.filename.replace(" ", "_").replace("/", "_")
     return Response(
@@ -253,38 +392,80 @@ def export_analysis(
 
 # ── Suppression Rules ─────────────────────────────────────────────────────────
 
-class SuppressionCreate(BaseModel):
-    rule_id: Optional[str] = None
-    src_ip: Optional[str] = None
-    dst_ip: Optional[str] = None
-    reason: str = ""
-
-
-@app.get("/api/suppressions")
+@app.get("/api/suppressions", response_model=List[SuppressionResponse])
 def list_suppressions(
+    scope: Optional[str] = Query(None, description="Filter by scope: global|user|analysis"),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    rows = db.query(SuppressionRuleModel).order_by(SuppressionRuleModel.created_at.desc()).all()
+    q = db.query(SuppressionRuleModel)
+    if scope:
+        q = q.filter(SuppressionRuleModel.scope == scope)
+    # Non-admins see only their own + global rules
+    if not current_user.is_admin:
+        q = q.filter(
+            (SuppressionRuleModel.scope == "global") |
+            (SuppressionRuleModel.created_by == current_user.id)
+        )
+    rows = q.order_by(SuppressionRuleModel.created_at.desc()).all()
     return [_suppression_dict(r) for r in rows]
 
 
-@app.post("/api/suppressions", status_code=201)
+@app.post("/api/suppressions", status_code=201, response_model=SuppressionResponse)
 def create_suppression(
     req: SuppressionCreate,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
     if not req.rule_id and not req.src_ip and not req.dst_ip:
-        raise HTTPException(400, "At least one of rule_id, src_ip, or dst_ip must be specified")
+        raise HTTPException(400, "At least one of rule_id, src_ip, dst_ip must be specified")
+
+    # Global scope requires admin
+    if req.scope == "global" and not current_user.is_admin:
+        raise HTTPException(403, "Only admins may create global suppression rules")
+
+    # analysis-scoped rules must reference an analysis the user owns
+    if req.scope == "analysis" and req.analysis_id:
+        _get_or_404(db, req.analysis_id, current_user.id)
+
+    expires_at = None
+    if req.expires_at:
+        try:
+            expires_at = datetime.fromisoformat(req.expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(400, "expires_at must be ISO-8601 format")
+
     rule = SuppressionRuleModel(
+        scope=req.scope,
         rule_id=req.rule_id or None,
         src_ip=req.src_ip or None,
         dst_ip=req.dst_ip or None,
+        analysis_id=req.analysis_id or None,
         reason=req.reason,
+        note=req.note,
+        is_active=True,
+        expires_at=expires_at,
         created_by=current_user.id,
     )
     db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return _suppression_dict(rule)
+
+
+@app.patch("/api/suppressions/{rule_id}", response_model=SuppressionResponse)
+def toggle_suppression(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Toggle is_active on a suppression rule (enable/disable without deleting)."""
+    rule = db.query(SuppressionRuleModel).filter(SuppressionRuleModel.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Suppression rule not found")
+    if not current_user.is_admin and rule.created_by != current_user.id:
+        raise HTTPException(403, "Not authorized to modify this rule")
+    rule.is_active = not rule.is_active
     db.commit()
     db.refresh(rule)
     return _suppression_dict(rule)
@@ -299,8 +480,71 @@ def delete_suppression(
     rule = db.query(SuppressionRuleModel).filter(SuppressionRuleModel.id == rule_id).first()
     if not rule:
         raise HTTPException(404, "Suppression rule not found")
+    if not current_user.is_admin and rule.created_by != current_user.id:
+        raise HTTPException(403, "Not authorized to delete this rule")
     db.delete(rule)
     db.commit()
+
+
+# ── Analyst Triage ────────────────────────────────────────────────────────────
+
+@app.get("/api/analyses/{analysis_id}/triage", response_model=List[TriageResponse])
+def list_triage(
+    analysis_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return all triage records for an analysis."""
+    _get_or_404(db, analysis_id, current_user.id)
+    rows = (
+        db.query(FindingTriageModel)
+        .filter(FindingTriageModel.analysis_id == analysis_id)
+        .all()
+    )
+    return [_triage_dict(r) for r in rows]
+
+
+@app.put(
+    "/api/analyses/{analysis_id}/triage/{finding_key:path}",
+    response_model=TriageResponse,
+)
+def upsert_triage(
+    analysis_id: str,
+    finding_key: str,
+    req: TriageUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Create or update triage state for a single finding."""
+    _get_or_404(db, analysis_id, current_user.id)
+
+    row = (
+        db.query(FindingTriageModel)
+        .filter(
+            FindingTriageModel.analysis_id == analysis_id,
+            FindingTriageModel.finding_key == finding_key,
+        )
+        .first()
+    )
+    if row:
+        row.status = req.status
+        if req.note is not None:
+            row.note = req.note
+        row.analyst_id = current_user.id
+        row.updated_at = datetime.utcnow()
+    else:
+        row = FindingTriageModel(
+            analysis_id=analysis_id,
+            finding_key=finding_key,
+            status=req.status,
+            note=req.note,
+            analyst_id=current_user.id,
+        )
+        db.add(row)
+
+    db.commit()
+    db.refresh(row)
+    return _triage_dict(row)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -325,12 +569,30 @@ def _get_or_404(db: Session, analysis_id: str, user_id: int) -> AnalysisModel:
 def _suppression_dict(r: SuppressionRuleModel) -> dict:
     return {
         "id": r.id,
+        "scope": r.scope,
         "rule_id": r.rule_id,
         "src_ip": r.src_ip,
         "dst_ip": r.dst_ip,
+        "analysis_id": r.analysis_id,
         "reason": r.reason,
+        "note": r.note,
+        "is_active": r.is_active,
+        "expires_at": r.expires_at.isoformat() if r.expires_at else None,
         "created_by": r.created_by,
         "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+def _triage_dict(r: FindingTriageModel) -> dict:
+    return {
+        "id": r.id,
+        "analysis_id": r.analysis_id,
+        "finding_key": r.finding_key,
+        "status": r.status,
+        "note": r.note,
+        "analyst_id": r.analyst_id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
     }
 
 
@@ -339,6 +601,8 @@ def _summary(row: AnalysisModel) -> dict:
         "id": row.id,
         "filename": row.filename,
         "status": row.status,
+        "current_stage": row.current_stage,
+        "progress_pct": row.progress_pct or 0,
         "packet_count": row.packet_count,
         "issue_count": row.issue_count,
         "critical_count": row.critical_count,

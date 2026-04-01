@@ -45,6 +45,7 @@ def seed_admin():
             db.add(UserModel(
                 username=settings.DEFAULT_USER,
                 hashed_password=hash_password(settings.DEFAULT_PASS),
+                is_admin=True,
             ))
             db.commit()
             print(f"[seed] Created admin: {settings.DEFAULT_USER} / {settings.DEFAULT_PASS}")

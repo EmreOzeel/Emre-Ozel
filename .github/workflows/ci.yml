@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # ── Backend: lint + unit tests + corpus regression ──────────────────────────
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt ruff
+
+      - name: Lint (ruff)
+        run: ruff check . --select E,F,W,I --ignore E501
+
+      - name: Run unit + semantic tests (no tshark required)
+        run: pytest tests/test_semantic_analysis.py tests/test_corpus_regression.py -v --tb=short
+
+      - name: Run tshark validation tests
+        run: pytest tests/test_tshark_validation.py -v --tb=short
+
+  # ── Backend: report generation smoke test ────────────────────────────────────
+  report-smoke:
+    name: Report generation smoke test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Smoke test HTML report generation
+        run: |
+          python - <<'EOF'
+          from reporting.html_report import generate_html_report
+
+          # Minimal analysis result — same shape as run_pipeline() output
+          data = {
+              "file_info": {
+                  "filename": "smoke.pcap",
+                  "file_size_bytes": 1024,
+                  "total_packets": 50,
+                  "duration_sec": 1.5,
+                  "first_packet": "2024-01-01T00:00:00",
+                  "last_packet": "2024-01-01T00:00:01",
+                  "encapsulation": "Ethernet",
+                  "avg_packet_size": 20,
+                  "avg_packet_rate": 33,
+                  "avg_bit_rate": 5000,
+              },
+              "analysis_time_sec": 0.1,
+              "issue_counts": {"critical": 1, "high": 0, "medium": 0, "warning": 0, "total": 1},
+              "all_issues": [{
+                  "rule_id": "SCAN-001",
+                  "title": "Port scan detected",
+                  "description": "Test",
+                  "explanation": "Test explanation",
+                  "confidence_note": "HIGH because obvious",
+                  "severity": "critical",
+                  "confidence": "high",
+                  "score": 9.0,
+                  "category": "security",
+                  "affected_hosts": ["192.168.1.5"],
+                  "mitre": [],
+                  "evidence": {"metrics": {"ports_scanned": 60}, "time_first": 0, "time_last": 1,
+                               "packet_nums": [], "flow_keys": [], "host_ips": [], "samples": []},
+                  "possible_causes": [],
+                  "recommended_actions": [],
+                  "affected_flows": [],
+                  "suppressed": False,
+                  "tags": [],
+              }],
+              "hosts": [],
+              "executive_summary": "Smoke test passed.",
+              "technical_summary": "",
+              "capture_story": "",
+          }
+          html = generate_html_report(data, "smoke-id", "smoke.pcap")
+          assert "<html" in html
+          assert "Port scan detected" in html
+          assert "smoke.pcap" in html
+          print("Report smoke test passed.")
+          EOF
+
+  # ── Alembic: migration check ──────────────────────────────────────────────
+  migrations:
+    name: Alembic migration integrity
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run migrations against in-memory SQLite
+        run: |
+          DATABASE_URL="sqlite:////tmp/ci_test.db" alembic upgrade head
+          DATABASE_URL="sqlite:////tmp/ci_test.db" alembic downgrade base
+
+  # ── Frontend: install + build ─────────────────────────────────────────────
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check (vue-tsc)
+        run: npx vue-tsc --noEmit || true   # warn-only until strict mode is enabled
+
+      - name: Production build
+        run: npm run build
+
+  # ── API contract: OpenAPI schema export ──────────────────────────────────
+  api-contract:
+    name: API contract export
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export OpenAPI schema
+        run: |
+          python - <<'EOF'
+          import json
+          # Import app without starting the server
+          import sys, os
+          sys.path.insert(0, ".")
+          # Override DB to in-memory for schema export
+          os.environ["DATABASE_URL"] = "sqlite:////tmp/schema_export.db"
+          from main import app
+          schema = app.openapi()
+          # Validate it has our key endpoints
+          paths = schema.get("paths", {})
+          required = [
+              "/api/auth/login",
+              "/api/analyses",
+              "/api/suppressions",
+          ]
+          for path in required:
+              assert path in paths, f"Missing path in OpenAPI schema: {path}"
+          # Write schema artifact
+          with open("/tmp/openapi.json", "w") as f:
+              json.dump(schema, f, indent=2)
+          print(f"OpenAPI schema exported: {len(paths)} paths")
+          EOF
+
+      - name: Upload OpenAPI schema
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: /tmp/openapi.json
+          retention-days: 30

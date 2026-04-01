@@ -5,7 +5,7 @@ Coordinates: normalizer → analyzers → profiler → correlator → NLG → se
 from __future__ import annotations
 import time
 import dataclasses
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from normalizer.pipeline import normalize
 from analyzers import tcp, dns, http, tls, security, protocols
@@ -187,40 +187,57 @@ def _timeline_to_dict(e: TimelineEvent) -> Dict[str, Any]:
 def run_pipeline(
     pcap_path: str,
     extra_suppressions: Optional[List[Dict]] = None,
+    progress_cb: Optional[Callable[[str, int], None]] = None,
 ) -> Dict[str, Any]:
     """
     Full analysis pipeline: normalize → analyze → profile → correlate → serialize.
     Returns a JSON-serializable dict.
 
     extra_suppressions: optional list of DB suppression dicts to merge with YAML.
+    progress_cb: optional callable(stage_name, pct_0_to_100) for progress reporting.
     """
+    def _progress(stage: str, pct: int) -> None:
+        if progress_cb:
+            try:
+                progress_cb(stage, pct)
+            except Exception:
+                pass
+
     t0 = time.time()
 
     # ── 1. Normalize ──────────────────────────────────────────────────────────
+    _progress("normalize", 5)
     ctx = normalize(pcap_path)
 
     # ── 2. Run all analyzers ──────────────────────────────────────────────────
+    _progress("analyze", 20)
     tcp.analyze(ctx)
     dns.analyze(ctx)
+    _progress("analyze", 35)
     http.analyze(ctx)
     tls.analyze(ctx)
     security.analyze(ctx)
     protocols.analyze(ctx)
 
     # ── 3. Host profiling ─────────────────────────────────────────────────────
+    _progress("profile", 55)
     build_profiles(ctx)
 
     # ── 4. Correlation + storylines ───────────────────────────────────────────
+    _progress("correlate", 65)
     correlate(ctx)
 
     # ── 5. Finalize findings (suppression + sort) ─────────────────────────────
+    _progress("finalize", 75)
     finalize(ctx, extra_suppressions=extra_suppressions)
 
     # ── 6. NLG summaries ─────────────────────────────────────────────────────
+    _progress("summarize", 85)
     ctx.executive_summary = generate_executive_summary(ctx)
     ctx.technical_summary = generate_technical_summary(ctx)
 
     # ── 7. Interpretation layer ───────────────────────────────────────────────
+    _progress("interpret", 92)
     # Per-session rich interpretations
     session_interpretations: Dict[int, Dict] = {}
     for sess in ctx.sessions.values():

@@ -49,6 +49,8 @@
               v-for="f in bySeverity[sev]"
               :key="f.id"
               :finding="f"
+              :analysis-id="analysisId"
+              :initial-triage="triageMap[`${f.rule_id}|${f.affected_hosts?.[0] ?? 'unknown'}`] ?? null"
               @suppress="openSuppressDialog"
             />
           </div>
@@ -87,7 +89,7 @@ import { CircleCheck } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import FindingCard from './FindingCard.vue'
 import api from '@/api'
-import type { Finding } from '@/types/analysis'
+import type { Finding, FindingTriage } from '@/types/analysis'
 
 // FindingFilters lives in composable but re-declare for prop typing clarity
 interface Filters { severity: string; category: string; search: string }
@@ -95,7 +97,16 @@ interface Filters { severity: string; category: string; search: string }
 const props = defineProps<{
   findings: Finding[]
   filters: Filters
+  analysisId?: string
+  triageRecords?: FindingTriage[]
 }>()
+
+const triageMap = computed<Record<string, FindingTriage>>(() => {
+  if (!props.triageRecords) return {}
+  const m: Record<string, FindingTriage> = {}
+  for (const t of props.triageRecords) m[t.finding_key] = t
+  return m
+})
 
 const suppressDialog = reactive({
   visible: false,

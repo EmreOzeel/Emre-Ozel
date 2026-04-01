@@ -61,6 +61,8 @@
             <FindingsPanel
               :findings="allActiveFindings"
               :filters="findingFilters"
+              :analysis-id="analysis.id"
+              :triage-records="triageRecords"
             />
           </el-tab-pane>
 
@@ -143,10 +145,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAnalysisDetail } from '@/composables/useAnalysisDetail'
 import { classifyAnalysisError } from '@/utils/analysisErrors'
+import api from '@/api'
+import type { FindingTriage } from '@/types/analysis'
 
 // Components
 import AnalysisHeader      from '@/components/analysis/AnalysisHeader.vue'
@@ -174,18 +178,31 @@ const {
   filteredSessions,
 } = useAnalysisDetail()
 
-onMounted(() => fetch(route.params.id as string))
+// Triage records for this analysis
+const triageRecords = ref<FindingTriage[]>([])
+
+async function loadTriage(id: string) {
+  try {
+    const res = await api.get(`/analyses/${id}/triage`)
+    triageRecords.value = res.data
+  } catch {
+    triageRecords.value = []
+  }
+}
+
+onMounted(async () => {
+  const id = route.params.id as string
+  await fetch(id)
+  loadTriage(id)
+})
 
 function handleNavigate(tab: string, filters?: Record<string, string>) {
   navigateTo(tab, filters)
-  // Scroll tabs into view
   setTimeout(() => {
     document.querySelector('.main-tabs')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, 50)
 }
 
-// When the analysis job itself failed, map the raw error to a friendly message.
-// This is separate from `error` (which is set only on network/fetch failures).
 const analysisFailure = computed(() => {
   if (!analysis.value || analysis.value.status !== 'failed') return null
   return classifyAnalysisError(analysis.value.error)

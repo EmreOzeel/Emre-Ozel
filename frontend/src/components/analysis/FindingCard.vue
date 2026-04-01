@@ -97,6 +97,35 @@
       </ul>
     </div>
 
+    <!-- Analyst triage -->
+    <div class="triage-row" v-if="analysisId">
+      <span class="triage-label">Triage:</span>
+      <el-select
+        v-model="triageStatus"
+        size="small"
+        style="width: 160px"
+        :class="`triage-sel triage-${triageStatus}`"
+        @change="saveTriage"
+      >
+        <el-option value="new" label="New" />
+        <el-option value="acknowledged" label="Acknowledged" />
+        <el-option value="in_progress" label="In Progress" />
+        <el-option value="resolved" label="Resolved" />
+        <el-option value="false_positive" label="False Positive" />
+      </el-select>
+      <el-input
+        v-if="showTriageNote"
+        v-model="triageNote"
+        size="small"
+        placeholder="Analyst note…"
+        style="flex: 1; min-width: 180px"
+        @blur="saveTriage"
+      />
+      <el-button size="small" plain text @click="showTriageNote = !showTriageNote">
+        {{ showTriageNote ? 'Hide note' : 'Add note' }}
+      </el-button>
+    </div>
+
     <!-- Quick suppress -->
     <div class="suppress-row" v-if="!finding.suppressed && finding.rule_id">
       <el-button size="small" plain type="info" @click="emit('suppress', finding)">
@@ -110,11 +139,39 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import type { Finding } from '@/types/analysis'
+import { computed, ref, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
+import api from '@/api'
+import type { Finding, FindingTriage, TriageStatus } from '@/types/analysis'
 
-const props = defineProps<{ finding: Finding }>()
+const props = defineProps<{
+  finding: Finding
+  analysisId?: string
+  initialTriage?: FindingTriage | null
+}>()
 const emit = defineEmits<{ (e: 'suppress', finding: Finding): void }>()
+
+// ── Triage state ──────────────────────────────────────────────────────────────
+const findingKey = computed(() => {
+  const host = props.finding.affected_hosts?.[0] ?? 'unknown'
+  return `${props.finding.rule_id}|${host}`
+})
+
+const triageStatus = ref<TriageStatus>(props.initialTriage?.status ?? 'new')
+const triageNote = ref<string>(props.initialTriage?.note ?? '')
+const showTriageNote = ref(false)
+
+async function saveTriage() {
+  if (!props.analysisId) return
+  try {
+    await api.put(
+      `/analyses/${props.analysisId}/triage/${encodeURIComponent(findingKey.value)}`,
+      { status: triageStatus.value, note: triageNote.value || null },
+    )
+  } catch {
+    ElMessage.error('Failed to save triage state')
+  }
+}
 
 const sevType = computed(() => {
   const m: Record<string, string> = {
@@ -228,6 +285,21 @@ function fmtTs(epoch: number): string {
 /* ── Actions ────────────────────────────────────────────────── */
 .actions-block { background: #f0f9eb; border-radius: 4px; padding: 8px 12px; margin-top: 8px; font-size: 13px; }
 .actions-block ul { margin: 0; padding-left: 18px; color: #529b2e; line-height: 1.8; }
+
+/* ── Triage ─────────────────────────────────────────────────── */
+.triage-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; padding: 6px 10px;
+  background: #f9f9fb; border: 1px solid #ebeef5; border-radius: 4px;
+}
+.triage-label { font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; color: #909399; white-space: nowrap; }
+
+/* Triage select accent colors */
+.triage-sel.triage-resolved :deep(.el-input__wrapper) { border-color: #67c23a; }
+.triage-sel.triage-false_positive :deep(.el-input__wrapper) { border-color: #909399; }
+.triage-sel.triage-in_progress :deep(.el-input__wrapper) { border-color: #e6a23c; }
+.triage-sel.triage-acknowledged :deep(.el-input__wrapper) { border-color: #409eff; }
 
 /* ── Suppress ───────────────────────────────────────────────── */
 .suppress-row { margin-top: 10px; }

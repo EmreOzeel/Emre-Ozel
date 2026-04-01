@@ -307,26 +307,49 @@ export interface AnalysisData {
   tcp_conversations: Record<string, unknown>[]
 }
 
-export interface AnalysisDetail {
+export interface AnalysisDetail extends AnalysisSummary {
+  data: AnalysisData | null
+}
+
+export interface SuppressionRule {
+  id: number
+  scope: 'global' | 'user' | 'analysis'
+  rule_id: string | null
+  src_ip: string | null
+  dst_ip: string | null
+  analysis_id: string | null
+  reason: string
+  note: string | null
+  is_active: boolean
+  expires_at: string | null
+  created_by: number | null
+  created_at: string | null
+}
+
+export type TriageStatus = 'new' | 'acknowledged' | 'in_progress' | 'resolved' | 'false_positive'
+
+export interface FindingTriage {
+  id: number
+  analysis_id: string
+  finding_key: string
+  status: TriageStatus
+  note: string | null
+  analyst_id: number | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface AnalysisSummary {
   id: string
   filename: string
   status: 'pending' | 'running' | 'completed' | 'failed'
   packet_count: number | null
   issue_count: number | null
   critical_count: number | null
+  current_stage: string | null
+  progress_pct: number
   created_at: string | null
   started_at: string | null
   finished_at: string | null
   error: string | null
-  data: AnalysisData | null
-}
-
-export interface SuppressionRule {
-  id: number
-  rule_id: string | null
-  src_ip: string | null
-  dst_ip: string | null
-  reason: string
-  created_by: number | null
-  created_at: string | null
 }

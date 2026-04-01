@@ -1,15 +1,31 @@
+"""
+SQLAlchemy ORM models and engine factory.
+Supports SQLite (default) and PostgreSQL (set DATABASE_URL).
+"""
 import os
-from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text, DateTime, ForeignKey
+from sqlalchemy import (
+    create_engine, Column, Integer, String,
+    Text, DateTime, ForeignKey, Boolean,
+)
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.sql import func
 from config import settings
 
-os.makedirs(os.path.dirname(settings.DB_PATH), exist_ok=True)
+# ── Engine factory ─────────────────────────────────────────────────────────────
+_url = settings.effective_db_url
+_is_sqlite = _url.startswith("sqlite")
 
-engine = create_engine(
-    f"sqlite:///{settings.DB_PATH}",
-    connect_args={"check_same_thread": False},
-)
+if _is_sqlite:
+    os.makedirs(os.path.dirname(settings.DB_PATH), exist_ok=True)
+    engine = create_engine(_url, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(
+        _url,
+        pool_pre_ping=True,   # detect stale connections
+        pool_size=5,
+        max_overflow=10,
+    )
+
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -17,21 +33,27 @@ class Base(DeclarativeBase):
     pass
 
 
+# ── Models ─────────────────────────────────────────────────────────────────────
+
 class UserModel(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 
 
 class AnalysisModel(Base):
     __tablename__ = "analyses"
-    id = Column(String, primary_key=True)           # UUID string
+    id = Column(String, primary_key=True)                   # UUID string
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     filename = Column(String, nullable=False)
     file_path = Column(String, nullable=True)
-    status = Column(String, default="pending")       # pending / running / completed / failed
+    file_hash = Column(String, nullable=True, index=True)   # SHA-256 for dedup / caching
+    status = Column(String, default="pending")              # pending/running/completed/failed
+    current_stage = Column(String, nullable=True)           # normalize/analyze/profile/…
+    progress_pct = Column(Integer, default=0)               # 0–100
     packet_count = Column(Integer, default=0)
     issue_count = Column(Integer, default=0)
     critical_count = Column(Integer, default=0)
@@ -44,19 +66,51 @@ class AnalysisModel(Base):
 
 class SuppressionRuleModel(Base):
     """
-    Persistent suppression rule — marks matching findings as suppressed.
-    Rules are global (team-wide) — any matching finding from any analysis
-    is suppressed when results are viewed.
+    Persistent suppression rule.
+
+    scope:
+      - "global"   — applies to all users; only admins may create
+      - "user"     — applies to creator only (default)
+      - "analysis" — applies to a single analysis run; set analysis_id
+
+    Rules with expires_at < now() or is_active=False are ignored at job time.
     """
     __tablename__ = "suppression_rules"
     id = Column(Integer, primary_key=True, index=True)
-    rule_id = Column(String, nullable=True)    # e.g. "SCAN-001" — null = match all
-    src_ip = Column(String, nullable=True)     # null = match any src
-    dst_ip = Column(String, nullable=True)     # null = match any dst
+    scope = Column(String, default="user", nullable=False)      # global | user | analysis
+    rule_id = Column(String, nullable=True)                     # e.g. "SCAN-001" — null = any
+    src_ip = Column(String, nullable=True)                      # null = any src
+    dst_ip = Column(String, nullable=True)                      # null = any dst
+    analysis_id = Column(String, ForeignKey("analyses.id"), nullable=True)
     reason = Column(String, nullable=False, default="")
+    note = Column(Text, nullable=True)                          # long-form analyst note
+    is_active = Column(Boolean, default=True, nullable=False)
+    expires_at = Column(DateTime, nullable=True)                # null = never expires
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
+
+class FindingTriageModel(Base):
+    """
+    Per-finding analyst triage state.
+
+    finding_key is a stable composite: "{rule_id}|{primary_affected_host}"
+    This allows triage state to persist even if the analysis is re-run.
+
+    status values: new | acknowledged | in_progress | resolved | false_positive
+    """
+    __tablename__ = "finding_triage"
+    id = Column(Integer, primary_key=True, index=True)
+    analysis_id = Column(String, ForeignKey("analyses.id"), nullable=False, index=True)
+    finding_key = Column(String, nullable=False, index=True)
+    status = Column(String, default="new", nullable=False)
+    note = Column(Text, nullable=True)
+    analyst_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+# ── Session / init helpers ─────────────────────────────────────────────────────
 
 def get_db():
     db = SessionLocal()
