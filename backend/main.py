@@ -199,6 +199,35 @@ def compare_analyses(
     return compare(data_a, data_b)
 
 
+# ── Report ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/analyses/{analysis_id}/report")
+def get_report(
+    analysis_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Generate and download a self-contained HTML report."""
+    from fastapi.responses import Response
+    from reporting.html_report import generate_html_report
+    row = _get_or_404(db, analysis_id, current_user.id)
+    if row.status != "completed":
+        raise HTTPException(400, "Analysis not completed")
+    if not row.result_json:
+        raise HTTPException(404, "No result data")
+    try:
+        data = json.loads(row.result_json)
+    except json.JSONDecodeError:
+        raise HTTPException(500, "Failed to parse analysis result")
+    html_content = generate_html_report(data, analysis_id, row.filename)
+    safe_name = row.filename.replace(" ", "_").replace("/", "_")
+    return Response(
+        content=html_content,
+        media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_report.html"'},
+    )
+
+
 # ── Export ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/analyses/{analysis_id}/export")

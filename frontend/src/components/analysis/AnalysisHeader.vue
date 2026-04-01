@@ -42,13 +42,20 @@
           Clean
         </el-tag>
       </template>
+
+      <!-- Export actions -->
+      <template v-if="analysis.status === 'completed'">
+        <el-button size="small" plain :icon="Download" @click="downloadReport">Report</el-button>
+        <el-button size="small" plain :icon="Download" @click="downloadJson">JSON</el-button>
+      </template>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { ArrowLeft } from '@element-plus/icons-vue'
+import { ArrowLeft, Download } from '@element-plus/icons-vue'
+import api from '@/api'
 import type { AnalysisDetail, AnalysisData } from '@/types/analysis'
 
 const props = defineProps<{
@@ -80,6 +87,26 @@ function formatDuration(s: number): string {
   if (s < 60) return s.toFixed(1) + 's'
   if (s < 3600) return `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+}
+
+async function downloadReport() {
+  const res = await api.get(`/analyses/${props.analysis.id}/report`, { responseType: 'blob' })
+  const url = URL.createObjectURL(res.data)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${props.analysis.filename}_report.html`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function downloadJson() {
+  const res = await api.get(`/analyses/${props.analysis.id}/export`, { responseType: 'blob' })
+  const url = URL.createObjectURL(res.data)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${props.analysis.filename}_analysis.json`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 </script>
 
