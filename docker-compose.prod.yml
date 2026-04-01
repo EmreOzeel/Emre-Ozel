@@ -1,0 +1,104 @@
+version: '3.8'
+
+# Production compose: backend + frontend + PostgreSQL + nginx reverse proxy.
+#
+# Prerequisites:
+#   1. Copy .env.example → .env and set JWT_SECRET, POSTGRES_PASSWORD, DOMAIN, etc.
+#   2. Create SSL certs at ./nginx/certs/fullchain.pem and privkey.pem
+#      (see nginx/README for Let's Encrypt / Certbot instructions).
+#   3. docker compose -f docker-compose.prod.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pcap-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pcap}
+      POSTGRES_USER: ${POSTGRES_USER:-pcap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - pcap-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pcap} -d ${POSTGRES_DB:-pcap}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      network: host
+    container_name: pcap-backend
+    restart: unless-stopped
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS:-24}
+      DEFAULT_USER: ${DEFAULT_USER:-admin}
+      DEFAULT_PASS: ${DEFAULT_PASS:?Set DEFAULT_PASS in .env}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pcap}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pcap}
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-100}
+      ANALYSIS_TIMEOUT_SEC: ${ANALYSIS_TIMEOUT_SEC:-300}
+      MAX_ANALYSES_PER_USER: ${MAX_ANALYSES_PER_USER:-0}
+      ALLOWED_ORIGINS: '["https://${DOMAIN:-localhost}"]'
+    volumes:
+      - upload-data:/data/uploads
+    networks:
+      - pcap-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      network: host
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: pcap-frontend
+    restart: unless-stopped
+    networks:
+      - pcap-internal
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: pcap-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - nginx-logs:/var/log/nginx
+    networks:
+      - pcap-internal
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  postgres-data:
+    driver: local
+  upload-data:
+    driver: local
+  nginx-logs:
+    driver: local
+
+networks:
+  pcap-internal:
+    driver: bridge
+    internal: false   # nginx needs outbound for OCSP stapling

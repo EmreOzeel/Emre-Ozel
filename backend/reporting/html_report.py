@@ -210,6 +210,99 @@ def _technical(data: Dict) -> str:
     return _section("Technical Summary", f"<p>{summary}</p>")
 
 
+def _impact_banner(data: Dict) -> str:
+    """Non-technical risk banner using decision_support.risk_summary."""
+    ds = data.get("decision_support", {}) or {}
+    risk = ds.get("risk_level", "")
+    summary = ds.get("risk_summary", "")
+    if not risk or not summary:
+        return ""
+
+    color = {
+        "critical": "#f56c6c", "high": "#e6a23c",
+        "medium": "#f0c040", "low": "#409eff", "clean": "#67c23a",
+    }.get(risk, "#909399")
+    bg = {
+        "critical": "#fff5f5", "high": "#fdf6ec",
+        "medium": "#fefbe6", "low": "#ecf5ff", "clean": "#f0fff4",
+    }.get(risk, "#f4f4f5")
+
+    return f"""
+<div class="impact-banner" style="border-left-color:{color}; background:{bg}">
+  <div class="impact-label" style="color:{color}">RISK LEVEL: {_e(risk.upper())}</div>
+  <p class="impact-text">{_e(summary)}</p>
+</div>"""
+
+
+def _decision_support_section(data: Dict) -> str:
+    """Ranked root causes with investigation steps — for analysts."""
+    ds = data.get("decision_support", {}) or {}
+    causes = ds.get("ranked_causes", [])
+    steps = ds.get("investigation_steps", [])
+    guidance = ds.get("resolution_guidance", "")
+
+    if not causes:
+        return ""
+
+    cards = []
+    for c in causes:
+        prob_pct = c.get("probability_pct", 0)
+        prob_label = c.get("probability", "")
+        prob_color = "#f56c6c" if prob_pct >= 75 else ("#e6a23c" if prob_pct >= 45 else "#909399")
+        steps_html = "".join(f"<li>{_e(s)}</li>" for s in (c.get("next_steps") or []))
+        cards.append(f"""
+<div class="cause-card">
+  <div class="cause-header">
+    <span class="cause-rank">#{_e(c.get('rank',''))}</span>
+    <span class="cause-title">{_e(c.get('cause',''))}</span>
+    <span class="prob-badge" style="color:{prob_color}">
+      {_e(prob_label.upper())} ({prob_pct}%)
+    </span>
+  </div>
+  <p class="cause-evidence">{_e(c.get('evidence_summary',''))}</p>
+  <div class="cause-steps">
+    <b>Investigation steps:</b>
+    <ol>{steps_html}</ol>
+  </div>
+  <div class="cause-resolution">
+    <b>Resolved when:</b> {_e(c.get('resolution',''))}
+  </div>
+</div>""")
+
+    steps_html = "".join(
+        f'<li class="inv-step">{_e(s)}</li>' for s in steps
+    )
+    content = (
+        "\n".join(cards) +
+        (f"<h3>Prioritized investigation steps</h3><ol>{steps_html}</ol>" if steps else "") +
+        (f'<div class="guidance-block">{_e(guidance)}</div>' if guidance else "")
+    )
+    return _section("Decision Support — Investigation Guidance", content)
+
+
+def _sanity_warnings_section(data: Dict) -> str:
+    """Render sanity check contradictions as analyst notices."""
+    warnings = data.get("sanity_warnings", []) or []
+    if not warnings:
+        return ""
+
+    items = []
+    for w in warnings:
+        sev = w.get("severity", "info")
+        color = "#e6a23c" if sev == "warning" else "#909399"
+        items.append(
+            f'<div class="sanity-item" style="border-left-color:{color}">'
+            f'<span class="sanity-id">{_e(w.get("check_id",""))}</span> '
+            f'{_e(w.get("message",""))}'
+            + (f'<div class="sanity-detail">{_e(w.get("detail",""))}</div>' if w.get("detail") else "")
+            + "</div>"
+        )
+    return _section(
+        f"Analysis Sanity Checks ({len(warnings)} notice(s))",
+        "\n".join(items),
+    )
+
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 
 _CSS = """
@@ -266,24 +359,75 @@ p { margin: 0 0 8px; }
 .metric-table { width: auto; margin: 6px 0; font-size: 12px; }
 .metric-table td { padding: 2px 12px 2px 0; border: none; }
 .hosts-row, .mitre-row { font-size: 11px; color: #909399; margin-top: 4px; }
+
+/* Impact banner */
+.impact-banner { border-left: 5px solid; border-radius: 6px; padding: 14px 18px;
+                 margin-bottom: 20px; }
+.impact-label { font-size: 13px; font-weight: 800; letter-spacing: .05em; margin-bottom: 6px; }
+.impact-text { margin: 0; font-size: 13px; line-height: 1.7; }
+
+/* Decision support */
+.cause-card { border: 1px solid #ebeef5; border-radius: 6px; padding: 12px 16px;
+              margin-bottom: 10px; }
+.cause-header { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+.cause-rank { font-size: 13px; font-weight: 700; color: #909399; min-width: 20px; }
+.cause-title { font-size: 14px; font-weight: 600; flex: 1; }
+.prob-badge { font-size: 11px; font-weight: 700; white-space: nowrap; }
+.cause-evidence { color: #606266; font-size: 12px; margin: 4px 0 8px; }
+.cause-steps { font-size: 12px; margin: 6px 0; }
+.cause-steps ol { margin: 4px 0 0 16px; padding: 0; }
+.cause-steps li { margin: 3px 0; }
+.cause-resolution { font-size: 12px; color: #67c23a; margin-top: 8px; padding: 5px 10px;
+                    background: #f0fff4; border-radius: 4px; }
+.inv-step { margin: 4px 0; font-size: 12px; }
+.guidance-block { margin-top: 14px; padding: 10px 14px; background: #f4f4f5;
+                  border-radius: 4px; font-size: 12px; color: #606266; line-height: 1.7; }
+
+/* Sanity warnings */
+.sanity-item { border-left: 3px solid; padding: 6px 12px; margin-bottom: 8px;
+               border-radius: 0 4px 4px 0; background: #fdf6ec; font-size: 12px; }
+.sanity-id { font-weight: 700; margin-right: 6px; color: #e6a23c; }
+.sanity-detail { color: #909399; margin-top: 3px; font-size: 11px; }
 """
 
 
 # ── Main entry ────────────────────────────────────────────────────────────────
 
-def generate_html_report(data: Dict[str, Any], analysis_id: str, filename: str) -> str:
-    """Return a complete self-contained HTML string for the given analysis result dict."""
+def generate_html_report(
+    data: Dict[str, Any],
+    analysis_id: str,
+    filename: str,
+    executive_only: bool = False,
+) -> str:
+    """
+    Return a complete self-contained HTML string for the given analysis result dict.
+
+    executive_only=True: produce a simplified view with only the impact banner,
+    executive summary, and decision guidance — no raw technical tables.
+    """
     generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    body = (
-        _overview(data) +
-        _executive(data) +
-        _findings(data) +
-        _hosts(data) +
-        _tcp_section(data) +
-        _dns_section(data) +
-        _technical(data)
-    )
+    impact = _impact_banner(data)
+
+    if executive_only:
+        body = (
+            impact +
+            _executive(data) +
+            _decision_support_section(data)
+        )
+    else:
+        body = (
+            impact +
+            _overview(data) +
+            _executive(data) +
+            _decision_support_section(data) +
+            _findings(data) +
+            _hosts(data) +
+            _tcp_section(data) +
+            _dns_section(data) +
+            _technical(data) +
+            _sanity_warnings_section(data)
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en">

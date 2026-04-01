@@ -18,9 +18,11 @@ from config import settings
 from database import (
     get_db, init_db,
     UserModel, AnalysisModel, SuppressionRuleModel, FindingTriageModel,
+    TelemetryEventModel,
 )
 from auth import verify_password, create_token, get_current_user, seed_admin
 from jobs.queue import enqueue, start_worker, stop_worker
+from telemetry import track
 
 # ── PCAP magic bytes ──────────────────────────────────────────────────────────
 # pcap little-endian, pcap big-endian, pcapng
@@ -235,6 +237,12 @@ async def create_analysis(
     db.commit()
     enqueue(db, file_id)
 
+    track("analysis.started", user_id=current_user.id, properties={
+        "analysis_id": file_id,
+        "file_size_bytes": len(data),
+        "extension": ext,
+    })
+
     return {
         "id": file_id,
         "filename": file.filename,
@@ -338,7 +346,9 @@ def compare_analyses(
     except (json.JSONDecodeError, TypeError):
         raise HTTPException(500, "Failed to parse analysis results")
     from reporting.compare import compare
-    return compare(data_a, data_b)
+    result = compare(data_a, data_b)
+    track("compare.executed", user_id=current_user.id, properties={"analysis_a": a, "analysis_b": b})
+    return result
 
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -346,10 +356,15 @@ def compare_analyses(
 @app.get("/api/analyses/{analysis_id}/report")
 def get_report(
     analysis_id: str,
+    format: Optional[str] = Query(None, description="'executive' for non-technical summary"),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Generate and stream a self-contained HTML report."""
+    """Generate and stream a self-contained HTML report.
+
+    ?format=executive returns a simplified view for non-technical stakeholders
+    (impact summary + decision guidance only, no raw technical tables).
+    """
     from fastapi.responses import Response
     from reporting.html_report import generate_html_report
     row = _get_or_404(db, analysis_id, current_user.id)
@@ -358,12 +373,17 @@ def get_report(
     if not row.result_json:
         raise HTTPException(404, "No result data")
     data = json.loads(row.result_json)
-    html_content = generate_html_report(data, analysis_id, row.filename)
+    executive_only = (format == "executive")
+    html_content = generate_html_report(data, analysis_id, row.filename, executive_only=executive_only)
     safe_name = row.filename.replace(" ", "_").replace("/", "_")
+    suffix = "_executive" if executive_only else ""
+    track("report.downloaded", user_id=current_user.id, properties={
+        "analysis_id": analysis_id, "format": format or "full",
+    })
     return Response(
         content=html_content,
         media_type="text/html",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}_report.html"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}{suffix}_report.html"'},
     )
 
 
@@ -450,6 +470,7 @@ def create_suppression(
     db.add(rule)
     db.commit()
     db.refresh(rule)
+    track("suppression.created", user_id=current_user.id, properties={"scope": req.scope, "rule_id": req.rule_id})
     return _suppression_dict(rule)
 
 
@@ -544,7 +565,45 @@ def upsert_triage(
 
     db.commit()
     db.refresh(row)
+    track("triage.updated", user_id=current_user.id, properties={
+        "analysis_id": analysis_id,
+        "status": req.status,
+    })
     return _triage_dict(row)
+
+
+# ── Telemetry summary (admin only) ────────────────────────────────────────────
+
+@app.get("/api/telemetry/summary")
+def telemetry_summary(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Aggregate telemetry counts by event type. Admin only."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    from sqlalchemy import func as sqlfunc
+    rows = (
+        db.query(TelemetryEventModel.event_type, sqlfunc.count(TelemetryEventModel.id))
+        .group_by(TelemetryEventModel.event_type)
+        .all()
+    )
+    counts = {event_type: count for event_type, count in rows}
+
+    # Total analyses in DB for context
+    total_analyses = db.query(AnalysisModel).count()
+    completed = db.query(AnalysisModel).filter(AnalysisModel.status == "completed").count()
+    failed = db.query(AnalysisModel).filter(AnalysisModel.status == "failed").count()
+
+    return {
+        "event_counts": counts,
+        "analyses": {
+            "total": total_analyses,
+            "completed": completed,
+            "failed": failed,
+        },
+    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

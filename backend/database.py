@@ -90,6 +90,26 @@ class SuppressionRuleModel(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class TelemetryEventModel(Base):
+    """
+    Non-sensitive usage telemetry.
+
+    Only structural events are recorded — no user data, no PCAP content,
+    no IP addresses, no findings content.
+
+    event_type values:
+      analysis.started | analysis.completed | analysis.failed |
+      suppression.created | triage.updated | report.downloaded | compare.executed
+    """
+    __tablename__ = "telemetry_events"
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Structural properties only — JSON string with no sensitive content
+    properties_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
 class FindingTriageModel(Base):
     """
     Per-finding analyst triage state.

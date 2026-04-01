@@ -14,6 +14,8 @@ from correlator.engine import correlate
 from detection.engine import finalize
 from core.nlg import generate_executive_summary, generate_technical_summary
 from core.interpret import interpret_session, assess_capture_quality, generate_bullet_summary
+from core.decision import build_decision_report
+from core.sanity import run_sanity_checks
 from models import (
     CaptureContext, Finding, Evidence, HostProfile,
     DnsTransaction, HttpTransaction, TlsHandshake,
@@ -249,6 +251,12 @@ def run_pipeline(
     # Bullet summary
     bullet_summary = generate_bullet_summary(ctx)
 
+    # ── 8. Decision support ───────────────────────────────────────────────────
+    _progress("decision", 96)
+    active_findings = [_finding_to_dict(f) for f in ctx.findings if not f.suppressed]
+    host_dicts = [_host_to_dict(h) for h in ctx.hosts.values()]
+    decision_support = build_decision_report(active_findings, host_dicts)
+
     ctx.analysis_time_sec = round(time.time() - t0, 2)
 
     # ── 8. Serialize to JSON-safe dict ────────────────────────────────────────
@@ -270,7 +278,7 @@ def run_pipeline(
     # Top hosts by anomaly score
     hosts_sorted = sorted(ctx.hosts.values(), key=lambda h: -h.anomaly_score)[:100]
 
-    return {
+    result = {
         # File metadata
         "file_info": dataclasses.asdict(ctx.file_info),
         "packets_analyzed": ctx.packets_analyzed,
@@ -353,4 +361,16 @@ def run_pipeline(
         "executive_summary": ctx.executive_summary,
         "technical_summary": ctx.technical_summary,
         "capture_story": ctx.capture_story,
+
+        # Decision support
+        "decision_support": decision_support,
+
+        # Sanity checks (contradictions between findings and raw stats)
+        "sanity_warnings": [],   # filled in post-serialize below
     }
+
+    # ── 9. Sanity checks (need the serialized result dict) ────────────────────
+    _progress("sanity", 99)
+    result["sanity_warnings"] = run_sanity_checks(result)
+
+    return result

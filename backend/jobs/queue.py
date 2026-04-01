@@ -196,6 +196,10 @@ class AnalysisWorker(threading.Thread):
                     row.current_stage = None
                     db.commit()
                 log.error(f"Analysis {analysis_id} timed out after {timeout_sec}s")
+                from telemetry import track
+                track("analysis.failed", user_id=user_id, properties={
+                    "analysis_id": analysis_id, "reason": "timeout", "timeout_sec": timeout_sec,
+                })
                 return
 
             if error_holder:
@@ -208,6 +212,10 @@ class AnalysisWorker(threading.Thread):
                     row.finished_at = datetime.utcnow()
                     row.current_stage = None
                     db.commit()
+                from telemetry import track
+                track("analysis.failed", user_id=user_id, properties={
+                    "analysis_id": analysis_id, "reason": type(exc).__name__,
+                })
                 return
 
             result = result_holder[0]
@@ -222,6 +230,15 @@ class AnalysisWorker(threading.Thread):
                 row.progress_pct = 100
                 row.current_stage = None
                 db.commit()
+            from telemetry import track
+            track("analysis.completed", user_id=user_id, properties={
+                "analysis_id": analysis_id,
+                "packet_count": result.get("file_info", {}).get("total_packets", 0),
+                "issue_count": result.get("issue_counts", {}).get("total", 0),
+                "critical_count": result.get("issue_counts", {}).get("critical", 0),
+                "duration_sec": result.get("analysis_time_sec", 0),
+                "sanity_warnings": len(result.get("sanity_warnings", [])),
+            })
             log.info(f"Analysis {analysis_id} completed")
 
         finally:
