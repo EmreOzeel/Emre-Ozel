@@ -88,6 +88,8 @@ export interface Finding {
   severity: Severity
   confidence: Confidence
   score: number
+  /** Evidence quality score 0–100. High = many packets + concrete metrics; low = thin / heuristic. */
+  confidence_score: number
   category: string
   title: string
   description: string
@@ -279,6 +281,39 @@ export interface TimelineEvent {
   packet_num: number
 }
 
+// ─── Sanity checks / trust score ─────────────────────────────────────────────
+
+export interface SanityWarning {
+  check_id: string
+  severity: 'warning' | 'info'
+  message: string
+  detail: string
+  related_finding: string | null
+  affected_host: string | null
+}
+
+export interface TrustComponents {
+  capture_completeness: number
+  finding_quality: number
+  contradiction_penalty: number
+}
+
+export interface LowConfidenceFinding {
+  rule_id: string
+  title: string
+  severity: string
+  confidence_score: number
+  reason: string
+}
+
+export interface TrustScore {
+  trust_score: number
+  trust_label: string
+  trust_reasons: string[]
+  low_confidence_findings: LowConfidenceFinding[]
+  components: TrustComponents
+}
+
 // ─── Top-level analysis response ─────────────────────────────────────────────
 
 export interface AnalysisData {
@@ -305,6 +340,11 @@ export interface AnalysisData {
   technical_summary: string
   capture_story: string
   tcp_conversations: Record<string, unknown>[]
+  /** Sanity check contradictions between findings and raw stats. */
+  sanity_warnings: SanityWarning[]
+  /** Overall analysis trust score. */
+  trust: TrustScore
+  decision_support: Record<string, unknown>
 }
 
 export interface AnalysisDetail extends AnalysisSummary {

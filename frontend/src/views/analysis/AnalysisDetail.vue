@@ -42,6 +42,15 @@
           @navigate="handleNavigate"
         />
 
+        <!-- Analysis trust + reliability signals -->
+        <TrustPanel :trust="analysis.data.trust ?? null" />
+
+        <!-- Sanity check contradictions -->
+        <SanityWarningsPanel
+          :warnings="analysis.data.sanity_warnings ?? []"
+          @navigate-finding="handleNavigateFinding"
+        />
+
         <!-- Executive summary + stats always visible above tabs -->
         <ExecutiveSummaryCard
           :bullets="analysis.data.bullet_summary ?? []"
@@ -155,6 +164,8 @@ import type { FindingTriage } from '@/types/analysis'
 // Components
 import AnalysisHeader      from '@/components/analysis/AnalysisHeader.vue'
 import StartHerePanel      from '@/components/analysis/StartHerePanel.vue'
+import TrustPanel          from '@/components/analysis/TrustPanel.vue'
+import SanityWarningsPanel from '@/components/analysis/SanityWarningsPanel.vue'
 import ExecutiveSummaryCard from '@/components/analysis/ExecutiveSummaryCard.vue'
 import FindingsPanel       from '@/components/analysis/FindingsPanel.vue'
 import HostProfileCard     from '@/components/analysis/HostProfileCard.vue'
@@ -198,6 +209,14 @@ onMounted(async () => {
 
 function handleNavigate(tab: string, filters?: Record<string, string>) {
   navigateTo(tab, filters)
+  setTimeout(() => {
+    document.querySelector('.main-tabs')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, 50)
+}
+
+function handleNavigateFinding(ruleId: string) {
+  // Navigate to the findings tab and filter by rule_id
+  navigateTo('findings', { rule_id: ruleId })
   setTimeout(() => {
     document.querySelector('.main-tabs')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, 50)

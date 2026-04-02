@@ -9,8 +9,22 @@
       <el-tag size="small" :type="confType" plain>
         Confidence: {{ finding.confidence }}
       </el-tag>
+      <!-- Evidence quality score — visually distinct from the severity/confidence enum tags -->
+      <span class="conf-score-badge" :class="confScoreClass" :title="`Evidence quality score: ${finding.confidence_score ?? '?'}/100`">
+        Evidence {{ finding.confidence_score ?? '?' }}/100
+      </span>
       <el-tag size="small" plain>Score {{ finding.score?.toFixed(1) }}</el-tag>
       <span class="finding-title">{{ finding.title }}</span>
+    </div>
+
+    <!-- High-severity / low-confidence warning -->
+    <div class="conf-warning" v-if="showConfWarning">
+      <el-icon><WarningFilled /></el-icon>
+      <span>
+        Severity is <strong>{{ finding.severity.toUpperCase() }}</strong> but evidence quality is low
+        ({{ finding.confidence_score }}/100). This finding should be treated as preliminary
+        until corroborated by additional data.
+      </span>
     </div>
 
     <!-- Short description -->
@@ -139,8 +153,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { WarningFilled } from '@element-plus/icons-vue'
 import api from '@/api'
 import type { Finding, FindingTriage, TriageStatus } from '@/types/analysis'
 
@@ -184,6 +199,21 @@ const confType = computed(() => {
   if (props.finding.confidence === 'high') return 'success'
   if (props.finding.confidence === 'medium') return 'warning'
   return 'info'
+})
+
+// Evidence quality score styling
+const confScoreClass = computed(() => {
+  const s = props.finding.confidence_score ?? 50
+  if (s >= 70) return 'cscore-high'
+  if (s >= 45) return 'cscore-medium'
+  return 'cscore-low'
+})
+
+// Warn when severity is high/critical but evidence quality is weak
+const showConfWarning = computed(() => {
+  const sev = props.finding.severity
+  const score = props.finding.confidence_score ?? 50
+  return (sev === 'critical' || sev === 'high') && score < 45
 })
 
 const hasEvidence = computed(() => {
@@ -300,6 +330,23 @@ function fmtTs(epoch: number): string {
 .triage-sel.triage-false_positive :deep(.el-input__wrapper) { border-color: #909399; }
 .triage-sel.triage-in_progress :deep(.el-input__wrapper) { border-color: #e6a23c; }
 .triage-sel.triage-acknowledged :deep(.el-input__wrapper) { border-color: #409eff; }
+
+/* ── Evidence quality score badge ───────────────────────────── */
+.conf-score-badge {
+  font-size: 11px; font-weight: 700; padding: 1px 7px;
+  border-radius: 10px; white-space: nowrap; cursor: default;
+}
+.cscore-high   { background: #f0f9eb; color: #529b2e; border: 1px solid #b3e19d; }
+.cscore-medium { background: #fdf6ec; color: #b88230; border: 1px solid #f5dab1; }
+.cscore-low    { background: #fef0f0; color: #c45656; border: 1px solid #fbc4c4; }
+
+/* ── High-severity / low-confidence warning ─────────────────── */
+.conf-warning {
+  display: flex; align-items: flex-start; gap: 6px;
+  background: #fdf6ec; border: 1px solid #f5dab1; border-radius: 4px;
+  padding: 6px 10px; margin: 6px 0; font-size: 13px; color: #8a6a1e; line-height: 1.5;
+}
+.conf-warning .el-icon { flex-shrink: 0; margin-top: 2px; color: #e6a23c; }
 
 /* ── Suppress ───────────────────────────────────────────────── */
 .suppress-row { margin-top: 10px; }

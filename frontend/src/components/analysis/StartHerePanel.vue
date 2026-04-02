@@ -11,6 +11,9 @@
       <div class="section-label danger">
         <el-icon><WarningFilled /></el-icon>
         {{ criticalFindings.length }} Critical Finding{{ criticalFindings.length > 1 ? 's' : '' }}
+        <span class="low-conf-qualifier" v-if="lowConfCriticalCount > 0">
+          — {{ lowConfCriticalCount }} with weak evidence
+        </span>
       </div>
       <div class="item-list">
         <div
@@ -18,9 +21,13 @@
           v-for="f in criticalFindings.slice(0, 5)"
           :key="f.id"
           @click="emit('navigate', 'findings', { severity: 'critical' })"
+          :class="{ 'finding-item-lowconf': isLowConf(f) }"
         >
           <el-tag type="danger" size="small" effect="dark">CRITICAL</el-tag>
           <span class="item-title">{{ f.title }}</span>
+          <span class="item-lowconf-badge" v-if="isLowConf(f)" title="Low evidence quality — treat as preliminary">
+            low evidence
+          </span>
           <span class="item-hosts" v-if="f.affected_hosts?.length">
             {{ f.affected_hosts.slice(0, 2).join(', ') }}
             <span v-if="f.affected_hosts.length > 2">+{{ f.affected_hosts.length - 2 }} more</span>
@@ -121,6 +128,16 @@ const emit = defineEmits<{
 
 const criticalFindings = computed(() =>
   props.findings.filter(f => f.severity === 'critical' && !f.suppressed)
+)
+
+const LOW_CONF_THRESHOLD = 45
+
+function isLowConf(f: Finding): boolean {
+  return (f.confidence_score ?? 50) < LOW_CONF_THRESHOLD
+}
+
+const lowConfCriticalCount = computed(() =>
+  criticalFindings.value.filter(isLowConf).length
 )
 
 const highFindings = computed(() =>
@@ -247,8 +264,18 @@ function scoreClass(score: number): string {
   cursor: pointer; font-size: 13px;
 }
 .finding-item:hover { background: #fee; }
+.finding-item-lowconf { opacity: 0.85; border: 1px dashed #f5dab1; background: #fffaf0; }
+.finding-item-lowconf:hover { background: #fef5e0; }
 .item-title { flex: 1; color: #303133; font-weight: 500; }
 .item-hosts { font-size: 11px; color: #909399; font-family: monospace; }
+.item-lowconf-badge {
+  font-size: 10px; font-weight: 700; padding: 1px 5px;
+  background: #fdf6ec; color: #b88230; border: 1px solid #f5dab1;
+  border-radius: 3px; white-space: nowrap;
+}
+.low-conf-qualifier {
+  font-size: 11px; font-weight: 400; color: #b88230; margin-left: 2px;
+}
 
 .host-item {
   display: flex; align-items: center; gap: 8px;
