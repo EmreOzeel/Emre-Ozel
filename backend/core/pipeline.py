@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from analyzers import dns, http, protocols, security, tcp, tls
 from core.decision import build_decision_report
+from core.trust import compute_trust_score
 from core.interpret import (
     assess_capture_quality,
     generate_bullet_summary,
@@ -51,6 +52,7 @@ def _finding_to_dict(f: Finding) -> Dict[str, Any]:
         "severity": f.severity if isinstance(f.severity, str) else f.severity.value,
         "confidence": f.confidence if isinstance(f.confidence, str) else f.confidence.value,
         "score": f.score,
+        "confidence_score": f.confidence_score,
         "category": f.category,
         "title": f.title,
         "description": f.description,
@@ -384,5 +386,9 @@ def run_pipeline(
     # ── 9. Sanity checks (need the serialized result dict) ────────────────────
     _progress("sanity", 99)
     result["sanity_warnings"] = run_sanity_checks(result)
+
+    # ── 10. Overall analysis trust score ──────────────────────────────────────
+    # Computed after sanity checks so contradiction count is available.
+    result["trust"] = compute_trust_score(result)
 
     return result

@@ -389,6 +389,10 @@ class Finding:
     title: str
     description: str
     explanation: str
+    # Evidence quality score: 0–100, independent of severity.
+    # Measures how much trust to place in the detection signal itself.
+    # Low score = thin evidence (few packets, no metrics, short time window).
+    confidence_score: int = 0
     # Why is the confidence level set to this value?  Explains signal strength.
     confidence_note: str = ""
     possible_causes: List[str] = field(default_factory=list)
