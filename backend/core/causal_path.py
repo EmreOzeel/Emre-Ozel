@@ -557,9 +557,13 @@ def classify_ip_role(ip: str, roles: TopologyRoles) -> str:
     return "unknown"
 
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Phase 2 — Hop Sequence Builder
+# Phase 2 — Hop Sequence Builder (role-aware)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_SLOW_BACKEND_THRESHOLD_MS = 500.0   # backend response considered slow above this
+
 
 def build_hop_sequence(
     packets: list,
@@ -567,34 +571,44 @@ def build_hop_sequence(
     dst_ip: str,
     roles: "TopologyRoles",
     destination_port: "Optional[int]" = None,
+    slow_threshold_ms: float = _SLOW_BACKEND_THRESHOLD_MS,
 ) -> list:
     """
-    Build a basic ordered hop sequence from raw packets.
+    Build an ordered, role-aware hop sequence from raw packets.
 
-    Detects:
-        client_initiated     — SYN seen from src → dst
-        connection_established — SYN-ACK seen from dst → src
-        connection_failed    — RST seen OR SYN present but no SYN-ACK
+    Base steps (always):
+        client_initiated        — SYN seen from src → dst
+        connection_established  — SYN-ACK seen (generic, non-role case)
+        connection_failed       — RST or no reply (generic, non-role case)
 
-    Each step dict always contains:
-        step        : str   — step label
-        src         : str   — source IP for this event
-        dst         : str   — destination IP for this event
-        source_role : str   — classify_ip_role(src)
-        dest_role   : str   — classify_ip_role(dst)
-        ts          : float — packet timestamp (0.0 if unavailable)
+    Role-specific steps (replace/extend base steps when roles are known):
+        firewall_pass_observed          — SYN-ACK received from a firewall IP
+        firewall_reset_observed         — RST received from a firewall IP
+        firewall_drop_suspected         — SYN to firewall, no reply at all
+        lb_frontend_connection_observed — SYN-ACK received from LB VIP
+        lb_backend_connection_missing   — no LB→backend SYN found in capture
+        backend_response_slow           — first backend response > slow_threshold_ms
+
+    Each step dict contains:
+        step        : str   — label
+        src         : str   — source IP of the event
+        dst         : str   — destination IP of the event
+        source_role : str   — classify_ip_role(src, roles)
+        dest_role   : str   — classify_ip_role(dst, roles)
+        ts          : float — packet timestamp
 
     Args:
-        packets:          List[PacketRecord] — full unfiltered packet list.
-        src_ip:           Initiating endpoint.
-        dst_ip:           Target endpoint.
-        roles:            TopologyRoles for role annotation.
-        destination_port: Optional port to narrow packet matching.
-
-    Returns:
-        Ordered list of step dicts representing the observed sequence.
+        packets:           Full unfiltered List[PacketRecord].
+        src_ip:            Initiating endpoint.
+        dst_ip:            Target endpoint.
+        roles:             TopologyRoles for classification.
+        destination_port:  Optional port to narrow packet matching.
+        slow_threshold_ms: Backend response delay threshold in milliseconds.
     """
-    def _matches(p) -> bool:
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _matches_pair(p) -> bool:
         pair = (
             (p.src_ip == src_ip and p.dst_ip == dst_ip) or
             (p.src_ip == dst_ip and p.dst_ip == src_ip)
@@ -605,8 +619,8 @@ def build_hop_sequence(
             return p.dst_port == destination_port or p.src_port == destination_port
         return True
 
-    def _step(label: str, src: str, dst: str, ts: float) -> dict:
-        return {
+    def _step(label: str, src: str, dst: str, ts: float, **extra) -> dict:
+        d = {
             "step":        label,
             "src":         src,
             "dst":         dst,
@@ -614,18 +628,22 @@ def build_hop_sequence(
             "dest_role":   classify_ip_role(dst, roles),
             "ts":          round(ts, 6),
         }
+        d.update(extra)
+        return d
 
-    relevant = sorted(
-        [p for p in packets if _matches(p)],
-        key=lambda p: p.ts,
-    )
+    # ── Filter + sort relevant packets ────────────────────────────────────────
 
-    steps: list = []
+    relevant = sorted([p for p in packets if _matches_pair(p)], key=lambda p: p.ts)
 
-    # ── Find key packets ──────────────────────────────────────────────────────
-    syn_pkt    = None
-    synack_pkt = None
-    rst_pkt    = None
+    if not relevant:
+        return []
+
+    # ── Locate key packets in the src↔dst exchange ───────────────────────────
+
+    syn_pkt    = None   # first SYN from src → dst
+    synack_pkt = None   # first SYN-ACK from dst → src
+    rst_pkt    = None   # first RST in either direction
+    data_pkts  = []     # packets with payload in either direction
 
     for p in relevant:
         if syn_pkt is None and p.src_ip == src_ip and p.tcp_flags_syn and not p.tcp_flags_ack:
@@ -634,20 +652,149 @@ def build_hop_sequence(
             synack_pkt = p
         if rst_pkt is None and p.tcp_flags_rst:
             rst_pkt = p
+        if p.tcp_payload_len > 0:
+            data_pkts.append(p)
 
-    # ── Build sequence ────────────────────────────────────────────────────────
     if syn_pkt is None:
-        # No connection attempt captured at all
-        return steps
+        return []   # no connection attempt in capture
+
+    # ── Determine destination role ────────────────────────────────────────────
+
+    dst_role = classify_ip_role(dst_ip, roles)
+
+    steps: list = []
+
+    # ── Step 1: client_initiated (always present when SYN found) ─────────────
 
     steps.append(_step("client_initiated", src_ip, dst_ip, syn_pkt.ts))
 
-    if synack_pkt is not None:
-        steps.append(_step("connection_established", dst_ip, src_ip, synack_pkt.ts))
-    elif rst_pkt is not None:
-        steps.append(_step("connection_failed", rst_pkt.src_ip, rst_pkt.dst_ip, rst_pkt.ts))
+    # ── Steps 2+: role-specific path reasoning ────────────────────────────────
+
+    if dst_role == "firewall":
+        steps.extend(_reason_firewall(
+            src_ip, dst_ip, syn_pkt, synack_pkt, rst_pkt, roles, _step
+        ))
+
+    elif dst_role == "load_balancer":
+        steps.extend(_reason_load_balancer(
+            src_ip, dst_ip, syn_pkt, synack_pkt, rst_pkt,
+            packets, roles, destination_port, slow_threshold_ms, _step
+        ))
+
+    elif dst_role == "backend":
+        steps.extend(_reason_backend(
+            src_ip, dst_ip, syn_pkt, synack_pkt, rst_pkt,
+            data_pkts, slow_threshold_ms, roles, _step
+        ))
+
     else:
-        # SYN present, no SYN-ACK, no RST — timed out / dropped
-        steps.append(_step("connection_failed", dst_ip, src_ip, syn_pkt.ts))
+        # Unknown destination — fall back to generic steps
+        if synack_pkt is not None:
+            steps.append(_step("connection_established", dst_ip, src_ip, synack_pkt.ts))
+        elif rst_pkt is not None:
+            steps.append(_step("connection_failed", rst_pkt.src_ip, rst_pkt.dst_ip, rst_pkt.ts))
+        else:
+            steps.append(_step("connection_failed", dst_ip, src_ip, syn_pkt.ts))
 
     return steps
+
+
+# ── Role-specific reasoning helpers ──────────────────────────────────────────
+
+def _reason_firewall(src_ip, dst_ip, syn, synack, rst, roles, _step):
+    """Return hop steps for a firewall destination."""
+    if synack is not None:
+        # Firewall passed — SYN-ACK received (transparent or acting as proxy)
+        return [_step("firewall_pass_observed", dst_ip, src_ip, synack.ts)]
+    if rst is not None and rst.src_ip == dst_ip:
+        # RST from the firewall IP itself
+        return [_step("firewall_reset_observed", rst.src_ip, rst.dst_ip, rst.ts)]
+    # No reply at all
+    return [_step("firewall_drop_suspected", dst_ip, src_ip, syn.ts)]
+
+
+def _reason_load_balancer(
+    src_ip, dst_ip, syn, synack, rst,
+    all_packets, roles, port, slow_threshold_ms, _step
+):
+    """Return hop steps for a load balancer VIP destination."""
+    result = []
+
+    if synack is None:
+        # Frontend connection itself failed
+        if rst is not None and rst.src_ip == dst_ip:
+            result.append(_step("connection_failed", rst.src_ip, rst.dst_ip, rst.ts))
+        else:
+            result.append(_step("connection_failed", dst_ip, src_ip, syn.ts))
+        return result
+
+    # Frontend handshake succeeded
+    result.append(_step("lb_frontend_connection_observed", dst_ip, src_ip, synack.ts))
+
+    # Look for LB → backend SYN in the full packet set
+    backend_syn = _find_lb_backend_syn(dst_ip, roles, all_packets)
+
+    if backend_syn is None:
+        result.append(_step(
+            "lb_backend_connection_missing",
+            dst_ip,
+            "(backend)",
+            synack.ts,
+            note="No SYN from LB toward any known backend IP was observed in this capture.",
+        ))
+    else:
+        be_dst = backend_syn.dst_ip
+        result.append(_step("connection_established", dst_ip, be_dst, backend_syn.ts))
+
+    return result
+
+
+def _reason_backend(src_ip, dst_ip, syn, synack, rst, data_pkts, threshold_ms, roles, _step):
+    """Return hop steps for a direct backend destination."""
+    result = []
+
+    if synack is None:
+        if rst is not None and rst.src_ip == dst_ip:
+            result.append(_step("connection_failed", rst.src_ip, rst.dst_ip, rst.ts))
+        else:
+            result.append(_step("connection_failed", dst_ip, src_ip, syn.ts))
+        return result
+
+    result.append(_step("connection_established", dst_ip, src_ip, synack.ts))
+
+    # Check for slow backend response
+    first_response = _first_data_from(dst_ip, data_pkts)
+    if first_response is not None:
+        delay_ms = (first_response.ts - synack.ts) * 1000
+        if delay_ms > threshold_ms:
+            result.append(_step(
+                "backend_response_slow", dst_ip, src_ip, first_response.ts,
+                delay_ms=round(delay_ms, 1),
+                threshold_ms=threshold_ms,
+            ))
+
+    return result
+
+
+def _find_lb_backend_syn(lb_ip: str, roles: "TopologyRoles", packets: list):
+    """
+    Search ALL packets for the first SYN sent FROM lb_ip TO any known backend IP.
+    Returns the matching packet or None.
+    """
+    all_backend_ips = set(roles.backend_ips)
+
+    for p in sorted(packets, key=lambda x: x.ts):
+        if (p.src_ip == lb_ip and p.tcp_flags_syn and not p.tcp_flags_ack):
+            if p.dst_ip in all_backend_ips:
+                return p
+            # Also check subnets
+            for subnet in roles.backend_subnets:
+                if _ip_in_subnet(p.dst_ip, subnet):
+                    return p
+    return None
+
+
+def _first_data_from(ip: str, data_pkts: list):
+    """Return the earliest data packet whose source is *ip*, or None."""
+    candidates = [p for p in data_pkts if p.src_ip == ip]
+    return min(candidates, key=lambda p: p.ts) if candidates else None
