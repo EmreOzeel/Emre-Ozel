@@ -485,3 +485,73 @@ class CausalPathEngine:
             f"Return ratio {ratio:.2f}x — "
             + ("symmetric." if 0.5 <= ratio <= 2.0 else "asymmetric — review capture position.")
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2 — Role-Aware Classification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import ipaddress as _ipaddress
+from dataclasses import dataclass as _dataclass, field as _field
+from typing import List as _List
+
+
+@_dataclass
+class TopologyRoles:
+    """
+    Caller-supplied topology hints.  All fields optional — only provide
+    what is known.  Priority order for classification:
+        firewall > load_balancer > backend (exact) > backend (subnet)
+    """
+    firewall_ips: _List[str]        = _field(default_factory=list)
+    load_balancer_vips: _List[str]  = _field(default_factory=list)
+    backend_ips: _List[str]         = _field(default_factory=list)
+    backend_subnets: _List[str]     = _field(default_factory=list)
+
+    @property
+    def has_topology(self) -> bool:
+        return bool(
+            self.firewall_ips or self.load_balancer_vips
+            or self.backend_ips or self.backend_subnets
+        )
+
+
+def _ip_in_subnet(ip: str, subnet: str) -> bool:
+    """Return True if *ip* falls inside *subnet* (CIDR notation)."""
+    try:
+        return (
+            _ipaddress.ip_address(ip)
+            in _ipaddress.ip_network(subnet, strict=False)
+        )
+    except ValueError:
+        return False
+
+
+def classify_ip_role(ip: str, roles: TopologyRoles) -> str:
+    """
+    Return the infrastructure role of *ip* given the caller's topology hints.
+
+    Priority (highest first):
+        1. firewall   — exact match in roles.firewall_ips
+        2. load_balancer — exact match in roles.load_balancer_vips
+        3. backend    — exact match in roles.backend_ips
+        4. backend    — falls inside any subnet in roles.backend_subnets
+        5. unknown
+
+    Args:
+        ip:    The IP address string to classify.
+        roles: Caller-supplied topology configuration.
+
+    Returns:
+        One of: "firewall" | "load_balancer" | "backend" | "unknown"
+    """
+    if ip in roles.firewall_ips:
+        return "firewall"
+    if ip in roles.load_balancer_vips:
+        return "load_balancer"
+    if ip in roles.backend_ips:
+        return "backend"
+    for subnet in roles.backend_subnets:
+        if _ip_in_subnet(ip, subnet):
+            return "backend"
+    return "unknown"
