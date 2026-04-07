@@ -555,3 +555,99 @@ def classify_ip_role(ip: str, roles: TopologyRoles) -> str:
         if _ip_in_subnet(ip, subnet):
             return "backend"
     return "unknown"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2 — Hop Sequence Builder
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_hop_sequence(
+    packets: list,
+    src_ip: str,
+    dst_ip: str,
+    roles: "TopologyRoles",
+    destination_port: "Optional[int]" = None,
+) -> list:
+    """
+    Build a basic ordered hop sequence from raw packets.
+
+    Detects:
+        client_initiated     — SYN seen from src → dst
+        connection_established — SYN-ACK seen from dst → src
+        connection_failed    — RST seen OR SYN present but no SYN-ACK
+
+    Each step dict always contains:
+        step        : str   — step label
+        src         : str   — source IP for this event
+        dst         : str   — destination IP for this event
+        source_role : str   — classify_ip_role(src)
+        dest_role   : str   — classify_ip_role(dst)
+        ts          : float — packet timestamp (0.0 if unavailable)
+
+    Args:
+        packets:          List[PacketRecord] — full unfiltered packet list.
+        src_ip:           Initiating endpoint.
+        dst_ip:           Target endpoint.
+        roles:            TopologyRoles for role annotation.
+        destination_port: Optional port to narrow packet matching.
+
+    Returns:
+        Ordered list of step dicts representing the observed sequence.
+    """
+    def _matches(p) -> bool:
+        pair = (
+            (p.src_ip == src_ip and p.dst_ip == dst_ip) or
+            (p.src_ip == dst_ip and p.dst_ip == src_ip)
+        )
+        if not pair:
+            return False
+        if destination_port is not None:
+            return p.dst_port == destination_port or p.src_port == destination_port
+        return True
+
+    def _step(label: str, src: str, dst: str, ts: float) -> dict:
+        return {
+            "step":        label,
+            "src":         src,
+            "dst":         dst,
+            "source_role": classify_ip_role(src, roles),
+            "dest_role":   classify_ip_role(dst, roles),
+            "ts":          round(ts, 6),
+        }
+
+    relevant = sorted(
+        [p for p in packets if _matches(p)],
+        key=lambda p: p.ts,
+    )
+
+    steps: list = []
+
+    # ── Find key packets ──────────────────────────────────────────────────────
+    syn_pkt    = None
+    synack_pkt = None
+    rst_pkt    = None
+
+    for p in relevant:
+        if syn_pkt is None and p.src_ip == src_ip and p.tcp_flags_syn and not p.tcp_flags_ack:
+            syn_pkt = p
+        if synack_pkt is None and p.src_ip == dst_ip and p.tcp_flags_syn and p.tcp_flags_ack:
+            synack_pkt = p
+        if rst_pkt is None and p.tcp_flags_rst:
+            rst_pkt = p
+
+    # ── Build sequence ────────────────────────────────────────────────────────
+    if syn_pkt is None:
+        # No connection attempt captured at all
+        return steps
+
+    steps.append(_step("client_initiated", src_ip, dst_ip, syn_pkt.ts))
+
+    if synack_pkt is not None:
+        steps.append(_step("connection_established", dst_ip, src_ip, synack_pkt.ts))
+    elif rst_pkt is not None:
+        steps.append(_step("connection_failed", rst_pkt.src_ip, rst_pkt.dst_ip, rst_pkt.ts))
+    else:
+        # SYN present, no SYN-ACK, no RST — timed out / dropped
+        steps.append(_step("connection_failed", dst_ip, src_ip, syn_pkt.ts))
+
+    return steps
