@@ -318,6 +318,61 @@ def _detect_lb_backend_visibility(
     }
 
 
+def _detect_backend_response_quality(
+    lb_vip: str,
+    flows,
+    roles: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    For flows already known to reach a backend (LB VIP → backend), determine
+    whether the backend replied and how fast.
+
+    Args:
+        lb_vip:  The load balancer VIP (destination_ip from the outer context).
+        flows:   All flows — iterable of FlowRecord objects.
+        roles:   Dict with optional backend_ips / backend_subnets lists.
+
+    Returns:
+        {
+            "backend_response_observed": bool,    # any backend→LB flow exists
+            "backend_response_delay_ms": float|None,  # LB→be first_seen to be→LB first_seen
+        }
+
+    Note: delay is None when either direction's first_seen is missing or negative.
+    """
+    backend_ips  = roles.get("backend_ips", []) or []
+    backend_nets = roles.get("backend_subnets", []) or []
+
+    def _is_backend(ip: str) -> bool:
+        if ip in backend_ips:
+            return True
+        return any(_ip_in_subnet(ip, net) for net in backend_nets)
+
+    lb_to_be_ts: Optional[float] = None   # earliest LB→backend first_seen
+    be_to_lb_ts: Optional[float] = None   # earliest backend→LB first_seen
+
+    for f in flows:
+        if f.src_ip == lb_vip and _is_backend(f.dst_ip):
+            if lb_to_be_ts is None or f.first_seen < lb_to_be_ts:
+                lb_to_be_ts = f.first_seen
+        if _is_backend(f.src_ip) and f.dst_ip == lb_vip:
+            if be_to_lb_ts is None or f.first_seen < be_to_lb_ts:
+                be_to_lb_ts = f.first_seen
+
+    backend_response_observed = be_to_lb_ts is not None
+
+    delay_ms: Optional[float] = None
+    if lb_to_be_ts is not None and be_to_lb_ts is not None:
+        raw = (be_to_lb_ts - lb_to_be_ts) * 1000
+        if raw >= 0:
+            delay_ms = round(raw, 3)
+
+    return {
+        "backend_response_observed": backend_response_observed,
+        "backend_response_delay_ms": delay_ms,
+    }
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -478,11 +533,30 @@ class CausalPathEngine:
                     "possible backend forwarding misconfiguration or unhealthy backend pool.",
                     "Backend pool members may be failing health checks or are unreachable from the LB.",
                 ]
-            elif _lb_vis["lb_frontend_observed"] and _lb_vis["lb_backend_observed"]:
-                hypotheses = list(hypotheses) + [
-                    "LB-to-backend forwarding was observed — issue may lie in backend response "
-                    "quality or return-path visibility rather than LB forwarding.",
-                ]
+
+            # ── Backend response quality (only when LB reached a backend) ────
+            if _lb_vis["lb_backend_observed"]:
+                _bq = _detect_backend_response_quality(
+                    destination_ip, self._flows.values(), _roles_dict
+                )
+                if not _bq["backend_response_observed"]:
+                    hypotheses = list(hypotheses) + [
+                        "Backend did not send a response to the load balancer.",
+                        "Backend service may be down or refusing connections.",
+                        "Return-path from backend to LB may not be visible at this capture point.",
+                    ]
+                else:
+                    _brd = _bq["backend_response_delay_ms"]
+                    if _brd is not None and _brd > 200:
+                        hypotheses = list(hypotheses) + [
+                            f"Backend response was slow ({_brd:.1f} ms from LB request to backend reply).",
+                            "Application-level processing delay (e.g., database query, blocking I/O).",
+                        ]
+                    else:
+                        hypotheses = list(hypotheses) + [
+                            "Backend response was observed — issue may be further downstream "
+                            "or on the return path between LB and client.",
+                        ]
 
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(
