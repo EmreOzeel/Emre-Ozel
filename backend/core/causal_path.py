@@ -84,6 +84,10 @@ class PathAnalysisResult:
     confidence_score: int = 0          # 0–100
     confidence_reasoning: str = ""
 
+    # ── Path-analysis confidence ──────────────────────────────────────────────
+    path_confidence_score: int = 0     # 0–100, penalty-based path analysis reliability
+    confidence_reasons: List[str] = field(default_factory=list)
+
     # ── Supporting evidence ──────────────────────────────────────────────────
     evidence_packets: List[int] = field(default_factory=list)   # packet nums
     evidence_flows: List[str]   = field(default_factory=list)   # flow keys
@@ -127,6 +131,8 @@ class PathAnalysisResult:
             "alternative_hypotheses":   self.alternative_hypotheses,
             "confidence_score":         self.confidence_score,
             "confidence_reasoning":     self.confidence_reasoning,
+            "path_confidence_score":    self.path_confidence_score,
+            "confidence_reasons":       self.confidence_reasons,
             "evidence_packets":         self.evidence_packets,
             "evidence_flows":           self.evidence_flows,
             "missing_visibility_notes": self.missing_visibility_notes,
@@ -501,6 +507,71 @@ _FAILURE_CLOSING: Dict[str, str] = {
     "backend_or_application_delay":
         "The most likely issue is a delay in backend or application response.",
 }
+
+
+def _compute_path_confidence(
+    timing: Dict[str, Any],
+    missing_visibility_notes: List[str],
+    lb_vis: Optional[Dict[str, Any]] = None,
+    bq: Optional[Dict[str, Any]] = None,
+    rp: Optional[Dict[str, Any]] = None,
+    fw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Penalty-based path analysis confidence scoring.
+
+    Starts from 100 and subtracts for each signal gap or conflict.
+    Returns {"path_confidence_score": int, "confidence_reasons": List[str]}.
+    """
+    score   = 100
+    reasons: List[str] = []
+
+    # Timing completeness
+    if timing.get("connect_time_ms") is None:
+        score -= 20
+        reasons.append("Connection establishment not observed — SYN-ACK not confirmed.")
+
+    if timing.get("first_response_time_ms") is None:
+        score -= 15
+        reasons.append("First server response not observed — server behaviour unclear.")
+
+    # LB-specific gaps (only penalise when LB path was expected)
+    if lb_vis is not None and not lb_vis["lb_backend_observed"]:
+        score -= 10
+        reasons.append("LB-to-backend forwarding not observed — backend reachability unknown.")
+
+    # Backend response
+    if bq is not None and not bq["backend_response_observed"]:
+        score -= 15
+        reasons.append("Backend response not observed — backend may be silent or unreachable.")
+
+    # Return path
+    if rp is not None and not rp["return_path_observed"]:
+        score -= 10
+        reasons.append("Return path visibility incomplete — LB-to-client flow not observed.")
+
+    # Capture completeness
+    if missing_visibility_notes:
+        score -= 10
+        reasons.append("Analysis based on partial capture — some path segments may be missing.")
+
+    # Conflicting signals: RST present alongside observed backend response
+    if (fw is not None and fw["rst_observed"]
+            and bq is not None and bq["backend_response_observed"]):
+        score -= 15
+        reasons.append(
+            "Conflicting signals: RST observed alongside backend response — "
+            "cause of failure is ambiguous."
+        )
+
+    # RST involving firewall IP
+    if fw is not None and fw["firewall_evidence_notes"]:
+        reasons.append("RST observed involving a known firewall address.")
+
+    return {
+        "path_confidence_score": max(0, min(100, score)),
+        "confidence_reasons":    reasons,
+    }
 
 
 def _compose_path_narrative(
@@ -929,6 +1000,14 @@ class CausalPathEngine:
         )
         result.path_steps = narrative["path_steps"]
         # path_summary keeps the step_e verdict; path_steps carries the full narrative.
+
+        # ── Path confidence ───────────────────────────────────────────────────
+        pc = _compute_path_confidence(
+            timing, visibility_notes,
+            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
+        )
+        result.path_confidence_score = pc["path_confidence_score"]
+        result.confidence_reasons    = pc["confidence_reasons"]
 
         return result
 
