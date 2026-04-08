@@ -70,6 +70,7 @@ class PathAnalysisResult:
 
     # ── Timing ───────────────────────────────────────────────────────────────
     timing_breakdown: Dict[str, Any] = field(default_factory=dict)
+    timing_interpretation: str = ""
 
     # ── Return path ──────────────────────────────────────────────────────────
     return_path_observation: str = ""
@@ -118,6 +119,7 @@ class PathAnalysisResult:
                 "note":     self.backend_observation.note,
             },
             "timing_breakdown":         self.timing_breakdown,
+            "timing_interpretation":    self.timing_interpretation,
             "return_path_observation":  self.return_path_observation,
             "likely_failure_point":     self.likely_failure_point,
             "alternative_hypotheses":   self.alternative_hypotheses,
@@ -127,6 +129,53 @@ class PathAnalysisResult:
             "evidence_flows":           self.evidence_flows,
             "missing_visibility_notes": self.missing_visibility_notes,
         }
+
+
+def _interpret_timing(timing: Dict[str, Any]) -> str:
+    """
+    Produce a plain-language timing interpretation from timing_breakdown values.
+
+    Rules (applied in priority order):
+    1. connect_time_ms is None
+       → connection establishment was not observed.
+    2. connect_time_ms present, first_response_time_ms is None
+       → connection established but no server data observed.
+    3. connect_time_ms > 100
+       → connection establishment appears slower than expected.
+    4. connect_time_ms <= 100, first_response_time_ms > 200
+       → fast connect, delayed server response.
+    5. connect_time_ms <= 100, first_response_time_ms <= 200
+       → no obvious delay.
+    Special: total < 100 ms AND no response → short failed attempt.
+    """
+    ct  = timing.get("connect_time_ms")
+    frt = timing.get("first_response_time_ms")
+    tot = timing.get("total_observed_latency_ms")
+
+    if ct is None:
+        if tot is not None and tot < 100 and frt is None:
+            return (
+                "A very short exchange was observed with no server response, "
+                "suggesting a brief failed connection attempt."
+            )
+        return "Connection establishment was not observed or did not complete."
+
+    if frt is None:
+        return "Connection was established, but no server response data was observed."
+
+    if ct > 100:
+        return "Connection establishment appears slower than expected."
+
+    if frt > 200:
+        return (
+            "Connection was established quickly, "
+            "but the server response appears delayed."
+        )
+
+    return (
+        "Connection establishment and first server response were observed "
+        "with no obvious delay."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -201,6 +250,7 @@ class CausalPathEngine:
             "first_response_time_ms": compute_first_response_time_ms(relevant_packets),
             "total_observed_latency_ms": compute_total_observed_latency_ms(relevant_packets),
         }
+        timing_interp = _interpret_timing(timing)
 
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(
@@ -228,6 +278,7 @@ class CausalPathEngine:
             path_summary=summary,
             hop_sequence=[source_ip, destination_ip],   # expanded by future topology layer
             timing_breakdown=timing,
+            timing_interpretation=timing_interp,
             return_path_observation=return_note,
             likely_failure_point=failure,
             alternative_hypotheses=hypotheses,
