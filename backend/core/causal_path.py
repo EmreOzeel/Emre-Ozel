@@ -48,6 +48,38 @@ class HopObservation:
 
 
 @dataclass
+class EvidenceItem:
+    """
+    A single traceable piece of evidence backing an impairment or outcome claim.
+
+    Attributes:
+        type:            Impairment token this evidence supports.
+        summary:         One-sentence human-readable description.
+        flow_id:         Flow key if evidence is flow-level (else "").
+        packet_refs:     Packet numbers from the capture (evidence_packets-style).
+        timestamps:      Epoch float timestamps for the relevant events.
+        signal_strength: "high" (direct observation) | "medium" (flow inference)
+                         | "low" (capture-gap / indirect).
+    """
+    type: str
+    summary: str
+    flow_id: str = ""
+    packet_refs: List[int] = field(default_factory=list)
+    timestamps: List[float] = field(default_factory=list)
+    signal_strength: str = "medium"   # "high" | "medium" | "low"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type":            self.type,
+            "summary":         self.summary,
+            "flow_id":         self.flow_id,
+            "packet_refs":     self.packet_refs,
+            "timestamps":      self.timestamps,
+            "signal_strength": self.signal_strength,
+        }
+
+
+@dataclass
 class PathAnalysisResult:
     # ── Identifiers ──────────────────────────────────────────────────────────
     source_ip: str
@@ -101,6 +133,7 @@ class PathAnalysisResult:
     # ── Supporting evidence ──────────────────────────────────────────────────
     evidence_packets: List[int] = field(default_factory=list)   # packet nums
     evidence_flows: List[str]   = field(default_factory=list)   # flow keys
+    evidence_items: List["EvidenceItem"] = field(default_factory=list)  # structured
 
     # ── Visibility gaps ──────────────────────────────────────────────────────
     missing_visibility_notes: List[str] = field(default_factory=list)
@@ -148,8 +181,209 @@ class PathAnalysisResult:
             "confidence_reasons":       self.confidence_reasons,
             "evidence_packets":         self.evidence_packets,
             "evidence_flows":           self.evidence_flows,
+            "evidence_items":           [e.to_dict() for e in self.evidence_items],
             "missing_visibility_notes": self.missing_visibility_notes,
         }
+
+
+def _build_evidence_items(
+    source_ip: str,
+    destination_ip: str,
+    state: "ConnectionState",
+    timing: Dict[str, Any],
+    impairments: List[str],
+    relevant_packets,
+    relevant_flows,
+    all_flows,
+    roles: Optional[Dict[str, Any]] = None,
+    lb_vis: Optional[Dict[str, Any]] = None,
+    bq: Optional[Dict[str, Any]] = None,
+    rp: Optional[Dict[str, Any]] = None,
+    fw: Optional[Dict[str, Any]] = None,
+) -> List["EvidenceItem"]:
+    """
+    Build structured EvidenceItem list from already-computed signals.
+    Does not add new packet parsing — reuses timing, lb_vis, bq, rp, fw.
+    One or more items per impairment token.
+    """
+    items: List[EvidenceItem] = []
+    fw = fw or {}
+    roles = roles or {}
+    firewall_ips = roles.get("firewall_ips", []) or []
+
+    # Helper: ordered packet list sorted by timestamp
+    ordered = sorted(relevant_packets, key=lambda p: p.ts)
+
+    def _first(predicate):
+        return next((p for p in ordered if predicate(p)), None)
+
+    # ── connection_establishment_failure ──────────────────────────────────────
+    if "connection_establishment_failure" in impairments:
+        syn = _first(lambda p: p.tcp_flags_syn and not p.tcp_flags_ack
+                     and p.src_ip == source_ip)
+        items.append(EvidenceItem(
+            type="connection_establishment_failure",
+            summary=(
+                "SYN packet observed from client but no SYN-ACK received — "
+                "connection could not be established."
+            ),
+            packet_refs=[syn.num] if syn else [],
+            timestamps=[syn.ts] if syn else [],
+            signal_strength="high" if syn else "medium",
+        ))
+
+    # ── no_server_response ────────────────────────────────────────────────────
+    if "no_server_response" in impairments:
+        synack = _first(lambda p: p.tcp_flags_syn and p.tcp_flags_ack
+                        and p.src_ip == destination_ip)
+        final_ack = _first(lambda p: p.tcp_flags_ack and not p.tcp_flags_syn
+                           and p.tcp_payload_len == 0 and p.src_ip == source_ip
+                           and (synack is None or p.ts >= synack.ts))
+        refs = [p.num for p in [synack, final_ack] if p is not None]
+        tss  = [p.ts  for p in [synack, final_ack] if p is not None]
+
+        # Packet-level evidence (ESTABLISHED_NO_DATA)
+        if state == ConnectionState.ESTABLISHED_NO_DATA:
+            items.append(EvidenceItem(
+                type="no_server_response",
+                summary=(
+                    "TCP handshake completed but no application data was observed "
+                    "from the server — service may not have responded."
+                ),
+                packet_refs=refs,
+                timestamps=tss,
+                signal_strength="high",
+            ))
+
+        # Flow-level evidence (LB backend did not reply)
+        if bq is not None and not bq["backend_response_observed"]:
+            lb_flow_key = ""
+            for f in all_flows:
+                if f.src_ip == destination_ip:
+                    lb_flow_key = f.key
+                    break
+            items.append(EvidenceItem(
+                type="no_server_response",
+                summary=(
+                    "No response flow from backend toward the load balancer was "
+                    "detected — backend may be down or not responding."
+                ),
+                flow_id=lb_flow_key,
+                signal_strength="medium",
+            ))
+
+    # ── backend_response_delay ────────────────────────────────────────────────
+    if "backend_response_delay" in impairments:
+        frt = timing.get("first_response_time_ms")
+        brd = (bq or {}).get("backend_response_delay_ms")
+
+        if frt is not None and frt > 200:
+            # Packet-level: find the pure ACK and first server data
+            synack_p = _first(lambda p: p.tcp_flags_syn and p.tcp_flags_ack
+                              and p.src_ip == destination_ip)
+            ack_p = _first(lambda p: p.tcp_flags_ack and not p.tcp_flags_syn
+                           and p.tcp_payload_len == 0 and p.src_ip == source_ip
+                           and (synack_p is None or p.ts >= synack_p.ts))
+            data_p = _first(lambda p: p.src_ip == destination_ip
+                            and p.tcp_payload_len > 0
+                            and (ack_p is None or p.ts >= ack_p.ts))
+            refs = [p.num for p in [ack_p, data_p] if p is not None]
+            tss  = [p.ts  for p in [ack_p, data_p] if p is not None]
+            items.append(EvidenceItem(
+                type="backend_response_delay",
+                summary=(
+                    f"Server first response observed {frt:.1f} ms after connection "
+                    f"was established — application-level delay is likely."
+                ),
+                packet_refs=refs,
+                timestamps=tss,
+                signal_strength="high" if frt > 500 else "medium",
+            ))
+
+        elif brd is not None and brd > 200:
+            # Flow-level: LB→backend to backend→LB timing
+            items.append(EvidenceItem(
+                type="backend_response_delay",
+                summary=(
+                    f"Backend response flow observed {brd:.1f} ms after LB forwarded "
+                    f"the request — backend processing appears slow."
+                ),
+                signal_strength="medium",
+            ))
+
+    # ── lb_backend_issue ─────────────────────────────────────────────────────
+    if "lb_backend_issue" in impairments:
+        # Find the client→LB flow for traceability
+        client_lb_flow = ""
+        for f in relevant_flows:
+            if f.src_ip == source_ip and f.dst_ip == destination_ip:
+                client_lb_flow = f.key
+                break
+        items.append(EvidenceItem(
+            type="lb_backend_issue",
+            summary=(
+                "Client-to-LB frontend flow was observed but no corresponding "
+                "LB-to-backend forwarding flow was detected."
+            ),
+            flow_id=client_lb_flow,
+            signal_strength="medium",
+        ))
+
+    # ── return_path_problem ───────────────────────────────────────────────────
+    if "return_path_problem" in impairments:
+        # Find the backend→LB flow as anchor
+        be_lb_flow = ""
+        for f in all_flows:
+            be_ips = (roles.get("backend_ips", []) or [])
+            be_nets = (roles.get("backend_subnets", []) or [])
+            if f.dst_ip == destination_ip and (
+                f.src_ip in be_ips
+                or any(_ip_in_subnet(f.src_ip, n) for n in be_nets)
+            ):
+                be_lb_flow = f.key
+                break
+        items.append(EvidenceItem(
+            type="return_path_problem",
+            summary=(
+                "Backend response was observed reaching the load balancer, but no "
+                "return flow from the LB toward the client was detected — "
+                "the return path may be interrupted or not visible at this capture point."
+            ),
+            flow_id=be_lb_flow,
+            signal_strength="medium",
+        ))
+
+    # ── firewall_interference ─────────────────────────────────────────────────
+    if "firewall_interference" in impairments:
+        rst_pkts = [p for p in ordered if p.tcp_flags_rst]
+        fw_involved = [
+            p for p in rst_pkts
+            if p.src_ip in firewall_ips or p.dst_ip in firewall_ips
+        ]
+        strength = "high" if fw_involved else "medium"
+        rst_refs = [p.num for p in rst_pkts[:5]]
+        rst_tss  = [p.ts  for p in rst_pkts[:5]]
+        direction = fw.get("rst_direction") or "unknown"
+        dir_label = {
+            "server_to_client": "from destination toward client",
+            "client_to_server": "from client toward destination",
+        }.get(direction, "in an unknown direction")
+        note = (
+            " A known firewall address is directly involved."
+            if fw_involved else
+            " Firewall involvement cannot be confirmed from packet data alone."
+        )
+        items.append(EvidenceItem(
+            type="firewall_interference",
+            summary=(
+                f"TCP RST packet observed {dir_label}.{note}"
+            ),
+            packet_refs=rst_refs,
+            timestamps=rst_tss,
+            signal_strength=strength,
+        ))
+
+    return items
 
 
 # Impairment priority — first match becomes primary_impairment.
@@ -1136,6 +1370,14 @@ class CausalPathEngine:
         result.connection_outcome  = oi["connection_outcome"]
         result.primary_impairment  = oi["primary_impairment"]
         result.path_impairments    = oi["path_impairments"]
+
+        # ── Structured evidence ───────────────────────────────────────────────
+        result.evidence_items = _build_evidence_items(
+            source_ip, destination_ip, state, timing,
+            oi["path_impairments"],
+            relevant_packets, relevant_flows, self._flows.values(),
+            roles=_roles_dict, lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
+        )
 
         return result
 

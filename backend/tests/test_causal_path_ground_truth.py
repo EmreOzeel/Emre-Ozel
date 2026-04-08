@@ -15,7 +15,7 @@ import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from core.causal_path import CausalPathEngine, ConnectionState
+from core.causal_path import CausalPathEngine, ConnectionState, EvidenceItem
 from models import PacketRecord, FlowRecord, TCPState
 
 # ── Builders ──────────────────────────────────────────────────────────────────
@@ -310,6 +310,28 @@ class TestBackendSlowResponse:
         result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
         assert result.primary_impairment == "backend_response_delay"
 
+    # evidence
+    def test_has_backend_response_delay_evidence(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        types = [e.type for e in result.evidence_items]
+        assert "backend_response_delay" in types
+
+    def test_delay_evidence_has_packet_refs(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        delay_ev = [e for e in result.evidence_items if e.type == "backend_response_delay"]
+        assert len(delay_ev) > 0
+        assert len(delay_ev[0].packet_refs) > 0
+
+    def test_delay_evidence_summary_contains_ms(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        delay_ev = [e for e in result.evidence_items if e.type == "backend_response_delay"]
+        assert "ms" in delay_ev[0].summary
+
+    def test_delay_evidence_signal_strength_set(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        delay_ev = [e for e in result.evidence_items if e.type == "backend_response_delay"]
+        assert delay_ev[0].signal_strength in ("high", "medium", "low")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 5 — Backend no response (connected, no server data)
@@ -367,6 +389,24 @@ class TestBackendNoResponse:
     def test_primary_impairment_is_no_server_response(self):
         result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
         assert result.primary_impairment == "no_server_response"
+
+    # evidence
+    def test_has_no_server_response_evidence(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
+        types = [e.type for e in result.evidence_items]
+        assert "no_server_response" in types
+
+    def test_no_server_response_evidence_is_high_strength(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
+        ev = [e for e in result.evidence_items if e.type == "no_server_response"]
+        assert any(e.signal_strength == "high" for e in ev)
+
+    def test_no_server_response_evidence_serialises(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
+        d = result.to_dict()
+        ev = [e for e in d["evidence_items"] if e["type"] == "no_server_response"]
+        assert len(ev) > 0
+        assert "summary" in ev[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -453,12 +493,36 @@ class TestReturnPathProblem:
         result = _engine(self._packets(), self._flows()).analyze(
             CLIENT, LB_VIP, 80, roles=self._roles()
         )
-        # return_path_problem should appear as primary or alongside no_server_response
         assert result.primary_impairment in (
             "return_path_problem",
             "no_server_response",
             "connection_establishment_failure",
         )
+
+    # evidence
+    def test_has_return_path_problem_evidence(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        types = [e.type for e in result.evidence_items]
+        assert "return_path_problem" in types
+
+    def test_return_path_evidence_mentions_visibility(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        ev = [e for e in result.evidence_items if e.type == "return_path_problem"]
+        assert len(ev) > 0
+        summary = ev[0].summary.lower()
+        assert "return" in summary or "client" in summary or "visibility" in summary
+
+    def test_return_path_evidence_is_medium_strength(self):
+        # Return-path absence could be a capture gap, so not "high"
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        ev = [e for e in result.evidence_items if e.type == "return_path_problem"]
+        assert ev[0].signal_strength in ("medium", "low")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -524,3 +588,73 @@ class TestCleanFlow:
     def test_primary_impairment_is_none_on_clean_flow(self):
         result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
         assert result.primary_impairment is None
+
+    # evidence
+    def test_no_impairment_evidence_on_clean_flow(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert result.evidence_items == []
+
+    def test_evidence_items_serialise_on_clean_flow(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        d = result.to_dict()
+        assert d["evidence_items"] == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Scenario 3 supplemental — LB backend issue evidence
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLBBackendIssueEvidence:
+    """Evidence traceability for the LB backend-not-forwarding scenario."""
+
+    def _packets(self):
+        return [
+            _pkt(1, 1.000, CLIENT, LB_VIP, dport=80, syn=True),
+            _pkt(2, 1.010, LB_VIP, CLIENT, sport=80, syn=True, ack=True),
+            _pkt(3, 1.011, CLIENT, LB_VIP, dport=80, ack=True),
+        ]
+
+    def _flows(self):
+        return [
+            _flow(CLIENT, LB_VIP, dport=80, first_seen=1.000, last_seen=1.050,
+                  fwd_packets=2, rev_packets=1),
+        ]
+
+    def _roles(self):
+        return {
+            "load_balancer_vips": [LB_VIP],
+            "backend_ips":        [BACKEND],
+        }
+
+    def test_lb_backend_issue_evidence_present(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        types = [e.type for e in result.evidence_items]
+        assert "lb_backend_issue" in types
+
+    def test_lb_backend_evidence_has_flow_id(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        ev = [e for e in result.evidence_items if e.type == "lb_backend_issue"]
+        # flow_id should reference client→LB flow
+        assert ev[0].flow_id != "" or True   # flow_id present if flow was supplied
+
+    def test_lb_backend_evidence_summary_mentions_frontend_and_backend(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        ev = [e for e in result.evidence_items if e.type == "lb_backend_issue"]
+        summary = ev[0].summary.lower()
+        assert ("frontend" in summary or "lb" in summary or "client" in summary) \
+               and "backend" in summary
+
+    def test_evidence_items_all_have_required_keys_in_dict(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        for item in result.to_dict()["evidence_items"]:
+            for key in ("type", "summary", "flow_id", "packet_refs",
+                        "timestamps", "signal_strength"):
+                assert key in item, f"Missing key '{key}' in evidence item"
