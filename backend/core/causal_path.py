@@ -196,7 +196,11 @@ class CausalPathEngine:
         )
 
         # ── Timing breakdown ──────────────────────────────────────────────────
-        timing = self._compute_timing(syn_pkt, synack_pkt, data_packets)
+        timing = {
+            "connect_time_ms": compute_connect_time_ms(relevant_packets),
+            "first_response_time_ms": compute_first_response_time_ms(relevant_packets),
+            "total_observed_latency_ms": compute_total_observed_latency_ms(relevant_packets),
+        }
 
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(

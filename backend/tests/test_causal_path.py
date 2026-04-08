@@ -78,9 +78,9 @@ class TestNoResponse:
         joined = " ".join(result.alternative_hypotheses).lower()
         assert "firewall" in joined or "blocked" in joined or "down" in joined
 
-    def test_syn_timestamp_in_timing(self):
+    def test_timing_has_total_latency(self):
         result = _engine(self._packets()).analyze("10.0.0.5", "10.0.0.1", 443)
-        assert "syn_ts" in result.timing_breakdown
+        assert "total_observed_latency_ms" in result.timing_breakdown
 
 
 # ── ConnectionState.ESTABLISHED_NO_DATA ──────────────────────────────────────
@@ -97,10 +97,10 @@ class TestEstablishedNoData:
         result = _engine(self._packets()).analyze("10.0.0.5", "10.0.0.1", 80)
         assert result.connection_state == ConnectionState.ESTABLISHED_NO_DATA
 
-    def test_handshake_rtt_computed(self):
+    def test_connect_time_ms_computed(self):
         result = _engine(self._packets()).analyze("10.0.0.5", "10.0.0.1", 80)
-        assert "handshake_rtt_ms" in result.timing_breakdown
-        assert result.timing_breakdown["handshake_rtt_ms"] == pytest.approx(15.0, abs=0.5)
+        assert "connect_time_ms" in result.timing_breakdown
+        assert result.timing_breakdown["connect_time_ms"] == pytest.approx(15.0, abs=0.5)
 
     def test_failure_point_set(self):
         result = _engine(self._packets()).analyze("10.0.0.5", "10.0.0.1", 80)
