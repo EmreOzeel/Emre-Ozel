@@ -804,22 +804,44 @@ def compute_connect_time_ms(flow_packets: list) -> "Optional[float]":
     """
     Compute TCP connect time from SYN to SYN-ACK.
 
+    Robustness rules:
+    - Uses the EARLIEST SYN (ignores retransmissions — all share the same ts order).
+    - SYN-ACK must occur AFTER the SYN and travel in the reverse direction.
+    - If SYN is missing (mid-stream capture) → returns None immediately.
+    - If SYN-ACK is missing → returns None.
+
     Args:
-        flow_packets: List[PacketRecord] — packets for a single flow.
+        flow_packets: List[PacketRecord] for a single flow (any order).
 
     Returns:
-        Time difference in milliseconds, or None if SYN-ACK not found.
+        Connect time in milliseconds (float), or None.
     """
-    syn    = None
-    synack = None
+    if not flow_packets:
+        return None
 
-    for p in sorted(flow_packets, key=lambda x: x.ts):
-        if syn is None and p.tcp_flags_syn and not p.tcp_flags_ack:
-            syn = p
-        elif synack is None and p.tcp_flags_syn and p.tcp_flags_ack:
-            synack = p
+    ordered = sorted(flow_packets, key=lambda p: p.ts)
 
-    if syn is None or synack is None:
+    # First valid SYN: client → server (syn=True, ack=False)
+    syn = next(
+        (p for p in ordered if p.tcp_flags_syn and not p.tcp_flags_ack),
+        None,
+    )
+    if syn is None:
+        return None   # mid-stream capture or no connection attempt
+
+    # First SYN-ACK: must be reverse direction AND after the SYN
+    synack = next(
+        (
+            p for p in ordered
+            if p.tcp_flags_syn
+            and p.tcp_flags_ack
+            and p.ts >= syn.ts
+            and p.src_ip == syn.dst_ip
+            and p.dst_ip == syn.src_ip
+        ),
+        None,
+    )
+    if synack is None:
         return None
 
     return round((synack.ts - syn.ts) * 1000, 3)
