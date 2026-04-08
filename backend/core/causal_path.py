@@ -798,3 +798,28 @@ def _first_data_from(ip: str, data_pkts: list):
     """Return the earliest data packet whose source is *ip*, or None."""
     candidates = [p for p in data_pkts if p.src_ip == ip]
     return min(candidates, key=lambda p: p.ts) if candidates else None
+
+
+def compute_connect_time_ms(flow_packets: list) -> "Optional[float]":
+    """
+    Compute TCP connect time from SYN to SYN-ACK.
+
+    Args:
+        flow_packets: List[PacketRecord] — packets for a single flow.
+
+    Returns:
+        Time difference in milliseconds, or None if SYN-ACK not found.
+    """
+    syn    = None
+    synack = None
+
+    for p in sorted(flow_packets, key=lambda x: x.ts):
+        if syn is None and p.tcp_flags_syn and not p.tcp_flags_ack:
+            syn = p
+        elif synack is None and p.tcp_flags_syn and p.tcp_flags_ack:
+            synack = p
+
+    if syn is None or synack is None:
+        return None
+
+    return round((synack.ts - syn.ts) * 1000, 3)
