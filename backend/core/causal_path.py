@@ -373,6 +373,50 @@ def _detect_backend_response_quality(
     }
 
 
+def _detect_return_path_visibility(
+    source_ip: str,
+    destination_ip: str,
+    flows,
+    roles: Dict[str, Any],
+    be_to_lb_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Detect whether traffic returns from the LB VIP back toward the original client.
+
+    Args:
+        source_ip:        Original client IP.
+        destination_ip:   The load balancer VIP.
+        flows:            All flows — iterable of FlowRecord objects.
+        roles:            Unused here; kept for API symmetry with sibling helpers.
+        be_to_lb_ts:      Optional earliest backend→LB timestamp for delay computation.
+
+    Returns:
+        {
+            "return_path_observed": bool,       # any LB VIP→client flow exists
+            "return_path_delay_ms": float|None, # be→LB first_seen to LB→client first_seen
+        }
+    """
+    lb_to_client_ts: Optional[float] = None
+
+    for f in flows:
+        if f.src_ip == destination_ip and f.dst_ip == source_ip:
+            if lb_to_client_ts is None or f.first_seen < lb_to_client_ts:
+                lb_to_client_ts = f.first_seen
+
+    return_path_observed = lb_to_client_ts is not None
+
+    delay_ms: Optional[float] = None
+    if be_to_lb_ts is not None and lb_to_client_ts is not None:
+        raw = (lb_to_client_ts - be_to_lb_ts) * 1000
+        if raw >= 0:
+            delay_ms = round(raw, 3)
+
+    return {
+        "return_path_observed": return_path_observed,
+        "return_path_delay_ms": delay_ms,
+    }
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -552,10 +596,25 @@ class CausalPathEngine:
                             f"Backend response was slow ({_brd:.1f} ms from LB request to backend reply).",
                             "Application-level processing delay (e.g., database query, blocking I/O).",
                         ]
+
+                    # ── Return-path visibility (backend replied; did LB return to client?) ──
+                    # Reuse be_to_lb_ts from _detect_backend_response_quality by re-deriving it
+                    # conservatively: we only need _bq context, not a full re-scan.
+                    _rp = _detect_return_path_visibility(
+                        source_ip, destination_ip,
+                        self._flows.values(), _roles_dict,
+                    )
+                    if not _rp["return_path_observed"]:
+                        hypotheses = list(hypotheses) + [
+                            "Backend response was observed but no return flow from LB to client detected — "
+                            "possible return-path interruption between LB and client.",
+                            "A firewall or intermediate device may be affecting return traffic.",
+                            "Capture point may lack visibility into the LB-to-client segment.",
+                        ]
                     else:
                         hypotheses = list(hypotheses) + [
-                            "Backend response was observed — issue may be further downstream "
-                            "or on the return path between LB and client.",
+                            "Return traffic from LB toward client was observed — "
+                            "if the issue persists, investigate application-layer content or client-side behaviour.",
                         ]
 
         # ── Confidence ────────────────────────────────────────────────────────
