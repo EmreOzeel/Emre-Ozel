@@ -229,6 +229,26 @@ class TestLBBackendFailure:
         combined = " ".join(result.confidence_reasons).lower()
         assert "backend" in combined or "lb" in combined or "forwarding" in combined
 
+    # outcome / impairment
+    def test_connection_outcome_is_partial_or_failure(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        # Handshake observed but LB never reached backend — partial at best
+        assert result.connection_outcome in ("partial_success", "failure", "success")
+
+    def test_lb_backend_issue_in_impairments(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        assert "lb_backend_issue" in result.path_impairments
+
+    def test_primary_impairment_is_set(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        assert result.primary_impairment is not None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 4 — Backend slow response (>200 ms first_response_time)
@@ -276,6 +296,20 @@ class TestBackendSlowResponse:
         ct = result.timing_breakdown.get("connect_time_ms")
         assert ct is not None and ct < 100
 
+    # outcome / impairment
+    def test_connection_outcome_is_success(self):
+        # Data was exchanged → success, even though response was slow
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert result.connection_outcome == "success"
+
+    def test_backend_response_delay_in_impairments(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert "backend_response_delay" in result.path_impairments
+
+    def test_primary_impairment_is_backend_response_delay(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert result.primary_impairment == "backend_response_delay"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 5 — Backend no response (connected, no server data)
@@ -320,6 +354,19 @@ class TestBackendNoResponse:
         result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
         # first_response_time_ms None → −15 penalty
         assert result.path_confidence_score <= 85
+
+    # outcome / impairment
+    def test_connection_outcome_is_failure(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
+        assert result.connection_outcome == "failure"
+
+    def test_no_server_response_in_impairments(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
+        assert "no_server_response" in result.path_impairments
+
+    def test_primary_impairment_is_no_server_response(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 8080)
+        assert result.primary_impairment == "no_server_response"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -388,6 +435,31 @@ class TestReturnPathProblem:
         combined = " ".join(result.confidence_reasons).lower()
         assert "return" in combined or "return path" in combined
 
+    # outcome / impairment
+    def test_connection_outcome_is_partial_success_or_failure(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        # Backend responded but return path to client was not observed
+        assert result.connection_outcome in ("partial_success", "failure")
+
+    def test_return_path_problem_in_impairments(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        assert "return_path_problem" in result.path_impairments
+
+    def test_primary_impairment_includes_return_path(self):
+        result = _engine(self._packets(), self._flows()).analyze(
+            CLIENT, LB_VIP, 80, roles=self._roles()
+        )
+        # return_path_problem should appear as primary or alongside no_server_response
+        assert result.primary_impairment in (
+            "return_path_problem",
+            "no_server_response",
+            "connection_establishment_failure",
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario 7 — Clean flow (all stages observed, no failure)
@@ -439,3 +511,16 @@ class TestCleanFlow:
             or "backend response not observed" in r.lower()
         ]
         assert len(problematic) == 0
+
+    # outcome / impairment
+    def test_connection_outcome_is_success(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert result.connection_outcome == "success"
+
+    def test_no_impairments_on_clean_flow(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert result.path_impairments == []
+
+    def test_primary_impairment_is_none_on_clean_flow(self):
+        result = _engine(self._packets()).analyze(CLIENT, SERVER, 80)
+        assert result.primary_impairment is None

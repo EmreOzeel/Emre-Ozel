@@ -76,8 +76,18 @@ class PathAnalysisResult:
     # ── Return path ──────────────────────────────────────────────────────────
     return_path_observation: str = ""
 
+    # ── Outcome / impairment model ───────────────────────────────────────────
+    # Separates connectivity outcome from performance/visibility degradation.
+    # A flow can be connection_outcome="success" yet still carry impairments.
+    connection_outcome: str = "unknown"          # success | partial_success | failure | unknown
+    primary_impairment: Optional[str] = None     # dominant impairment signal, or None
+    path_impairments: List[str] = field(default_factory=list)
+    # Valid impairment tokens:
+    #   connection_establishment_failure | no_server_response | backend_response_delay
+    #   lb_backend_issue | return_path_problem | firewall_interference
+
     # ── Failure attribution ──────────────────────────────────────────────────
-    likely_failure_point: str = ""     # empty string = no failure detected
+    likely_failure_point: str = ""     # domain-oriented summary (kept for backward compat)
     alternative_hypotheses: List[str] = field(default_factory=list)
 
     # ── Confidence ───────────────────────────────────────────────────────────
@@ -127,6 +137,9 @@ class PathAnalysisResult:
             "timing_breakdown":         self.timing_breakdown,
             "timing_interpretation":    self.timing_interpretation,
             "return_path_observation":  self.return_path_observation,
+            "connection_outcome":        self.connection_outcome,
+            "primary_impairment":       self.primary_impairment,
+            "path_impairments":         self.path_impairments,
             "likely_failure_point":     self.likely_failure_point,
             "alternative_hypotheses":   self.alternative_hypotheses,
             "confidence_score":         self.confidence_score,
@@ -137,6 +150,112 @@ class PathAnalysisResult:
             "evidence_flows":           self.evidence_flows,
             "missing_visibility_notes": self.missing_visibility_notes,
         }
+
+
+# Impairment priority — first match becomes primary_impairment.
+_IMPAIRMENT_PRIORITY = [
+    "connection_establishment_failure",
+    "no_server_response",
+    "firewall_interference",
+    "return_path_problem",
+    "lb_backend_issue",
+    "backend_response_delay",
+]
+
+
+def _classify_outcome_and_impairments(
+    state: "ConnectionState",
+    timing: Dict[str, Any],
+    lb_vis: Optional[Dict[str, Any]] = None,
+    bq: Optional[Dict[str, Any]] = None,
+    rp: Optional[Dict[str, Any]] = None,
+    fw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Derive connection_outcome, primary_impairment, and path_impairments from
+    existing analysis signals.
+
+    Separates *connectivity outcome* from *performance/visibility impairment*
+    so that DATA_OBSERVED flows can still surface degradation signals.
+
+    connection_outcome values:
+        success         — data exchanged, no significant impairment
+        partial_success — data exchanged but end-to-end delivery questionable,
+                          OR handshake completed but no application data
+        failure         — connection never established, or no data after connect
+        unknown         — no connection attempt observed
+
+    path_impairments tokens (may co-occur):
+        connection_establishment_failure
+        no_server_response
+        backend_response_delay
+        lb_backend_issue
+        return_path_problem
+        firewall_interference
+    """
+    impairments: List[str] = []
+
+    # ── Collect impairment signals ────────────────────────────────────────────
+
+    # Connection-level failure
+    if state in (ConnectionState.NO_RESPONSE, ConnectionState.NO_ATTEMPT):
+        impairments.append("connection_establishment_failure")
+
+    # No application data after a successful handshake
+    if state == ConnectionState.ESTABLISHED_NO_DATA:
+        impairments.append("no_server_response")
+
+    # Backend slow response — check packet-level timing regardless of state
+    frt = timing.get("first_response_time_ms")
+    if frt is not None and frt > 200:
+        impairments.append("backend_response_delay")
+
+    # LB-level: LB did not forward to any backend
+    if lb_vis is not None and not lb_vis["lb_backend_observed"]:
+        impairments.append("lb_backend_issue")
+
+    # LB-level: backend did not reply to LB
+    if bq is not None and not bq["backend_response_observed"]:
+        if "no_server_response" not in impairments:
+            impairments.append("no_server_response")
+
+    # LB-level: backend response was slow
+    brd = (bq or {}).get("backend_response_delay_ms")
+    if brd is not None and brd > 200:
+        if "backend_response_delay" not in impairments:
+            impairments.append("backend_response_delay")
+
+    # Return-path problem (LB→client flow missing despite backend reply)
+    if rp is not None and not rp["return_path_observed"]:
+        impairments.append("return_path_problem")
+
+    # Firewall interference (RST or RST-on-known-FW-IP)
+    if fw is not None and (fw["rst_observed"] or fw["firewall_evidence_notes"]):
+        impairments.append("firewall_interference")
+
+    # ── Derive outcome ────────────────────────────────────────────────────────
+    if state == ConnectionState.DATA_OBSERVED:
+        if "return_path_problem" in impairments:
+            outcome = "partial_success"
+        else:
+            outcome = "success"
+    elif state == ConnectionState.ESTABLISHED_NO_DATA:
+        outcome = "failure"
+    elif state == ConnectionState.NO_RESPONSE:
+        outcome = "failure"
+    elif state == ConnectionState.NO_ATTEMPT:
+        outcome = "unknown"
+    else:
+        outcome = "unknown"
+
+    # ── Primary impairment — highest-priority token present ───────────────────
+    primary = next((i for i in _IMPAIRMENT_PRIORITY if i in impairments), None)
+
+    return {
+        "connection_outcome": outcome,
+        "primary_impairment": primary,
+        "path_impairments":   impairments,
+    }
 
 
 def _classify_failure_domain(timing: Dict[str, Any]):
@@ -1008,6 +1127,15 @@ class CausalPathEngine:
         )
         result.path_confidence_score = pc["path_confidence_score"]
         result.confidence_reasons    = pc["confidence_reasons"]
+
+        # ── Outcome / impairment model ────────────────────────────────────────
+        oi = _classify_outcome_and_impairments(
+            state, timing,
+            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
+        )
+        result.connection_outcome  = oi["connection_outcome"]
+        result.primary_impairment  = oi["primary_impairment"]
+        result.path_impairments    = oi["path_impairments"]
 
         return result
 
