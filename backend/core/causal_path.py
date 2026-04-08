@@ -845,3 +845,77 @@ def compute_connect_time_ms(flow_packets: list) -> "Optional[float]":
         return None
 
     return round((synack.ts - syn.ts) * 1000, 3)
+
+
+def compute_first_response_time_ms(flow_packets: list) -> "Optional[float]":
+    """
+    Compute time from handshake completion (final ACK) to first server data.
+
+    Handshake is considered complete when:
+        1. SYN  : client → server  (syn=True,  ack=False)
+        2. SYN-ACK : server → client  (syn=True,  ack=True)
+        3. ACK  : client → server  (syn=False, ack=True, no payload)
+
+    First server response: earliest packet from server → client with payload
+    (tcp_payload_len > 0) that occurs after the final ACK.
+
+    Returns:
+        Milliseconds between final ACK and first server data, or None.
+    """
+    if not flow_packets:
+        return None
+
+    ordered = sorted(flow_packets, key=lambda p: p.ts)
+
+    # Step 1: SYN (client → server)
+    syn = next(
+        (p for p in ordered if p.tcp_flags_syn and not p.tcp_flags_ack),
+        None,
+    )
+    if syn is None:
+        return None
+
+    client = syn.src_ip
+    server = syn.dst_ip
+
+    # Step 2: SYN-ACK (server → client, after SYN)
+    synack = next(
+        (
+            p for p in ordered
+            if p.tcp_flags_syn and p.tcp_flags_ack
+            and p.src_ip == server and p.dst_ip == client
+            and p.ts >= syn.ts
+        ),
+        None,
+    )
+    if synack is None:
+        return None
+
+    # Step 3: final ACK (client → server, after SYN-ACK, no payload)
+    final_ack = next(
+        (
+            p for p in ordered
+            if not p.tcp_flags_syn and p.tcp_flags_ack
+            and p.src_ip == client and p.dst_ip == server
+            and p.tcp_payload_len == 0
+            and p.ts >= synack.ts
+        ),
+        None,
+    )
+    if final_ack is None:
+        return None
+
+    # Step 4: first server data (server → client, after final ACK, with payload)
+    first_data = next(
+        (
+            p for p in ordered
+            if p.src_ip == server and p.dst_ip == client
+            and p.tcp_payload_len > 0
+            and p.ts >= final_ack.ts
+        ),
+        None,
+    )
+    if first_data is None:
+        return None
+
+    return round((first_data.ts - final_ack.ts) * 1000, 3)
