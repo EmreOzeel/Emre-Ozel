@@ -271,6 +271,53 @@ def _classify_role_aware_failure_domain(
     return (hypotheses, visibility_notes)
 
 
+def _detect_lb_backend_visibility(
+    source_ip: str,
+    destination_ip: str,
+    flows,
+    roles: Dict[str, Any],
+) -> Dict[str, bool]:
+    """
+    Determine whether client-to-LB and LB-to-backend flows are both observed.
+
+    Args:
+        source_ip:        Originating client IP.
+        destination_ip:   The load balancer VIP (already confirmed by caller).
+        flows:            All flows — iterable of FlowRecord objects.
+        roles:            Dict with optional backend_ips / backend_subnets lists.
+
+    Returns:
+        {
+            "lb_frontend_observed": bool,  # flow from source_ip → LB VIP exists
+            "lb_backend_observed":  bool,  # flow from LB VIP → any backend exists
+        }
+
+    Note: caller must only invoke this when destination_ip is a known LB VIP.
+    """
+    backend_ips  = roles.get("backend_ips", []) or []
+    backend_nets = roles.get("backend_subnets", []) or []
+
+    frontend_observed = False
+    backend_observed  = False
+
+    for f in flows:
+        # Client → LB VIP
+        if f.src_ip == source_ip and f.dst_ip == destination_ip:
+            frontend_observed = True
+
+        # LB VIP → backend (exact match or subnet)
+        if f.src_ip == destination_ip:
+            if f.dst_ip in backend_ips:
+                backend_observed = True
+            elif any(_ip_in_subnet(f.dst_ip, net) for net in backend_nets):
+                backend_observed = True
+
+    return {
+        "lb_frontend_observed": frontend_observed,
+        "lb_backend_observed":  backend_observed,
+    }
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -419,6 +466,23 @@ class CausalPathEngine:
         )
         _roles_dict = roles if isinstance(roles, dict) else None
         hypotheses, _role_vis = _classify_role_aware_failure_domain(_stub, _roles_dict)
+
+        # ── LB frontend/backend separation (only when destination is a known LB VIP) ──
+        if _roles_dict and destination_ip in (_roles_dict.get("load_balancer_vips") or []):
+            _lb_vis = _detect_lb_backend_visibility(
+                source_ip, destination_ip, self._flows.values(), _roles_dict
+            )
+            if _lb_vis["lb_frontend_observed"] and not _lb_vis["lb_backend_observed"]:
+                hypotheses = list(hypotheses) + [
+                    "Load balancer frontend connection observed but no LB-to-backend flow detected — "
+                    "possible backend forwarding misconfiguration or unhealthy backend pool.",
+                    "Backend pool members may be failing health checks or are unreachable from the LB.",
+                ]
+            elif _lb_vis["lb_frontend_observed"] and _lb_vis["lb_backend_observed"]:
+                hypotheses = list(hypotheses) + [
+                    "LB-to-backend forwarding was observed — issue may lie in backend response "
+                    "quality or return-path visibility rather than LB forwarding.",
+                ]
 
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(
