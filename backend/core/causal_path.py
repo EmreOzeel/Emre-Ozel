@@ -131,6 +131,81 @@ class PathAnalysisResult:
         }
 
 
+def _classify_failure_domain(timing: Dict[str, Any]):
+    """
+    First-pass timing-based failure-domain classification.
+
+    Returns (failure_point: str, hypotheses: List[str]).
+
+    Domains:
+        front_end_connection_failure       — no connect, very short capture
+        connection_establishment_failure   — no connect, unclear cause
+        no_server_response_after_connection — connected, no server data
+        slow_connection_establishment      — connect_time_ms > 100
+        backend_or_application_delay       — fast connect, slow response
+        no_obvious_failure_detected        — all within normal thresholds
+
+    Note: callers should only apply the latency-specific domains
+    (slow_connection_establishment, backend_or_application_delay,
+    no_server_response_after_connection) as overrides; connectivity
+    failures are better described by the connection-state classifier.
+    """
+    ct  = timing.get("connect_time_ms")
+    frt = timing.get("first_response_time_ms")
+    tot = timing.get("total_observed_latency_ms")
+
+    if ct is None:
+        if tot is not None and tot < 100:
+            return (
+                "front_end_connection_failure",
+                [
+                    "Connection attempt was blocked before reaching the service.",
+                    "Capture window too short to observe a full handshake.",
+                    "Service may not be running or is unreachable on this path.",
+                ],
+            )
+        return (
+            "connection_establishment_failure",
+            [
+                "A firewall or ACL on the path may be filtering this traffic.",
+                "The service is not reachable from the source network.",
+                "Capture does not cover the full connection attempt.",
+            ],
+        )
+
+    if frt is None:
+        return (
+            "no_server_response_after_connection",
+            [
+                "Backend service accepted the TCP connection but sent no application data.",
+                "Return-path visibility gap — server response may exist but is not captured.",
+                "Application-layer negotiation failed (e.g., TLS error, auth rejection).",
+            ],
+        )
+
+    if ct > 100:
+        return (
+            "slow_connection_establishment",
+            [
+                "High network latency between client and server.",
+                "Server is overloaded and slow to complete the TCP handshake.",
+                "Intermediate device (firewall, NAT) is adding latency.",
+            ],
+        )
+
+    if frt > 200:
+        return (
+            "backend_or_application_delay",
+            [
+                "Backend service is processing the request slowly.",
+                "Load balancer backend pool is under pressure.",
+                "Application-level processing latency (database, compute).",
+            ],
+        )
+
+    return ("no_obvious_failure_detected", [])
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -251,6 +326,18 @@ class CausalPathEngine:
             "total_observed_latency_ms": compute_total_observed_latency_ms(relevant_packets),
         }
         timing_interp = _interpret_timing(timing)
+
+        # ── Failure domain (timing-based refinement) ──────────────────────────
+        # Apply only for latency-specific domains; step_e owns connectivity failures.
+        _TIMING_OVERRIDES = {
+            "slow_connection_establishment",
+            "backend_or_application_delay",
+            "no_server_response_after_connection",
+        }
+        td_failure, td_hypotheses = _classify_failure_domain(timing)
+        if td_failure in _TIMING_OVERRIDES and state != ConnectionState.DATA_OBSERVED:
+            failure    = td_failure
+            hypotheses = td_hypotheses
 
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(
