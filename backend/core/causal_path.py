@@ -919,3 +919,21 @@ def compute_first_response_time_ms(flow_packets: list) -> "Optional[float]":
         return None
 
     return round((first_data.ts - final_ack.ts) * 1000, 3)
+
+
+def compute_total_observed_latency_ms(flow_packets: list) -> "Optional[float]":
+    """
+    Return the total observed duration of a flow in milliseconds.
+
+    Computed as: last_packet.ts - first_packet.ts
+
+    Args:
+        flow_packets: List[PacketRecord] for a single flow (any order).
+
+    Returns:
+        Duration in milliseconds, 0.0 if only one packet, or None if empty.
+    """
+    if not flow_packets:
+        return None
+    ts_values = [p.ts for p in flow_packets]
+    return round((max(ts_values) - min(ts_values)) * 1000, 3)
