@@ -206,6 +206,71 @@ def _classify_failure_domain(timing: Dict[str, Any]):
     return ("no_obvious_failure_detected", [])
 
 
+def _classify_role_aware_failure_domain(
+    result: "PathAnalysisResult",
+    roles: Optional[Dict[str, Any]],
+) -> tuple:
+    """
+    Conservatively enrich alternative_hypotheses and missing_visibility_notes
+    based on the destination IP's known role.
+
+    Does NOT rename likely_failure_point.
+    Does NOT add new packet parsing logic.
+    Only uses the roles dict supplied by the caller.
+
+    Returns:
+        (enriched_hypotheses: List[str], enriched_visibility_notes: List[str])
+    """
+    if not roles:
+        return (list(result.alternative_hypotheses), list(result.missing_visibility_notes))
+
+    dst = result.destination_ip
+    failure = result.likely_failure_point
+    hypotheses = list(result.alternative_hypotheses)
+    visibility_notes = list(result.missing_visibility_notes)
+
+    lb_vips       = roles.get("load_balancer_vips", []) or []
+    backend_ips   = roles.get("backend_ips", []) or []
+    backend_nets  = roles.get("backend_subnets", []) or []
+    firewall_ips  = roles.get("firewall_ips", []) or []
+
+    # ── Load balancer destination ─────────────────────────────────────────────
+    if dst in lb_vips:
+        if failure in ("connection_establishment_failure", "front_end_connection_failure"):
+            hypotheses.extend([
+                "Load balancer frontend is not accepting connections (VIP misconfiguration or LB down).",
+                "Firewall or path filtering is blocking traffic before it reaches the load balancer.",
+            ])
+        elif failure == "no_server_response_after_connection":
+            hypotheses.extend([
+                "Load balancer accepted the connection but failed to forward to a backend (forwarding rule issue).",
+                "Backend pool is unhealthy — no members are passing health checks.",
+            ])
+
+    # ── Backend destination ───────────────────────────────────────────────────
+    elif dst in backend_ips or any(_ip_in_subnet(dst, net) for net in backend_nets):
+        if failure == "backend_or_application_delay":
+            hypotheses.extend([
+                "Backend host is responding slowly (CPU/memory pressure or I/O wait).",
+                "Application processing delay (e.g., slow database query, synchronous blocking call).",
+            ])
+        elif failure == "no_server_response_after_connection":
+            hypotheses.extend([
+                "Backend service accepted the TCP connection but the application layer did not respond.",
+                "Return-path visibility gap — response may exist but is not visible at the capture point.",
+            ])
+
+    # ── Firewall destination ──────────────────────────────────────────────────
+    elif dst in firewall_ips:
+        visibility_notes.append(
+            f"Destination {dst} is a known firewall address. "
+            "Traffic is targeting the firewall itself; attribution of failures to upstream/downstream "
+            "components is limited from this capture point."
+        )
+
+    return (hypotheses, visibility_notes)
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -339,6 +404,22 @@ class CausalPathEngine:
             failure    = td_failure
             hypotheses = td_hypotheses
 
+        # ── Role-aware enrichment ─────────────────────────────────────────────
+        # Build a minimal stub so the helper can read destination_ip and failure.
+        _stub = PathAnalysisResult(
+            source_ip=source_ip,
+            destination_ip=destination_ip,
+            destination_port=destination_port,
+            protocol="unknown",
+            connection_state=state,
+            path_summary="",
+            likely_failure_point=failure,
+            alternative_hypotheses=hypotheses,
+            missing_visibility_notes=[],   # enriched below after _visibility_notes()
+        )
+        _roles_dict = roles if isinstance(roles, dict) else None
+        hypotheses, _role_vis = _classify_role_aware_failure_domain(_stub, _roles_dict)
+
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(
             relevant_packets, relevant_flows, syn_pkt, synack_pkt
@@ -349,6 +430,7 @@ class CausalPathEngine:
             relevant_packets, relevant_flows,
             syn_pkt, destination_port
         )
+        visibility_notes.extend(_role_vis)   # append any role-based visibility notes
 
         # ── Determine protocol ────────────────────────────────────────────────
         protocol = self._infer_protocol(relevant_packets, destination_port)
