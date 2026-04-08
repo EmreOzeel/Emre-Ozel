@@ -58,6 +58,7 @@ class PathAnalysisResult:
     # ── Top-level verdict ────────────────────────────────────────────────────
     connection_state: ConnectionState
     path_summary: str                  # One-sentence human narrative
+    path_steps: List[str] = field(default_factory=list)   # Step-by-step narrative
 
     # ── Path observations (populated by future reasoning layers) ─────────────
     hop_sequence: List[str] = field(default_factory=list)
@@ -99,6 +100,7 @@ class PathAnalysisResult:
             "protocol":           self.protocol,
             "connection_state":   self.connection_state.value,
             "path_summary":       self.path_summary,
+            "path_steps":         self.path_steps,
             "hop_sequence":       self.hop_sequence,
             "firewall_observation": {
                 "role":     self.firewall_observation.role,
@@ -484,6 +486,170 @@ def _detect_firewall_path_interference(
     }
 
 
+# ── Failure-point → closing sentence map ─────────────────────────────────────
+_FAILURE_CLOSING: Dict[str, str] = {
+    "no_obvious_failure_detected":
+        "No obvious failure was detected along the observed path.",
+    "front_end_connection_failure":
+        "The most likely issue is a connection failure before the traffic reached the service.",
+    "connection_establishment_failure":
+        "Connection establishment failed — the service may be unreachable or filtered on this path.",
+    "no_server_response_after_connection":
+        "The connection was established but no server response was observed.",
+    "slow_connection_establishment":
+        "Connection establishment appears slow, suggesting possible network latency or overload.",
+    "backend_or_application_delay":
+        "The most likely issue is a delay in backend or application response.",
+}
+
+
+def _compose_path_narrative(
+    source_ip: str,
+    destination_ip: str,
+    result: "PathAnalysisResult",
+    roles: Optional[Dict[str, Any]] = None,
+    lb_vis: Optional[Dict[str, Any]] = None,
+    bq: Optional[Dict[str, Any]] = None,
+    rp: Optional[Dict[str, Any]] = None,
+    fw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Compose a step-by-step human-readable narrative from existing analysis signals.
+
+    Args:
+        source_ip / destination_ip: Endpoint identifiers.
+        result:   Fully populated PathAnalysisResult.
+        roles:    Optional infrastructure role dict.
+        lb_vis:   Output of _detect_lb_backend_visibility (or None).
+        bq:       Output of _detect_backend_response_quality (or None).
+        rp:       Output of _detect_return_path_visibility (or None).
+        fw:       Output of _detect_firewall_path_interference (or None).
+
+    Returns:
+        {"path_steps": List[str], "path_summary": str}
+    """
+    steps: List[str] = []
+    timing   = result.timing_breakdown
+    state    = result.connection_state
+    failure  = result.likely_failure_point
+    lb_vips  = (roles or {}).get("load_balancer_vips", []) or []
+    is_lb    = destination_ip in lb_vips
+
+    # ── Step 1: opening ───────────────────────────────────────────────────────
+    if state in (ConnectionState.NO_ATTEMPT, ConnectionState.UNKNOWN):
+        steps.append(
+            f"Traffic from {source_ip} toward {destination_ip} was observed, "
+            "but connection establishment was incomplete or not confirmed."
+        )
+    else:
+        steps.append(f"Client {source_ip} initiated traffic toward {destination_ip}.")
+
+    # ── Step 2: connection establishment timing ───────────────────────────────
+    ct = timing.get("connect_time_ms")
+    if ct is None:
+        steps.append("Connection establishment was not observed in this capture.")
+    elif ct > 100:
+        steps.append(
+            f"Connection establishment completed in {ct:.1f} ms, "
+            "which is slower than expected and may indicate network latency or server load."
+        )
+    else:
+        steps.append(f"Connection was established successfully ({ct:.1f} ms).")
+
+    # ── Step 3: load-balancer path (only when destination is a known LB VIP) ──
+    if is_lb and lb_vis is not None:
+        if lb_vis["lb_frontend_observed"]:
+            steps.append("Traffic reached the load balancer frontend.")
+        else:
+            steps.append(
+                "No client-to-LB frontend flow was observed — "
+                "the load balancer may not have been reachable from this client."
+            )
+
+        if lb_vis["lb_backend_observed"]:
+            steps.append("The load balancer forwarded traffic to a backend host.")
+        else:
+            steps.append(
+                "No LB-to-backend flow was observed — "
+                "the load balancer may not have forwarded traffic to any backend."
+            )
+
+        # Backend response
+        if bq is not None:
+            if not bq["backend_response_observed"]:
+                steps.append(
+                    "No backend response to the load balancer was observed."
+                )
+            else:
+                brd = bq["backend_response_delay_ms"]
+                if brd is not None and brd > 200:
+                    steps.append(
+                        f"The backend responded to the load balancer, "
+                        f"but took {brd:.1f} ms, suggesting application-level delay."
+                    )
+                else:
+                    steps.append("The backend responded to the load balancer.")
+
+        # Return path
+        if rp is not None:
+            if rp["return_path_observed"]:
+                steps.append(
+                    "Return traffic from the load balancer toward the client was observed."
+                )
+            else:
+                steps.append(
+                    "No return traffic from the load balancer toward the client was detected."
+                )
+
+    # ── Step 4: firewall / RST evidence ──────────────────────────────────────
+    if fw is not None and fw["rst_observed"]:
+        direction = fw["rst_direction"] or "unknown"
+        dir_label = {
+            "server_to_client": "from server toward client",
+            "client_to_server": "from client toward server",
+        }.get(direction, "in an unknown direction")
+        steps.append(
+            f"A TCP reset (RST) was observed {dir_label}. "
+            "This may indicate an active rejection, but the cause cannot be confirmed from "
+            "packet data alone."
+        )
+        if fw["firewall_evidence_notes"]:
+            steps.append(
+                "A RST packet was observed involving a known firewall address — "
+                "firewall interference is possible but cannot be confirmed."
+            )
+
+    elif fw is not None and fw["firewall_evidence_notes"]:
+        steps.append(
+            "Firewall-related visibility notes were recorded; "
+            "firewall involvement is possible but cannot be confirmed."
+        )
+
+    # ── Step 5: backend delay summary (non-LB path) ──────────────────────────
+    if not is_lb:
+        frt = timing.get("first_response_time_ms")
+        if frt is not None and frt > 200:
+            steps.append(
+                f"The server response took {frt:.1f} ms after connection, "
+                "suggesting possible application-level delay."
+            )
+
+    # ── Step 6: closing summary ───────────────────────────────────────────────
+    closing = _FAILURE_CLOSING.get(
+        failure,
+        f"The analysis points to a possible issue at: {failure}." if failure else
+        "The path analysis did not identify a specific failure point.",
+    )
+    if result.confidence_score < 50:
+        closing += " Confidence is low; capture visibility may be incomplete."
+    steps.append(closing)
+
+    return {
+        "path_steps":   steps,
+        "path_summary": closing,
+    }
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -633,13 +799,14 @@ class CausalPathEngine:
         _roles_dict = roles if isinstance(roles, dict) else None
         hypotheses, _role_vis = _classify_role_aware_failure_domain(_stub, _roles_dict)
 
-        # Initialise per-layer context so firewall check can reference them unconditionally.
-        _bq: Optional[Dict[str, Any]] = None
-        _rp: Optional[Dict[str, Any]] = None
+        # Initialise per-layer context so downstream steps can reference them unconditionally.
+        _lb_vis: Optional[Dict[str, Any]] = None
+        _bq:     Optional[Dict[str, Any]] = None
+        _rp:     Optional[Dict[str, Any]] = None
 
         # ── LB frontend/backend separation (only when destination is a known LB VIP) ──
         if _roles_dict and destination_ip in (_roles_dict.get("load_balancer_vips") or []):
-            _lb_vis = _detect_lb_backend_visibility(
+            _lb_vis = _detect_lb_backend_visibility(  # noqa: F841 (used by narrative)
                 source_ip, destination_ip, self._flows.values(), _roles_dict
             )
             if _lb_vis["lb_frontend_observed"] and not _lb_vis["lb_backend_observed"]:
@@ -735,7 +902,7 @@ class CausalPathEngine:
         # ── Return path ───────────────────────────────────────────────────────
         return_note = self._return_path_note(relevant_packets, source_ip, destination_ip)
 
-        return PathAnalysisResult(
+        result = PathAnalysisResult(
             source_ip=source_ip,
             destination_ip=destination_ip,
             destination_port=destination_port,
@@ -754,6 +921,16 @@ class CausalPathEngine:
             evidence_flows=[f.key for f in relevant_flows],
             missing_visibility_notes=visibility_notes,
         )
+
+        # ── Path narrative ────────────────────────────────────────────────────
+        narrative = _compose_path_narrative(
+            source_ip, destination_ip, result, _roles_dict,
+            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
+        )
+        result.path_steps = narrative["path_steps"]
+        # path_summary keeps the step_e verdict; path_steps carries the full narrative.
+
+        return result
 
     # ── Step A: filter ────────────────────────────────────────────────────────
 
