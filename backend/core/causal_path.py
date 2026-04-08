@@ -417,6 +417,73 @@ def _detect_return_path_visibility(
     }
 
 
+def _detect_firewall_path_interference(
+    source_ip: str,
+    destination_ip: str,
+    flow_packets,
+    roles: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Identify conservative packet-level evidence of firewall involvement.
+
+    Inspects RST flags and known firewall IPs in the packet list.
+    Does NOT invent certainty — all notes use hedged language.
+
+    Args:
+        source_ip:        Originating client IP.
+        destination_ip:   Target IP (may be an LB VIP or backend).
+        flow_packets:     Packets filtered for the client-facing flow.
+        roles:            Dict with optional firewall_ips list.
+
+    Returns:
+        {
+            "rst_observed":           bool,
+            "rst_direction":          "server_to_client"|"client_to_server"|"unknown"|None,
+            "firewall_evidence_notes": List[str],   # visibility/evidence notes
+            "firewall_hypotheses":     List[str],   # alternative hypothesis strings
+        }
+    """
+    firewall_ips = roles.get("firewall_ips", []) or []
+
+    rst_observed   = False
+    rst_direction  = None
+    evidence_notes: List[str] = []
+    fw_hypotheses:  List[str] = []
+
+    for p in flow_packets:
+        if not p.tcp_flags_rst:
+            continue
+
+        rst_observed = True
+
+        # Determine direction of the first RST observed
+        if rst_direction is None:
+            if p.src_ip == destination_ip and p.dst_ip == source_ip:
+                rst_direction = "server_to_client"
+            elif p.src_ip == source_ip and p.dst_ip == destination_ip:
+                rst_direction = "client_to_server"
+            else:
+                rst_direction = "unknown"
+
+        # Direct firewall IP involvement in this RST packet
+        if p.src_ip in firewall_ips or p.dst_ip in firewall_ips:
+            fw_ip = p.src_ip if p.src_ip in firewall_ips else p.dst_ip
+            evidence_notes.append(
+                f"RST packet observed involving known firewall address {fw_ip} — "
+                "may indicate active policy enforcement by the firewall."
+            )
+
+    if rst_observed and rst_direction is None:
+        rst_direction = "unknown"
+
+    return {
+        "rst_observed":            rst_observed,
+        "rst_direction":           rst_direction,
+        "firewall_evidence_notes": evidence_notes,
+        "firewall_hypotheses":     fw_hypotheses,
+    }
+
+
 def _interpret_timing(timing: Dict[str, Any]) -> str:
     """
     Produce a plain-language timing interpretation from timing_breakdown values.
@@ -566,6 +633,10 @@ class CausalPathEngine:
         _roles_dict = roles if isinstance(roles, dict) else None
         hypotheses, _role_vis = _classify_role_aware_failure_domain(_stub, _roles_dict)
 
+        # Initialise per-layer context so firewall check can reference them unconditionally.
+        _bq: Optional[Dict[str, Any]] = None
+        _rp: Optional[Dict[str, Any]] = None
+
         # ── LB frontend/backend separation (only when destination is a known LB VIP) ──
         if _roles_dict and destination_ip in (_roles_dict.get("load_balancer_vips") or []):
             _lb_vis = _detect_lb_backend_visibility(
@@ -598,8 +669,6 @@ class CausalPathEngine:
                         ]
 
                     # ── Return-path visibility (backend replied; did LB return to client?) ──
-                    # Reuse be_to_lb_ts from _detect_backend_response_quality by re-deriving it
-                    # conservatively: we only need _bq context, not a full re-scan.
                     _rp = _detect_return_path_visibility(
                         source_ip, destination_ip,
                         self._flows.values(), _roles_dict,
@@ -617,6 +686,36 @@ class CausalPathEngine:
                             "if the issue persists, investigate application-layer content or client-side behaviour.",
                         ]
 
+        # ── Firewall path interference ────────────────────────────────────────
+        _backend_resp_observed = bool(_bq and _bq["backend_response_observed"])
+        _return_path_obs       = bool(_rp and _rp["return_path_observed"])
+        _fw = _detect_firewall_path_interference(
+            source_ip, destination_ip, relevant_packets, _roles_dict or {}
+        )
+        # Carry over any RST-on-known-firewall evidence notes.
+        _fw_vis = list(_fw["firewall_evidence_notes"])
+        hypotheses = list(hypotheses) + _fw["firewall_hypotheses"]
+
+        # Rule 2: RST observed + return path absent + firewall IPs configured.
+        if (_fw["rst_observed"]
+                and not _return_path_obs
+                and (_roles_dict or {}).get("firewall_ips")):
+            hypotheses = list(hypotheses) + [
+                "RST packet observed and no return path detected — "
+                "could suggest a firewall is actively blocking or resetting return traffic.",
+                "A firewall-generated reset may indicate traffic policy enforcement on this path.",
+                "Intermediate filtering on the return path cannot be confirmed from this capture alone.",
+            ]
+
+        # Rule 3: backend replied, return path absent, no RST → silent drop.
+        if _backend_resp_observed and not _return_path_obs and not _fw["rst_observed"]:
+            hypotheses = list(hypotheses) + [
+                "Backend response was observed but no RST and no return path detected — "
+                "may indicate a silent drop on the return path.",
+                "A firewall or intermediate device could be filtering return traffic silently.",
+                "A capture visibility gap on the LB-to-client segment cannot be excluded.",
+            ]
+
         # ── Confidence ────────────────────────────────────────────────────────
         conf_score, conf_reason = self._compute_confidence(
             relevant_packets, relevant_flows, syn_pkt, synack_pkt
@@ -627,7 +726,8 @@ class CausalPathEngine:
             relevant_packets, relevant_flows,
             syn_pkt, destination_port
         )
-        visibility_notes.extend(_role_vis)   # append any role-based visibility notes
+        visibility_notes.extend(_role_vis)    # role-based visibility notes
+        visibility_notes.extend(_fw_vis)      # firewall evidence notes
 
         # ── Determine protocol ────────────────────────────────────────────────
         protocol = self._infer_protocol(relevant_packets, destination_port)
