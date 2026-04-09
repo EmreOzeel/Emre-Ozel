@@ -463,8 +463,17 @@ def _classify_outcome_and_impairments(
     if rp is not None and not rp["return_path_observed"]:
         impairments.append("return_path_problem")
 
-    # Firewall interference (RST or RST-on-known-FW-IP)
-    if fw is not None and (fw["rst_observed"] or fw["firewall_evidence_notes"]):
+    # Firewall interference: only when RST originates from the server side
+    # (server_to_client) or involves a known firewall IP.  Client-originated
+    # RSTs are often normal application-level connection teardown and should
+    # not be conflated with firewall blocking.
+    if fw is not None and (
+        fw["firewall_evidence_notes"]  # RST involving a known firewall address
+        or (
+            fw["rst_observed"]
+            and fw.get("rst_direction") == "server_to_client"
+        )
+    ):
         impairments.append("firewall_interference")
 
     # ── Derive outcome ────────────────────────────────────────────────────────
@@ -561,6 +570,9 @@ def _classify_failure_domain(timing: Dict[str, Any]):
                 "Backend service is processing the request slowly.",
                 "Load balancer backend pool is under pressure.",
                 "Application-level processing latency (database, compute).",
+                "Response latency may be within normal baseline for this "
+                "application — compare against historical measurements before "
+                "treating this as a problem.",
             ],
         )
 
@@ -854,11 +866,15 @@ _FAILURE_CLOSING: Dict[str, str] = {
     "connection_establishment_failure":
         "Connection establishment failed — the service may be unreachable or filtered on this path.",
     "no_server_response_after_connection":
-        "The connection was established but no server response was observed.",
+        "The connection was established but no server response was observed — "
+        "this may reflect a service issue or a capture visibility gap on the "
+        "server-side response path.",
     "slow_connection_establishment":
         "Connection establishment appears slow, suggesting possible network latency or overload.",
     "backend_or_application_delay":
-        "The most likely issue is a delay in backend or application response.",
+        "Timing suggests possible backend or application delay; verify whether "
+        "this latency is within the normal baseline for this service before "
+        "concluding there is a problem.",
 }
 
 
@@ -869,6 +885,7 @@ def _compute_path_confidence(
     bq: Optional[Dict[str, Any]] = None,
     rp: Optional[Dict[str, Any]] = None,
     fw: Optional[Dict[str, Any]] = None,
+    path_impairments: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Penalty-based path analysis confidence scoring.
@@ -878,13 +895,15 @@ def _compute_path_confidence(
     """
     score   = 100
     reasons: List[str] = []
+    impairments = path_impairments or []
+    frt = timing.get("first_response_time_ms")
 
     # Timing completeness
     if timing.get("connect_time_ms") is None:
         score -= 20
         reasons.append("Connection establishment not observed — SYN-ACK not confirmed.")
 
-    if timing.get("first_response_time_ms") is None:
+    if frt is None:
         score -= 15
         reasons.append("First server response not observed — server behaviour unclear.")
 
@@ -903,10 +922,14 @@ def _compute_path_confidence(
         score -= 10
         reasons.append("Return path visibility incomplete — LB-to-client flow not observed.")
 
-    # Capture completeness
+    # Capture completeness — -5 per note, capped at -20
     if missing_visibility_notes:
-        score -= 10
-        reasons.append("Analysis based on partial capture — some path segments may be missing.")
+        note_penalty = min(len(missing_visibility_notes) * 5, 20)
+        score -= note_penalty
+        reasons.append(
+            f"Analysis based on partial capture ({len(missing_visibility_notes)} "
+            "visibility gap(s)) — some path segments may be missing."
+        )
 
     # Conflicting signals: RST present alongside observed backend response
     if (fw is not None and fw["rst_observed"]
@@ -920,6 +943,30 @@ def _compute_path_confidence(
     # RST involving firewall IP
     if fw is not None and fw["firewall_evidence_notes"]:
         reasons.append("RST observed involving a known firewall address.")
+
+    # ── Impairment-specific confidence adjustments ────────────────────────────
+
+    # Borderline backend delay (200–500 ms only) is a weak signal — many services
+    # operate in this range normally.  Only apply when it's the sole impairment.
+    if (
+        impairments == ["backend_response_delay"]
+        and frt is not None
+        and 200 < frt <= 500
+    ):
+        score -= 15
+        reasons.append(
+            f"Backend delay of {frt:.0f} ms is in the borderline range (200–500 ms); "
+            "this latency may be within normal operating range for this service."
+        )
+
+    # Return path absent without any other connectivity impairment most often
+    # indicates a capture visibility gap rather than a genuine path failure.
+    if impairments == ["return_path_problem"]:
+        score -= 10
+        reasons.append(
+            "Return path absence is the only impairment — likely a capture "
+            "visibility gap rather than an active path failure."
+        )
 
     return {
         "path_confidence_score": max(0, min(100, score)),
@@ -991,11 +1038,15 @@ def _compose_path_narrative(
             )
 
         if lb_vis["lb_backend_observed"]:
-            steps.append("The load balancer forwarded traffic to a backend host.")
+            steps.append(
+                "The load balancer forwarded traffic to a backend host "
+                "(LB-to-backend flow observed in capture)."
+            )
         else:
             steps.append(
                 "No LB-to-backend flow was observed — "
-                "the load balancer may not have forwarded traffic to any backend."
+                "the load balancer may not have forwarded traffic to any backend, "
+                "or this flow may not be visible at the current capture point."
             )
 
         # Backend response
@@ -1022,7 +1073,9 @@ def _compose_path_narrative(
                 )
             else:
                 steps.append(
-                    "No return traffic from the load balancer toward the client was detected."
+                    "No return traffic from the load balancer toward the client was detected "
+                    "— this may indicate a path interruption or a capture visibility gap at "
+                    "this monitoring point."
                 )
 
     # ── Step 4: firewall / RST evidence ──────────────────────────────────────
@@ -1034,8 +1087,9 @@ def _compose_path_narrative(
         }.get(direction, "in an unknown direction")
         steps.append(
             f"A TCP reset (RST) was observed {dir_label}. "
-            "This may indicate an active rejection, but the cause cannot be confirmed from "
-            "packet data alone."
+            "RST may indicate an active policy rejection by a firewall or the server, "
+            "but could also reflect normal application-level connection teardown; "
+            "the specific cause cannot be confirmed from packet data alone."
         )
         if fw["firewall_evidence_notes"]:
             steps.append(
@@ -1052,10 +1106,16 @@ def _compose_path_narrative(
     # ── Step 5: backend delay summary (non-LB path) ──────────────────────────
     if not is_lb:
         frt = timing.get("first_response_time_ms")
-        if frt is not None and frt > 200:
+        if frt is not None and frt > 500:
             steps.append(
                 f"The server response took {frt:.1f} ms after connection, "
-                "suggesting possible application-level delay."
+                "which is notably elevated and suggests application-level delay."
+            )
+        elif frt is not None and frt > 200:
+            steps.append(
+                f"The server response took {frt:.1f} ms after connection — "
+                "possible delay, though this may still be within the normal "
+                "baseline for this application; verify before treating as a problem."
             )
 
     # ── Step 6: closing summary ───────────────────────────────────────────────
@@ -1064,8 +1124,11 @@ def _compose_path_narrative(
         f"The analysis points to a possible issue at: {failure}." if failure else
         "The path analysis did not identify a specific failure point.",
     )
-    if result.confidence_score < 50:
-        closing += " Confidence is low; capture visibility may be incomplete."
+    if result.confidence_score < 65:
+        closing += (
+            " Note: analysis confidence is reduced — capture visibility may be "
+            "incomplete or evidence is thin; treat conclusions as indicative."
+        )
     steps.append(closing)
 
     return {
@@ -1238,6 +1301,8 @@ class CausalPathEngine:
                     "Load balancer frontend connection observed but no LB-to-backend flow detected — "
                     "possible backend forwarding misconfiguration or unhealthy backend pool.",
                     "Backend pool members may be failing health checks or are unreachable from the LB.",
+                    "LB-to-backend forwarding flow may exist but not be captured at this monitoring "
+                    "point — verify that the capture covers both LB interfaces.",
                 ]
 
             # ── Backend response quality (only when LB reached a backend) ────
@@ -1266,10 +1331,12 @@ class CausalPathEngine:
                     )
                     if not _rp["return_path_observed"]:
                         hypotheses = list(hypotheses) + [
-                            "Backend response was observed but no return flow from LB to client detected — "
-                            "possible return-path interruption between LB and client.",
-                            "A firewall or intermediate device may be affecting return traffic.",
-                            "Capture point may lack visibility into the LB-to-client segment.",
+                            "Capture point may not cover the LB-to-client path segment — "
+                            "asymmetric routing or monitoring point location is a common "
+                            "cause of missing return flows.",
+                            "Backend response was observed but no return flow from LB to "
+                            "client detected — possible return-path interruption between LB and client.",
+                            "A firewall or intermediate device may be silently filtering return traffic.",
                         ]
                     else:
                         hypotheses = list(hypotheses) + [
@@ -1346,23 +1413,7 @@ class CausalPathEngine:
             missing_visibility_notes=visibility_notes,
         )
 
-        # ── Path narrative ────────────────────────────────────────────────────
-        narrative = _compose_path_narrative(
-            source_ip, destination_ip, result, _roles_dict,
-            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
-        )
-        result.path_steps = narrative["path_steps"]
-        # path_summary keeps the step_e verdict; path_steps carries the full narrative.
-
-        # ── Path confidence ───────────────────────────────────────────────────
-        pc = _compute_path_confidence(
-            timing, visibility_notes,
-            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
-        )
-        result.path_confidence_score = pc["path_confidence_score"]
-        result.confidence_reasons    = pc["confidence_reasons"]
-
-        # ── Outcome / impairment model ────────────────────────────────────────
+        # ── Outcome / impairment model (computed first so confidence can use it) ──
         oi = _classify_outcome_and_impairments(
             state, timing,
             lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
@@ -1370,6 +1421,23 @@ class CausalPathEngine:
         result.connection_outcome  = oi["connection_outcome"]
         result.primary_impairment  = oi["primary_impairment"]
         result.path_impairments    = oi["path_impairments"]
+
+        # ── Path confidence (uses impairment list for calibrated adjustments) ──
+        pc = _compute_path_confidence(
+            timing, visibility_notes,
+            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
+            path_impairments=oi["path_impairments"],
+        )
+        result.path_confidence_score = pc["path_confidence_score"]
+        result.confidence_reasons    = pc["confidence_reasons"]
+
+        # ── Path narrative ────────────────────────────────────────────────────
+        narrative = _compose_path_narrative(
+            source_ip, destination_ip, result, _roles_dict,
+            lb_vis=_lb_vis, bq=_bq, rp=_rp, fw=_fw,
+        )
+        result.path_steps = narrative["path_steps"]
+        # path_summary keeps the step_e verdict; path_steps carries the full narrative.
 
         # ── Structured evidence ───────────────────────────────────────────────
         result.evidence_items = _build_evidence_items(
