@@ -1,0 +1,418 @@
+<template>
+  <div class="path-analysis-tab">
+
+    <!-- Input form -->
+    <el-card class="form-card" shadow="never">
+      <template #header>
+        <span class="card-title">Path Analysis</span>
+        <span class="card-subtitle">Trace the causal path between two endpoints</span>
+      </template>
+
+      <el-form :model="form" label-width="160px" size="small">
+        <el-row :gutter="16">
+          <el-col :span="12">
+            <el-form-item label="Source IP" required>
+              <el-input v-model="form.source_ip" placeholder="e.g. 10.0.0.5" clearable />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="Destination IP" required>
+              <el-input v-model="form.destination_ip" placeholder="e.g. 10.0.0.1" clearable />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-row :gutter="16">
+          <el-col :span="12">
+            <el-form-item label="Destination Port">
+              <el-input
+                v-model="form.destination_port_raw"
+                placeholder="optional (e.g. 443)"
+                clearable
+                style="width: 100%"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <!-- Role hints collapsible -->
+        <el-collapse v-model="activeCollapse" style="margin-bottom: 12px; border: none">
+          <el-collapse-item title="Role Hints (optional)" name="roles">
+            <el-form-item label="Firewall IPs">
+              <el-input
+                v-model="form.firewall_ips_raw"
+                placeholder="comma-separated, e.g. 10.0.0.254"
+                clearable
+              />
+            </el-form-item>
+            <el-form-item label="Load Balancer VIPs">
+              <el-input
+                v-model="form.lb_vips_raw"
+                placeholder="comma-separated, e.g. 10.0.0.10"
+                clearable
+              />
+            </el-form-item>
+            <el-form-item label="Backend IPs">
+              <el-input
+                v-model="form.backend_ips_raw"
+                placeholder="comma-separated"
+                clearable
+              />
+            </el-form-item>
+            <el-form-item label="Backend Subnets">
+              <el-input
+                v-model="form.backend_subnets_raw"
+                placeholder="comma-separated CIDRs, e.g. 10.0.1.0/24"
+                clearable
+              />
+            </el-form-item>
+          </el-collapse-item>
+        </el-collapse>
+
+        <el-form-item>
+          <el-button
+            type="primary"
+            :loading="loading"
+            :disabled="!form.source_ip.trim() || !form.destination_ip.trim()"
+            @click="runAnalysis"
+          >
+            Analyze Path
+          </el-button>
+          <el-button v-if="result" plain @click="clearResult">Clear Results</el-button>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
+    <!-- Error -->
+    <el-alert
+      v-if="error"
+      type="error"
+      :title="error"
+      show-icon
+      :closable="false"
+    />
+
+    <!-- Results -->
+    <template v-if="result">
+
+      <!-- Summary strip -->
+      <div class="result-summary">
+        <div class="summary-card" :class="outcomeClass">
+          <span class="summary-val">{{ outcomeLabel }}</span>
+          <span class="summary-lbl">Outcome</span>
+        </div>
+        <div class="summary-card impairment-card" v-if="result.primary_impairment">
+          <span class="summary-val impairment-val">{{ formatToken(result.primary_impairment) }}</span>
+          <span class="summary-lbl">Primary Impairment</span>
+        </div>
+        <div class="summary-card no-impairment-card" v-else>
+          <span class="summary-val" style="color: #67c23a">None</span>
+          <span class="summary-lbl">Primary Impairment</span>
+        </div>
+        <div class="summary-card" :class="confidenceClass">
+          <span class="summary-val">{{ result.path_confidence_score }}%</span>
+          <span class="summary-lbl">Path Confidence</span>
+        </div>
+      </div>
+
+      <!-- Low-confidence warning -->
+      <el-alert
+        v-if="result.path_confidence_score < 60"
+        type="warning"
+        title="Low confidence — results are indicative only"
+        show-icon
+        :closable="false"
+      >
+        <template #default>
+          <p style="margin: 4px 0 0">
+            Confidence is low due to limited capture visibility. Treat findings as
+            indicative rather than conclusive.
+          </p>
+        </template>
+      </el-alert>
+
+      <!-- Verdict card -->
+      <el-card class="result-card" shadow="never">
+        <template #header>
+          <span class="card-title">Verdict</span>
+          <span class="endpoint-badge">
+            {{ result.source_ip }} → {{ result.destination_ip
+            }}<template v-if="result.destination_port">:{{ result.destination_port }}</template>
+          </span>
+        </template>
+        <p class="verdict-text">{{ result.path_summary }}</p>
+        <div v-if="result.path_impairments && result.path_impairments.length" class="impairment-tags">
+          <el-tag
+            v-for="imp in result.path_impairments"
+            :key="imp"
+            size="small"
+            :type="imp === result.primary_impairment ? 'danger' : 'warning'"
+            style="margin-right: 6px; margin-top: 4px"
+          >
+            {{ formatToken(imp) }}
+          </el-tag>
+        </div>
+      </el-card>
+
+      <!-- Path narrative -->
+      <el-card class="result-card" shadow="never">
+        <template #header><span class="card-title">Path Narrative</span></template>
+        <ol class="path-steps" v-if="result.path_steps && result.path_steps.length">
+          <li
+            v-for="(step, i) in result.path_steps"
+            :key="i"
+            class="path-step"
+          >{{ step }}</li>
+        </ol>
+        <el-empty v-else description="No narrative steps generated" :image-size="60" />
+      </el-card>
+
+      <!-- Evidence items -->
+      <el-card class="result-card" shadow="never" v-if="result.evidence_items && result.evidence_items.length">
+        <template #header><span class="card-title">Evidence</span></template>
+        <div class="evidence-list">
+          <div
+            v-for="(ev, i) in result.evidence_items"
+            :key="i"
+            class="evidence-item"
+            :class="`strength-${ev.signal_strength}`"
+          >
+            <div class="evidence-header">
+              <el-tag :type="strengthTagType(ev.signal_strength)" size="small" effect="plain">
+                {{ ev.signal_strength }}
+              </el-tag>
+              <span class="evidence-type">{{ formatToken(ev.type) }}</span>
+            </div>
+            <p class="evidence-summary">{{ ev.summary }}</p>
+            <div class="evidence-meta">
+              <span v-if="ev.flow_id" class="meta-item">
+                Flow: <code>{{ ev.flow_id }}</code>
+              </span>
+              <span v-if="ev.packet_refs && ev.packet_refs.length" class="meta-item">
+                Packets: {{ ev.packet_refs.join(', ') }}
+              </span>
+            </div>
+          </div>
+        </div>
+      </el-card>
+
+      <!-- Hypotheses + visibility -->
+      <el-row :gutter="12">
+        <el-col :span="12">
+          <el-card class="result-card" shadow="never">
+            <template #header><span class="card-title">Alternative Hypotheses</span></template>
+            <ul class="note-list" v-if="result.alternative_hypotheses && result.alternative_hypotheses.length">
+              <li
+                v-for="(h, i) in result.alternative_hypotheses"
+                :key="i"
+              >{{ h }}</li>
+            </ul>
+            <el-empty v-else description="No alternative hypotheses" :image-size="60" />
+          </el-card>
+        </el-col>
+        <el-col :span="12">
+          <el-card class="result-card" shadow="never">
+            <template #header><span class="card-title">Visibility Gaps</span></template>
+            <ul class="note-list" v-if="result.missing_visibility_notes && result.missing_visibility_notes.length">
+              <li
+                v-for="(n, i) in result.missing_visibility_notes"
+                :key="i"
+              >{{ n }}</li>
+            </ul>
+            <el-empty v-else description="No visibility gaps noted" :image-size="60" />
+          </el-card>
+        </el-col>
+      </el-row>
+
+      <!-- Confidence reasons -->
+      <el-card
+        class="result-card"
+        shadow="never"
+        v-if="result.confidence_reasons && result.confidence_reasons.length"
+      >
+        <template #header><span class="card-title">Confidence Notes</span></template>
+        <ul class="note-list">
+          <li v-for="(r, i) in result.confidence_reasons" :key="i">{{ r }}</li>
+        </ul>
+      </el-card>
+
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, reactive } from 'vue'
+import api from '@/api'
+
+const props = defineProps<{ analysisId: string }>()
+
+const loading = ref(false)
+const error = ref('')
+const result = ref<Record<string, any> | null>(null)
+const activeCollapse = ref<string[]>([])
+
+const form = reactive({
+  source_ip: '',
+  destination_ip: '',
+  destination_port_raw: '',
+  firewall_ips_raw: '',
+  lb_vips_raw: '',
+  backend_ips_raw: '',
+  backend_subnets_raw: '',
+})
+
+function parseList(raw: string): string[] {
+  return raw.split(',').map(s => s.trim()).filter(Boolean)
+}
+
+async function runAnalysis() {
+  error.value = ''
+  result.value = null
+
+  if (!form.source_ip.trim() || !form.destination_ip.trim()) return
+
+  const payload: Record<string, any> = {
+    source_ip: form.source_ip.trim(),
+    destination_ip: form.destination_ip.trim(),
+  }
+
+  const port = parseInt(form.destination_port_raw, 10)
+  if (!isNaN(port) && port > 0 && port <= 65535) {
+    payload.destination_port = port
+  }
+
+  const fw = parseList(form.firewall_ips_raw)
+  const lb = parseList(form.lb_vips_raw)
+  const be = parseList(form.backend_ips_raw)
+  const sn = parseList(form.backend_subnets_raw)
+  const roles: Record<string, string[]> = {}
+  if (fw.length) roles.firewall_ips = fw
+  if (lb.length) roles.load_balancer_vips = lb
+  if (be.length) roles.backend_ips = be
+  if (sn.length) roles.backend_subnets = sn
+  if (Object.keys(roles).length) payload.roles = roles
+
+  loading.value = true
+  try {
+    const res = await api.post(`/analyses/${props.analysisId}/path-analysis`, payload)
+    result.value = res.data
+  } catch (e: any) {
+    error.value =
+      e.response?.data?.detail ??
+      'Path analysis failed. Ensure the PCAP file is still available on the server.'
+  } finally {
+    loading.value = false
+  }
+}
+
+function clearResult() {
+  result.value = null
+  error.value = ''
+}
+
+const outcomeLabel = computed(() => {
+  const map: Record<string, string> = {
+    success: 'Success',
+    partial_success: 'Partial Success',
+    failure: 'Failure',
+    unknown: 'Unknown',
+  }
+  return map[result.value?.connection_outcome ?? ''] ?? result.value?.connection_outcome ?? '—'
+})
+
+const outcomeClass = computed(() => {
+  const o = result.value?.connection_outcome
+  if (o === 'success') return 'outcome-success'
+  if (o === 'failure') return 'outcome-failure'
+  if (o === 'partial_success') return 'outcome-warning'
+  return ''
+})
+
+const confidenceClass = computed(() => {
+  const s = result.value?.path_confidence_score ?? 0
+  if (s >= 75) return 'conf-high'
+  if (s >= 50) return 'conf-medium'
+  return 'conf-low'
+})
+
+function formatToken(tok: string): string {
+  return tok.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+}
+
+function strengthTagType(s: string): '' | 'success' | 'warning' | 'danger' | 'info' {
+  if (s === 'high') return 'danger'
+  if (s === 'medium') return 'warning'
+  return 'info'
+}
+</script>
+
+<style scoped>
+.path-analysis-tab { display: flex; flex-direction: column; gap: 12px; }
+
+/* Form card header */
+.form-card :deep(.el-card__header) { display: flex; align-items: baseline; gap: 10px; }
+.card-title  { font-weight: 600; font-size: 14px; }
+.card-subtitle { font-size: 12px; color: #909399; }
+
+/* Summary strip */
+.result-summary {
+  display: flex; gap: 12px; flex-wrap: wrap;
+}
+.summary-card {
+  background: #fff; border: 1px solid #ebeef5; border-radius: 6px;
+  padding: 12px 20px; text-align: center; min-width: 110px;
+}
+.summary-val {
+  display: block; font-size: 18px; font-weight: 700; color: #303133;
+}
+.summary-val.impairment-val { font-size: 12px; line-height: 1.4; }
+.summary-lbl { font-size: 11px; color: #909399; margin-top: 2px; display: block; }
+
+.outcome-success  { border-color: #67c23a; }
+.outcome-success  .summary-val { color: #67c23a; }
+.outcome-failure  { border-color: #f56c6c; }
+.outcome-failure  .summary-val { color: #f56c6c; }
+.outcome-warning  { border-color: #e6a23c; }
+.outcome-warning  .summary-val { color: #e6a23c; }
+
+.conf-high   .summary-val { color: #67c23a; }
+.conf-medium .summary-val { color: #e6a23c; }
+.conf-low    .summary-val { color: #f56c6c; }
+
+/* Verdict card header */
+.result-card :deep(.el-card__header) {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+}
+.endpoint-badge {
+  font-size: 12px; color: #909399; font-family: monospace;
+}
+.verdict-text { font-size: 14px; color: #303133; margin: 0 0 8px; line-height: 1.6; }
+.impairment-tags { margin-top: 4px; }
+
+/* Path steps */
+.path-steps { margin: 0; padding-left: 22px; }
+.path-step  { font-size: 13px; color: #606266; margin-bottom: 8px; line-height: 1.6; }
+
+/* Evidence */
+.evidence-list { display: flex; flex-direction: column; gap: 10px; }
+.evidence-item {
+  border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 14px;
+}
+.evidence-item.strength-high   { border-left: 3px solid #f56c6c; }
+.evidence-item.strength-medium { border-left: 3px solid #e6a23c; }
+.evidence-item.strength-low    { border-left: 3px solid #909399; }
+.evidence-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.evidence-type   { font-weight: 600; font-size: 13px; }
+.evidence-summary { margin: 4px 0; font-size: 13px; color: #606266; }
+.evidence-meta {
+  font-size: 12px; color: #909399; display: flex; gap: 14px; flex-wrap: wrap;
+  margin-top: 4px;
+}
+.meta-item code {
+  font-size: 11px; background: #f4f4f5; padding: 1px 5px; border-radius: 3px;
+}
+
+/* Notes lists */
+.note-list { margin: 0; padding-left: 18px; }
+.note-list li { font-size: 13px; color: #606266; margin-bottom: 4px; line-height: 1.6; }
+</style>

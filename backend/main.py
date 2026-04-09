@@ -512,6 +512,52 @@ def delete_suppression(
     db.commit()
 
 
+# ── Path Analysis ─────────────────────────────────────────────────────────────
+
+class PathAnalysisRequest(BaseModel):
+    source_ip: str
+    destination_ip: str
+    destination_port: Optional[int] = None
+    roles: Optional[dict] = None
+
+
+@app.post("/api/analyses/{analysis_id}/path-analysis")
+def run_path_analysis(
+    analysis_id: str,
+    req: PathAnalysisRequest,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Run CausalPathEngine against the original PCAP for a specific src→dst pair."""
+    row = _get_or_404(db, analysis_id, current_user.id)
+    if row.status != "completed":
+        raise HTTPException(400, "Analysis must be completed before running path analysis")
+    if not row.file_path or not Path(row.file_path).exists():
+        raise HTTPException(404, "Original PCAP file is no longer available")
+
+    from normalizer.pipeline import normalize
+    from core.causal_path import CausalPathEngine
+
+    try:
+        ctx = normalize(row.file_path)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to parse PCAP: {e}")
+
+    engine = CausalPathEngine(ctx.packets, ctx.flows, ctx.findings, ctx)
+    result = engine.analyze(
+        req.source_ip,
+        req.destination_ip,
+        destination_port=req.destination_port,
+        roles=req.roles,
+    )
+    track("path_analysis.executed", user_id=current_user.id, properties={
+        "analysis_id": analysis_id,
+        "src": req.source_ip,
+        "dst": req.destination_ip,
+    })
+    return result.to_dict()
+
+
 # ── Analyst Triage ────────────────────────────────────────────────────────────
 
 @app.get("/api/analyses/{analysis_id}/triage", response_model=List[TriageResponse])

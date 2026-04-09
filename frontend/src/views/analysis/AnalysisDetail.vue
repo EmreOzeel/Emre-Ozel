@@ -145,6 +145,11 @@
             />
           </el-tab-pane>
 
+          <!-- Path Analysis -->
+          <el-tab-pane label="Path Analysis" name="path">
+            <PathAnalysisTab :analysis-id="analysis.id" />
+          </el-tab-pane>
+
         </el-tabs>
       </template>
     </template>
@@ -178,6 +183,7 @@ import TcpIssuesTab        from '@/components/analysis/TcpIssuesTab.vue'
 import SecurityFindingsTab from '@/components/analysis/SecurityFindingsTab.vue'
 import TimelineTab         from '@/components/analysis/TimelineTab.vue'
 import ExpertInfoTab       from '@/components/analysis/ExpertInfoTab.vue'
+import PathAnalysisTab     from '@/components/analysis/PathAnalysisTab.vue'
 
 const route = useRoute()
 
