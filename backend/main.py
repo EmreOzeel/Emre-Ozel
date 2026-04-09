@@ -19,6 +19,7 @@ from config import settings
 from database import (
     AnalysisModel,
     FindingTriageModel,
+    PathAnalysisFeedbackModel,
     SuppressionRuleModel,
     TelemetryEventModel,
     UserModel,
@@ -558,6 +559,192 @@ def run_path_analysis(
     return result.to_dict()
 
 
+# ── Path Analysis Feedback ────────────────────────────────────────────────────
+
+class PathAnalysisFeedbackCreate(BaseModel):
+    source_ip: str
+    destination_ip: str
+    destination_port: Optional[int] = None
+    # Predicted values from the live result (captured at judgment time)
+    predicted_outcome: str
+    predicted_impairment: Optional[str] = None
+    predicted_confidence: int
+    # Analyst judgment
+    verdict: str = Field(pattern="^(correct|partially_correct|incorrect)$")
+    analyst_note: Optional[str] = None
+    actual_root_cause: Optional[str] = None
+    misleading_step: Optional[str] = None
+
+
+class PathAnalysisFeedbackResponse(BaseModel):
+    id: int
+    analysis_id: str
+    source_ip: str
+    destination_ip: str
+    destination_port: Optional[int]
+    predicted_outcome: str
+    predicted_impairment: Optional[str]
+    predicted_confidence: int
+    verdict: str
+    analyst_note: Optional[str]
+    actual_root_cause: Optional[str]
+    misleading_step: Optional[str]
+    analyst_id: Optional[int]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/path-analysis/feedback",
+    response_model=PathAnalysisFeedbackResponse,
+    status_code=200,
+)
+def upsert_path_feedback(
+    analysis_id: str,
+    req: PathAnalysisFeedbackCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Submit (or update) analyst verdict on a path analysis result.
+
+    Re-submitting the same source_ip / destination_ip / destination_port
+    combination updates the existing record rather than creating a duplicate.
+    """
+    _get_or_404(db, analysis_id, current_user.id)
+
+    existing = (
+        db.query(PathAnalysisFeedbackModel)
+        .filter(
+            PathAnalysisFeedbackModel.analysis_id      == analysis_id,
+            PathAnalysisFeedbackModel.source_ip        == req.source_ip,
+            PathAnalysisFeedbackModel.destination_ip   == req.destination_ip,
+            PathAnalysisFeedbackModel.destination_port == req.destination_port,
+            PathAnalysisFeedbackModel.analyst_id       == current_user.id,
+        )
+        .first()
+    )
+
+    if existing:
+        existing.predicted_outcome    = req.predicted_outcome
+        existing.predicted_impairment = req.predicted_impairment
+        existing.predicted_confidence = req.predicted_confidence
+        existing.verdict              = req.verdict
+        existing.analyst_note         = req.analyst_note
+        existing.actual_root_cause    = req.actual_root_cause
+        existing.misleading_step      = req.misleading_step
+        row = existing
+    else:
+        row = PathAnalysisFeedbackModel(
+            analysis_id=analysis_id,
+            source_ip=req.source_ip,
+            destination_ip=req.destination_ip,
+            destination_port=req.destination_port,
+            predicted_outcome=req.predicted_outcome,
+            predicted_impairment=req.predicted_impairment,
+            predicted_confidence=req.predicted_confidence,
+            verdict=req.verdict,
+            analyst_note=req.analyst_note,
+            actual_root_cause=req.actual_root_cause,
+            misleading_step=req.misleading_step,
+            analyst_id=current_user.id,
+        )
+        db.add(row)
+
+    db.commit()
+    db.refresh(row)
+    track("path_feedback.submitted", user_id=current_user.id, properties={
+        "analysis_id": analysis_id,
+        "verdict": req.verdict,
+    })
+    return _feedback_dict(row)
+
+
+@app.get(
+    "/api/analyses/{analysis_id}/path-analysis/feedback",
+    response_model=List[PathAnalysisFeedbackResponse],
+)
+def list_path_feedback(
+    analysis_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return all path analysis feedback records for this analysis (current user only)."""
+    _get_or_404(db, analysis_id, current_user.id)
+    rows = (
+        db.query(PathAnalysisFeedbackModel)
+        .filter(
+            PathAnalysisFeedbackModel.analysis_id == analysis_id,
+            PathAnalysisFeedbackModel.analyst_id  == current_user.id,
+        )
+        .order_by(PathAnalysisFeedbackModel.created_at.desc())
+        .all()
+    )
+    return [_feedback_dict(r) for r in rows]
+
+
+@app.get("/api/path-analysis/feedback/summary")
+def path_feedback_summary(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Aggregate analyst feedback for calibration.
+
+    Returns verdict distribution, per-impairment accuracy, overconfident cases
+    (high confidence + incorrect), and weak-narrative cases (misleading step noted).
+    """
+    rows = (
+        db.query(PathAnalysisFeedbackModel)
+        .filter(PathAnalysisFeedbackModel.analyst_id == current_user.id)
+        .all()
+    )
+
+    if not rows:
+        return {
+            "total": 0,
+            "verdict_counts": {"correct": 0, "partially_correct": 0, "incorrect": 0},
+            "accuracy_rate": None,
+            "by_predicted_impairment": {},
+            "overconfident": [],
+            "weak_narratives": [],
+        }
+
+    verdict_counts: dict = {"correct": 0, "partially_correct": 0, "incorrect": 0}
+    by_impairment: dict = {}
+
+    for r in rows:
+        verdict_counts[r.verdict] = verdict_counts.get(r.verdict, 0) + 1
+        key = r.predicted_impairment or "none"
+        bucket = by_impairment.setdefault(
+            key, {"total": 0, "correct": 0, "partially_correct": 0, "incorrect": 0}
+        )
+        bucket["total"] += 1
+        bucket[r.verdict] = bucket.get(r.verdict, 0) + 1
+
+    correct_total = verdict_counts["correct"] + verdict_counts["partially_correct"]
+    accuracy_rate = round(correct_total / len(rows), 3) if rows else None
+
+    overconfident = [
+        _feedback_dict(r)
+        for r in rows
+        if r.predicted_confidence >= 75 and r.verdict == "incorrect"
+    ]
+
+    weak_narratives = [
+        _feedback_dict(r)
+        for r in rows
+        if r.misleading_step and r.verdict in ("partially_correct", "incorrect")
+    ]
+
+    return {
+        "total": len(rows),
+        "verdict_counts": verdict_counts,
+        "accuracy_rate": accuracy_rate,
+        "by_predicted_impairment": by_impairment,
+        "overconfident": overconfident,
+        "weak_narratives": weak_narratives,
+    }
+
+
 # ── Analyst Triage ────────────────────────────────────────────────────────────
 
 @app.get("/api/analyses/{analysis_id}/triage", response_model=List[TriageResponse])
@@ -703,6 +890,26 @@ def _triage_dict(r: FindingTriageModel) -> dict:
         "analyst_id": r.analyst_id,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    }
+
+
+def _feedback_dict(r: PathAnalysisFeedbackModel) -> dict:
+    return {
+        "id":                   r.id,
+        "analysis_id":          r.analysis_id,
+        "source_ip":            r.source_ip,
+        "destination_ip":       r.destination_ip,
+        "destination_port":     r.destination_port,
+        "predicted_outcome":    r.predicted_outcome,
+        "predicted_impairment": r.predicted_impairment,
+        "predicted_confidence": r.predicted_confidence,
+        "verdict":              r.verdict,
+        "analyst_note":         r.analyst_note,
+        "actual_root_cause":    r.actual_root_cause,
+        "misleading_step":      r.misleading_step,
+        "analyst_id":           r.analyst_id,
+        "created_at":  r.created_at.isoformat() if r.created_at else None,
+        "updated_at":  r.updated_at.isoformat() if r.updated_at else None,
     }
 
 

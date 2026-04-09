@@ -379,6 +379,42 @@ export interface FindingTriage {
   updated_at: string | null
 }
 
+// ─── Path Analysis Feedback ───────────────────────────────────────────────────
+
+export type PathAnalysisFeedbackVerdict = 'correct' | 'partially_correct' | 'incorrect'
+
+export interface PathAnalysisFeedback {
+  id: number
+  analysis_id: string
+  source_ip: string
+  destination_ip: string
+  destination_port: number | null
+  predicted_outcome: string
+  predicted_impairment: string | null
+  predicted_confidence: number
+  verdict: PathAnalysisFeedbackVerdict
+  analyst_note: string | null
+  actual_root_cause: string | null
+  misleading_step: string | null
+  analyst_id: number | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface PathAnalysisFeedbackSummary {
+  total: number
+  verdict_counts: { correct: number; partially_correct: number; incorrect: number }
+  accuracy_rate: number | null
+  by_predicted_impairment: Record<string, {
+    total: number
+    correct: number
+    partially_correct: number
+    incorrect: number
+  }>
+  overconfident: PathAnalysisFeedback[]
+  weak_narratives: PathAnalysisFeedback[]
+}
+
 export interface AnalysisSummary {
   id: string
   filename: string

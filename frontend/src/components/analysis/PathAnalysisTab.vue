@@ -39,32 +39,16 @@
         <el-collapse v-model="activeCollapse" style="margin-bottom: 12px; border: none">
           <el-collapse-item title="Role Hints (optional)" name="roles">
             <el-form-item label="Firewall IPs">
-              <el-input
-                v-model="form.firewall_ips_raw"
-                placeholder="comma-separated, e.g. 10.0.0.254"
-                clearable
-              />
+              <el-input v-model="form.firewall_ips_raw" placeholder="comma-separated, e.g. 10.0.0.254" clearable />
             </el-form-item>
             <el-form-item label="Load Balancer VIPs">
-              <el-input
-                v-model="form.lb_vips_raw"
-                placeholder="comma-separated, e.g. 10.0.0.10"
-                clearable
-              />
+              <el-input v-model="form.lb_vips_raw" placeholder="comma-separated, e.g. 10.0.0.10" clearable />
             </el-form-item>
             <el-form-item label="Backend IPs">
-              <el-input
-                v-model="form.backend_ips_raw"
-                placeholder="comma-separated"
-                clearable
-              />
+              <el-input v-model="form.backend_ips_raw" placeholder="comma-separated" clearable />
             </el-form-item>
             <el-form-item label="Backend Subnets">
-              <el-input
-                v-model="form.backend_subnets_raw"
-                placeholder="comma-separated CIDRs, e.g. 10.0.1.0/24"
-                clearable
-              />
+              <el-input v-model="form.backend_subnets_raw" placeholder="comma-separated CIDRs, e.g. 10.0.1.0/24" clearable />
             </el-form-item>
           </el-collapse-item>
         </el-collapse>
@@ -84,13 +68,7 @@
     </el-card>
 
     <!-- Error -->
-    <el-alert
-      v-if="error"
-      type="error"
-      :title="error"
-      show-icon
-      :closable="false"
-    />
+    <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" />
 
     <!-- Results -->
     <template v-if="result">
@@ -105,7 +83,7 @@
           <span class="summary-val impairment-val">{{ formatToken(result.primary_impairment) }}</span>
           <span class="summary-lbl">Primary Impairment</span>
         </div>
-        <div class="summary-card no-impairment-card" v-else>
+        <div class="summary-card" v-else>
           <span class="summary-val" style="color: #67c23a">None</span>
           <span class="summary-lbl">Primary Impairment</span>
         </div>
@@ -158,11 +136,7 @@
       <el-card class="result-card" shadow="never">
         <template #header><span class="card-title">Path Narrative</span></template>
         <ol class="path-steps" v-if="result.path_steps && result.path_steps.length">
-          <li
-            v-for="(step, i) in result.path_steps"
-            :key="i"
-            class="path-step"
-          >{{ step }}</li>
+          <li v-for="(step, i) in result.path_steps" :key="i" class="path-step">{{ step }}</li>
         </ol>
         <el-empty v-else description="No narrative steps generated" :image-size="60" />
       </el-card>
@@ -185,12 +159,8 @@
             </div>
             <p class="evidence-summary">{{ ev.summary }}</p>
             <div class="evidence-meta">
-              <span v-if="ev.flow_id" class="meta-item">
-                Flow: <code>{{ ev.flow_id }}</code>
-              </span>
-              <span v-if="ev.packet_refs && ev.packet_refs.length" class="meta-item">
-                Packets: {{ ev.packet_refs.join(', ') }}
-              </span>
+              <span v-if="ev.flow_id" class="meta-item">Flow: <code>{{ ev.flow_id }}</code></span>
+              <span v-if="ev.packet_refs && ev.packet_refs.length" class="meta-item">Packets: {{ ev.packet_refs.join(', ') }}</span>
             </div>
           </div>
         </div>
@@ -202,10 +172,7 @@
           <el-card class="result-card" shadow="never">
             <template #header><span class="card-title">Alternative Hypotheses</span></template>
             <ul class="note-list" v-if="result.alternative_hypotheses && result.alternative_hypotheses.length">
-              <li
-                v-for="(h, i) in result.alternative_hypotheses"
-                :key="i"
-              >{{ h }}</li>
+              <li v-for="(h, i) in result.alternative_hypotheses" :key="i">{{ h }}</li>
             </ul>
             <el-empty v-else description="No alternative hypotheses" :image-size="60" />
           </el-card>
@@ -214,10 +181,7 @@
           <el-card class="result-card" shadow="never">
             <template #header><span class="card-title">Visibility Gaps</span></template>
             <ul class="note-list" v-if="result.missing_visibility_notes && result.missing_visibility_notes.length">
-              <li
-                v-for="(n, i) in result.missing_visibility_notes"
-                :key="i"
-              >{{ n }}</li>
+              <li v-for="(n, i) in result.missing_visibility_notes" :key="i">{{ n }}</li>
             </ul>
             <el-empty v-else description="No visibility gaps noted" :image-size="60" />
           </el-card>
@@ -236,19 +200,174 @@
         </ul>
       </el-card>
 
+      <!-- ── Analyst Feedback ─────────────────────────────────────────────── -->
+      <el-divider content-position="left">
+        <span style="font-size: 12px; color: #909399">Analyst Feedback</span>
+      </el-divider>
+
+      <!-- Existing feedback (read-only) -->
+      <el-card
+        v-if="feedback && !feedbackEditing"
+        class="result-card feedback-card"
+        shadow="never"
+      >
+        <template #header>
+          <span class="card-title">Your Verdict</span>
+          <el-tag :type="verdictTagType(feedback.verdict)" size="small" style="margin-left: 8px">
+            {{ verdictLabel(feedback.verdict) }}
+          </el-tag>
+          <span class="feedback-ts" v-if="feedback.updated_at">
+            Updated {{ formatDate(feedback.updated_at) }}
+          </span>
+          <el-button
+            size="small"
+            plain
+            style="margin-left: auto"
+            @click="startEdit"
+          >Edit</el-button>
+        </template>
+
+        <div class="feedback-body">
+          <div v-if="feedback.actual_root_cause" class="fb-row">
+            <span class="fb-label">Actual root cause</span>
+            <span class="fb-value">{{ feedback.actual_root_cause }}</span>
+          </div>
+          <div v-if="feedback.misleading_step" class="fb-row">
+            <span class="fb-label">Misleading step</span>
+            <span class="fb-value fb-quote">{{ feedback.misleading_step }}</span>
+          </div>
+          <div v-if="feedback.analyst_note" class="fb-row">
+            <span class="fb-label">Note</span>
+            <span class="fb-value">{{ feedback.analyst_note }}</span>
+          </div>
+          <div class="fb-row fb-prediction">
+            <span class="fb-label">Engine predicted</span>
+            <span class="fb-value">
+              {{ formatToken(feedback.predicted_outcome) }}
+              <template v-if="feedback.predicted_impairment">
+                · {{ formatToken(feedback.predicted_impairment) }}
+              </template>
+              · {{ feedback.predicted_confidence }}% confidence
+            </span>
+          </div>
+        </div>
+      </el-card>
+
+      <!-- Feedback form (new or editing) -->
+      <el-card
+        v-else-if="!feedback || feedbackEditing"
+        class="result-card"
+        shadow="never"
+      >
+        <template #header>
+          <span class="card-title">{{ feedback ? 'Edit Verdict' : 'Submit Verdict' }}</span>
+          <span class="card-subtitle" style="margin-left: 8px">
+            Was the engine's assessment correct?
+          </span>
+          <el-button
+            v-if="feedback && feedbackEditing"
+            size="small"
+            plain
+            style="margin-left: auto"
+            @click="cancelEdit"
+          >Cancel</el-button>
+        </template>
+
+        <el-form :model="feedbackForm" label-width="160px" size="small">
+          <!-- Verdict -->
+          <el-form-item label="Verdict" required>
+            <el-radio-group v-model="feedbackForm.verdict">
+              <el-radio-button value="correct">
+                <span style="color: #67c23a">✓ Correct</span>
+              </el-radio-button>
+              <el-radio-button value="partially_correct">
+                <span style="color: #e6a23c">~ Partially Correct</span>
+              </el-radio-button>
+              <el-radio-button value="incorrect">
+                <span style="color: #f56c6c">✗ Incorrect</span>
+              </el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+
+          <!-- Actual root cause — shown when not fully correct -->
+          <el-form-item
+            v-if="feedbackForm.verdict !== 'correct'"
+            label="Actual root cause"
+          >
+            <el-input
+              v-model="feedbackForm.actual_root_cause"
+              placeholder="What actually caused the issue? (free text)"
+              clearable
+            />
+          </el-form-item>
+
+          <!-- Misleading step — shown when not fully correct, only if steps exist -->
+          <el-form-item
+            v-if="feedbackForm.verdict !== 'correct' && result.path_steps && result.path_steps.length"
+            label="Misleading step"
+          >
+            <el-select
+              v-model="feedbackForm.misleading_step"
+              placeholder="Which step was wrong or misleading? (optional)"
+              clearable
+              style="width: 100%"
+            >
+              <el-option
+                v-for="(step, i) in result.path_steps"
+                :key="i"
+                :label="`Step ${i + 1}: ${step.slice(0, 80)}${step.length > 80 ? '…' : ''}`"
+                :value="step"
+              />
+            </el-select>
+          </el-form-item>
+
+          <!-- Note -->
+          <el-form-item label="Note">
+            <el-input
+              v-model="feedbackForm.analyst_note"
+              type="textarea"
+              :rows="2"
+              placeholder="Optional free-form note for future calibration"
+            />
+          </el-form-item>
+
+          <el-form-item>
+            <el-button
+              type="primary"
+              :loading="feedbackLoading"
+              :disabled="!feedbackForm.verdict"
+              @click="submitFeedback"
+            >
+              {{ feedback ? 'Update Verdict' : 'Submit Verdict' }}
+            </el-button>
+          </el-form-item>
+        </el-form>
+
+        <el-alert
+          v-if="feedbackError"
+          type="error"
+          :title="feedbackError"
+          show-icon
+          :closable="false"
+          style="margin-top: 8px"
+        />
+      </el-card>
+
     </template>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, watch } from 'vue'
 import api from '@/api'
+import type { PathAnalysisFeedback, PathAnalysisFeedbackVerdict } from '@/types/analysis'
 
 const props = defineProps<{ analysisId: string }>()
 
+// ── Analysis state ────────────────────────────────────────────────────────────
 const loading = ref(false)
-const error = ref('')
-const result = ref<Record<string, any> | null>(null)
+const error   = ref('')
+const result  = ref<Record<string, any> | null>(null)
 const activeCollapse = ref<string[]>([])
 
 const form = reactive({
@@ -261,25 +380,118 @@ const form = reactive({
   backend_subnets_raw: '',
 })
 
+// ── Feedback state ────────────────────────────────────────────────────────────
+const feedback        = ref<PathAnalysisFeedback | null>(null)
+const feedbackEditing = ref(false)
+const feedbackLoading = ref(false)
+const feedbackError   = ref('')
+
+const feedbackForm = reactive({
+  verdict:           '' as PathAnalysisFeedbackVerdict | '',
+  analyst_note:      '',
+  actual_root_cause: '',
+  misleading_step:   '',
+})
+
+function resetFeedbackForm(source?: PathAnalysisFeedback) {
+  feedbackForm.verdict           = source?.verdict           ?? ''
+  feedbackForm.analyst_note      = source?.analyst_note      ?? ''
+  feedbackForm.actual_root_cause = source?.actual_root_cause ?? ''
+  feedbackForm.misleading_step   = source?.misleading_step   ?? ''
+}
+
+function startEdit() {
+  resetFeedbackForm(feedback.value ?? undefined)
+  feedbackEditing.value = true
+}
+
+function cancelEdit() {
+  feedbackEditing.value = false
+  feedbackError.value   = ''
+}
+
+// ── Load existing feedback for a given query ──────────────────────────────────
+async function loadFeedback(src: string, dst: string, port: number | null) {
+  feedback.value        = null
+  feedbackEditing.value = false
+  feedbackError.value   = ''
+  try {
+    const res = await api.get(`/analyses/${props.analysisId}/path-analysis/feedback`)
+    const all: PathAnalysisFeedback[] = res.data
+    const match = all.find(
+      f =>
+        f.source_ip      === src &&
+        f.destination_ip === dst &&
+        (f.destination_port ?? null) === (port ?? null),
+    )
+    if (match) {
+      feedback.value = match
+      resetFeedbackForm(match)
+    } else {
+      resetFeedbackForm()
+      feedbackEditing.value = true   // no prior feedback → show form
+    }
+  } catch {
+    resetFeedbackForm()
+    feedbackEditing.value = true
+  }
+}
+
+// ── Submit feedback ───────────────────────────────────────────────────────────
+async function submitFeedback() {
+  if (!result.value || !feedbackForm.verdict) return
+  feedbackError.value   = ''
+  feedbackLoading.value = true
+
+  const port = result.value.destination_port ?? null
+  const payload = {
+    source_ip:            result.value.source_ip,
+    destination_ip:       result.value.destination_ip,
+    destination_port:     port,
+    predicted_outcome:    result.value.connection_outcome,
+    predicted_impairment: result.value.primary_impairment ?? null,
+    predicted_confidence: result.value.path_confidence_score,
+    verdict:              feedbackForm.verdict,
+    analyst_note:         feedbackForm.analyst_note      || null,
+    actual_root_cause:    feedbackForm.actual_root_cause || null,
+    misleading_step:      feedbackForm.misleading_step   || null,
+  }
+
+  try {
+    const res = await api.post(
+      `/analyses/${props.analysisId}/path-analysis/feedback`,
+      payload,
+    )
+    feedback.value        = res.data
+    feedbackEditing.value = false
+  } catch (e: any) {
+    feedbackError.value =
+      e.response?.data?.detail ?? 'Failed to save feedback. Please try again.'
+  } finally {
+    feedbackLoading.value = false
+  }
+}
+
+// ── Analysis execution ────────────────────────────────────────────────────────
 function parseList(raw: string): string[] {
   return raw.split(',').map(s => s.trim()).filter(Boolean)
 }
 
 async function runAnalysis() {
-  error.value = ''
+  error.value  = ''
   result.value = null
+  feedback.value = null
+  feedbackEditing.value = false
 
   if (!form.source_ip.trim() || !form.destination_ip.trim()) return
 
   const payload: Record<string, any> = {
-    source_ip: form.source_ip.trim(),
+    source_ip:      form.source_ip.trim(),
     destination_ip: form.destination_ip.trim(),
   }
 
   const port = parseInt(form.destination_port_raw, 10)
-  if (!isNaN(port) && port > 0 && port <= 65535) {
-    payload.destination_port = port
-  }
+  if (!isNaN(port) && port > 0 && port <= 65535) payload.destination_port = port
 
   const fw = parseList(form.firewall_ips_raw)
   const lb = parseList(form.lb_vips_raw)
@@ -296,6 +508,12 @@ async function runAnalysis() {
   try {
     const res = await api.post(`/analyses/${props.analysisId}/path-analysis`, payload)
     result.value = res.data
+    // Fetch any saved feedback for this exact query
+    await loadFeedback(
+      res.data.source_ip,
+      res.data.destination_ip,
+      res.data.destination_port ?? null,
+    )
   } catch (e: any) {
     error.value =
       e.response?.data?.detail ??
@@ -306,24 +524,26 @@ async function runAnalysis() {
 }
 
 function clearResult() {
-  result.value = null
-  error.value = ''
+  result.value          = null
+  error.value           = ''
+  feedback.value        = null
+  feedbackEditing.value = false
+  feedbackError.value   = ''
 }
 
+// ── Display helpers ───────────────────────────────────────────────────────────
 const outcomeLabel = computed(() => {
   const map: Record<string, string> = {
-    success: 'Success',
-    partial_success: 'Partial Success',
-    failure: 'Failure',
-    unknown: 'Unknown',
+    success: 'Success', partial_success: 'Partial Success',
+    failure: 'Failure', unknown: 'Unknown',
   }
   return map[result.value?.connection_outcome ?? ''] ?? result.value?.connection_outcome ?? '—'
 })
 
 const outcomeClass = computed(() => {
   const o = result.value?.connection_outcome
-  if (o === 'success') return 'outcome-success'
-  if (o === 'failure') return 'outcome-failure'
+  if (o === 'success')         return 'outcome-success'
+  if (o === 'failure')         return 'outcome-failure'
   if (o === 'partial_success') return 'outcome-warning'
   return ''
 })
@@ -340,9 +560,33 @@ function formatToken(tok: string): string {
 }
 
 function strengthTagType(s: string): '' | 'success' | 'warning' | 'danger' | 'info' {
-  if (s === 'high') return 'danger'
+  if (s === 'high')   return 'danger'
   if (s === 'medium') return 'warning'
   return 'info'
+}
+
+function verdictLabel(v: string): string {
+  if (v === 'correct')           return 'Correct'
+  if (v === 'partially_correct') return 'Partially Correct'
+  if (v === 'incorrect')         return 'Incorrect'
+  return v
+}
+
+function verdictTagType(v: string): '' | 'success' | 'warning' | 'danger' {
+  if (v === 'correct')           return 'success'
+  if (v === 'partially_correct') return 'warning'
+  if (v === 'incorrect')         return 'danger'
+  return ''
+}
+
+function formatDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleDateString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    })
+  } catch {
+    return iso
+  }
 }
 </script>
 
@@ -351,20 +595,16 @@ function strengthTagType(s: string): '' | 'success' | 'warning' | 'danger' | 'in
 
 /* Form card header */
 .form-card :deep(.el-card__header) { display: flex; align-items: baseline; gap: 10px; }
-.card-title  { font-weight: 600; font-size: 14px; }
+.card-title    { font-weight: 600; font-size: 14px; }
 .card-subtitle { font-size: 12px; color: #909399; }
 
 /* Summary strip */
-.result-summary {
-  display: flex; gap: 12px; flex-wrap: wrap;
-}
+.result-summary { display: flex; gap: 12px; flex-wrap: wrap; }
 .summary-card {
   background: #fff; border: 1px solid #ebeef5; border-radius: 6px;
   padding: 12px 20px; text-align: center; min-width: 110px;
 }
-.summary-val {
-  display: block; font-size: 18px; font-weight: 700; color: #303133;
-}
+.summary-val { display: block; font-size: 18px; font-weight: 700; color: #303133; }
 .summary-val.impairment-val { font-size: 12px; line-height: 1.4; }
 .summary-lbl { font-size: 11px; color: #909399; margin-top: 2px; display: block; }
 
@@ -374,19 +614,16 @@ function strengthTagType(s: string): '' | 'success' | 'warning' | 'danger' | 'in
 .outcome-failure  .summary-val { color: #f56c6c; }
 .outcome-warning  { border-color: #e6a23c; }
 .outcome-warning  .summary-val { color: #e6a23c; }
-
 .conf-high   .summary-val { color: #67c23a; }
 .conf-medium .summary-val { color: #e6a23c; }
 .conf-low    .summary-val { color: #f56c6c; }
 
-/* Verdict card header */
+/* Result cards */
 .result-card :deep(.el-card__header) {
-  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px;
 }
-.endpoint-badge {
-  font-size: 12px; color: #909399; font-family: monospace;
-}
-.verdict-text { font-size: 14px; color: #303133; margin: 0 0 8px; line-height: 1.6; }
+.endpoint-badge { font-size: 12px; color: #909399; font-family: monospace; }
+.verdict-text   { font-size: 14px; color: #303133; margin: 0 0 8px; line-height: 1.6; }
 .impairment-tags { margin-top: 4px; }
 
 /* Path steps */
@@ -401,18 +638,33 @@ function strengthTagType(s: string): '' | 'success' | 'warning' | 'danger' | 'in
 .evidence-item.strength-high   { border-left: 3px solid #f56c6c; }
 .evidence-item.strength-medium { border-left: 3px solid #e6a23c; }
 .evidence-item.strength-low    { border-left: 3px solid #909399; }
-.evidence-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.evidence-type   { font-weight: 600; font-size: 13px; }
+.evidence-header  { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.evidence-type    { font-weight: 600; font-size: 13px; }
 .evidence-summary { margin: 4px 0; font-size: 13px; color: #606266; }
-.evidence-meta {
-  font-size: 12px; color: #909399; display: flex; gap: 14px; flex-wrap: wrap;
-  margin-top: 4px;
-}
-.meta-item code {
-  font-size: 11px; background: #f4f4f5; padding: 1px 5px; border-radius: 3px;
-}
+.evidence-meta    { font-size: 12px; color: #909399; display: flex; gap: 14px; flex-wrap: wrap; margin-top: 4px; }
+.meta-item code   { font-size: 11px; background: #f4f4f5; padding: 1px 5px; border-radius: 3px; }
 
-/* Notes lists */
-.note-list { margin: 0; padding-left: 18px; }
+/* Notes */
+.note-list    { margin: 0; padding-left: 18px; }
 .note-list li { font-size: 13px; color: #606266; margin-bottom: 4px; line-height: 1.6; }
+
+/* Feedback card */
+.feedback-card :deep(.el-card__header) { flex-wrap: wrap; }
+.feedback-ts { font-size: 11px; color: #c0c4cc; margin-left: 6px; }
+
+.feedback-body { display: flex; flex-direction: column; gap: 8px; }
+.fb-row {
+  display: flex; gap: 12px; align-items: flex-start;
+  font-size: 13px; padding: 6px 0;
+  border-bottom: 1px solid #f4f4f5;
+}
+.fb-row:last-child { border-bottom: none; }
+.fb-label { color: #909399; min-width: 130px; flex-shrink: 0; }
+.fb-value { color: #303133; flex: 1; }
+.fb-quote {
+  font-style: italic; color: #606266;
+  border-left: 3px solid #dcdfe6; padding-left: 8px;
+}
+.fb-prediction { background: #fafafa; border-radius: 4px; padding: 6px 8px; }
+.fb-prediction .fb-value { font-family: monospace; font-size: 12px; }
 </style>

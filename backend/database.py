@@ -143,6 +143,40 @@ class FindingTriageModel(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class PathAnalysisFeedbackModel(Base):
+    """
+    Analyst verdict on a single CausalPathEngine result.
+
+    Keyed by (analysis_id, source_ip, destination_ip, destination_port, analyst_id)
+    so that re-submitting the same query updates the existing record (upsert).
+
+    verdict values: correct | partially_correct | incorrect
+
+    predicted_* fields are sent by the frontend from the live result so we
+    capture exactly what the engine said at the moment of judgment — even if
+    the PCAP is later deleted and the analysis cannot be re-run.
+    """
+    __tablename__ = "path_analysis_feedback"
+    id               = Column(Integer, primary_key=True, index=True)
+    analysis_id      = Column(String, ForeignKey("analyses.id"), nullable=False, index=True)
+    source_ip        = Column(String, nullable=False)
+    destination_ip   = Column(String, nullable=False)
+    destination_port = Column(Integer, nullable=True)
+    # Engine prediction captured at submission time
+    predicted_outcome    = Column(String, nullable=False)   # success|partial_success|failure|unknown
+    predicted_impairment = Column(String, nullable=True)    # primary_impairment token or null
+    predicted_confidence = Column(Integer, nullable=False)  # path_confidence_score 0–100
+    # Analyst judgment
+    verdict           = Column(String, nullable=False)      # correct|partially_correct|incorrect
+    analyst_note      = Column(Text, nullable=True)
+    actual_root_cause = Column(String, nullable=True)       # free-form or impairment token
+    misleading_step   = Column(Text, nullable=True)         # text of the path_step that misled
+    # Metadata
+    analyst_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 # ── Session / init helpers ─────────────────────────────────────────────────────
 
 def get_db():
