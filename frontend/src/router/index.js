@@ -37,6 +37,11 @@ const routes = [
         name: 'Suppressions',
         component: () => import('../views/SuppressionsView.vue'),
       },
+      {
+        path: 'calibration',
+        name: 'Calibration',
+        component: () => import('../views/CalibrationView.vue'),
+      },
     ]
   },
   {

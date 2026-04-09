@@ -745,6 +745,177 @@ def path_feedback_summary(
     }
 
 
+@app.get("/api/path-analysis/feedback/calibration")
+def path_feedback_calibration(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Full calibration report over all analyst feedback records.
+
+    Returns:
+    - confidence_buckets: accuracy per 0–39 / 40–59 / 60–74 / 75–89 / 90–100 band
+    - by_impairment: accuracy per predicted_impairment token
+    - by_outcome: accuracy per predicted_outcome token
+    - overconfident: rows with predicted_confidence >= 75 and verdict == incorrect
+    - underconfident: rows with predicted_confidence <= 50 and verdict == correct
+    - misleading_steps: frequency table of misleading path steps
+    - root_cause_mismatches: predicted_impairment vs actual_root_cause crosstab
+    """
+    rows = (
+        db.query(PathAnalysisFeedbackModel)
+        .filter(PathAnalysisFeedbackModel.analyst_id == current_user.id)
+        .all()
+    )
+
+    if not rows:
+        return {
+            "total": 0,
+            "confidence_buckets": [],
+            "by_impairment": [],
+            "by_outcome": [],
+            "overconfident": [],
+            "underconfident": [],
+            "misleading_steps": [],
+            "root_cause_mismatches": [],
+        }
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _is_correct(verdict: str) -> bool:
+        return verdict in ("correct", "partially_correct")
+
+    # ── confidence buckets ─────────────────────────────────────────────────────
+
+    BUCKETS = [
+        ("0–39",  0,  39),
+        ("40–59", 40, 59),
+        ("60–74", 60, 74),
+        ("75–89", 75, 89),
+        ("90–100", 90, 100),
+    ]
+
+    bucket_data: dict[str, dict] = {
+        label: {"label": label, "min": lo, "max": hi, "total": 0, "correct": 0,
+                "partially_correct": 0, "incorrect": 0}
+        for label, lo, hi in BUCKETS
+    }
+
+    for r in rows:
+        for label, lo, hi in BUCKETS:
+            if lo <= r.predicted_confidence <= hi:
+                b = bucket_data[label]
+                b["total"] += 1
+                b[r.verdict] = b.get(r.verdict, 0) + 1
+                break
+
+    for b in bucket_data.values():
+        correct_n = b["correct"] + b["partially_correct"]
+        b["accuracy_rate"] = round(correct_n / b["total"], 3) if b["total"] else None
+
+    confidence_buckets = list(bucket_data.values())
+
+    # ── by impairment ──────────────────────────────────────────────────────────
+
+    imp_map: dict[str, dict] = {}
+    for r in rows:
+        key = r.predicted_impairment or "none"
+        d = imp_map.setdefault(key, {
+            "predicted_impairment": key, "total": 0,
+            "correct": 0, "partially_correct": 0, "incorrect": 0,
+        })
+        d["total"] += 1
+        d[r.verdict] = d.get(r.verdict, 0) + 1
+
+    for d in imp_map.values():
+        n = d["correct"] + d["partially_correct"]
+        d["accuracy_rate"] = round(n / d["total"], 3) if d["total"] else None
+
+    by_impairment = sorted(imp_map.values(), key=lambda x: -x["total"])
+
+    # ── by outcome ─────────────────────────────────────────────────────────────
+
+    out_map: dict[str, dict] = {}
+    for r in rows:
+        key = r.predicted_outcome or "unknown"
+        d = out_map.setdefault(key, {
+            "predicted_outcome": key, "total": 0,
+            "correct": 0, "partially_correct": 0, "incorrect": 0,
+        })
+        d["total"] += 1
+        d[r.verdict] = d.get(r.verdict, 0) + 1
+
+    for d in out_map.values():
+        n = d["correct"] + d["partially_correct"]
+        d["accuracy_rate"] = round(n / d["total"], 3) if d["total"] else None
+
+    by_outcome = sorted(out_map.values(), key=lambda x: -x["total"])
+
+    # ── overconfident / underconfident ─────────────────────────────────────────
+
+    overconfident = [
+        _feedback_dict(r)
+        for r in rows
+        if r.predicted_confidence >= 75 and r.verdict == "incorrect"
+    ]
+
+    underconfident = [
+        _feedback_dict(r)
+        for r in rows
+        if r.predicted_confidence <= 50 and r.verdict == "correct"
+    ]
+
+    # ── misleading step frequency ──────────────────────────────────────────────
+
+    step_freq: dict[str, dict] = {}
+    for r in rows:
+        if not r.misleading_step:
+            continue
+        step = r.misleading_step.strip()
+        if not step:
+            continue
+        d = step_freq.setdefault(step, {
+            "step": step, "count": 0, "impairments": [],
+        })
+        d["count"] += 1
+        imp = r.predicted_impairment or "none"
+        if imp not in d["impairments"]:
+            d["impairments"].append(imp)
+
+    misleading_steps = sorted(step_freq.values(), key=lambda x: -x["count"])
+
+    # ── root-cause mismatch crosstab ───────────────────────────────────────────
+
+    mismatch_map: dict[tuple, dict] = {}
+    for r in rows:
+        if not r.actual_root_cause:
+            continue
+        pred = r.predicted_impairment or "none"
+        actual = r.actual_root_cause.strip()
+        key = (pred, actual)
+        d = mismatch_map.setdefault(key, {
+            "predicted_impairment": pred,
+            "actual_root_cause": actual,
+            "count": 0,
+        })
+        d["count"] += 1
+
+    root_cause_mismatches = sorted(
+        mismatch_map.values(),
+        key=lambda x: -x["count"],
+    )
+
+    return {
+        "total": len(rows),
+        "confidence_buckets": confidence_buckets,
+        "by_impairment": by_impairment,
+        "by_outcome": by_outcome,
+        "overconfident": overconfident,
+        "underconfident": underconfident,
+        "misleading_steps": misleading_steps,
+        "root_cause_mismatches": root_cause_mismatches,
+    }
+
+
 # ── Analyst Triage ────────────────────────────────────────────────────────────
 
 @app.get("/api/analyses/{analysis_id}/triage", response_model=List[TriageResponse])

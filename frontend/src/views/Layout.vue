@@ -31,6 +31,10 @@
           <el-icon><CircleClose /></el-icon>
           <span>Suppressions</span>
         </el-menu-item>
+        <el-menu-item index="/calibration">
+          <el-icon><TrendCharts /></el-icon>
+          <span>Calibration</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">
