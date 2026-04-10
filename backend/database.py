@@ -143,6 +143,28 @@ class FindingTriageModel(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class PathAnalysisCacheModel(Base):
+    """
+    Cached result of CausalPathEngine.analyze() for one (analysis, src, dst, port, roles, engine_version) tuple.
+
+    cache_key is a SHA-256 hex digest of the six-component key.  Entries are
+    considered valid only when their engine_version matches the constant in
+    core.causal_path.  Different roles or a bumped engine version produce a
+    different cache_key and therefore a distinct row.
+    """
+    __tablename__ = "path_analysis_cache"
+    id               = Column(Integer, primary_key=True, index=True)
+    cache_key        = Column(String, nullable=False, unique=True, index=True)
+    analysis_id      = Column(String, ForeignKey("analyses.id"), nullable=False, index=True)
+    source_ip        = Column(String, nullable=False)
+    destination_ip   = Column(String, nullable=False)
+    destination_port = Column(Integer, nullable=True)
+    roles_hash       = Column(String, nullable=False)   # SHA-256 of normalised roles JSON
+    engine_version   = Column(String, nullable=False)
+    result_json      = Column(Text, nullable=False)     # PathAnalysisResult.to_dict() as JSON
+    created_at       = Column(DateTime, server_default=func.now())
+
+
 class PathAnalysisFeedbackModel(Base):
     """
     Analyst verdict on a single CausalPathEngine result.

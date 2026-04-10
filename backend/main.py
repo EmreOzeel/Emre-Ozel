@@ -19,6 +19,7 @@ from config import settings
 from database import (
     AnalysisModel,
     FindingTriageModel,
+    PathAnalysisCacheModel,
     PathAnalysisFeedbackModel,
     SuppressionRuleModel,
     TelemetryEventModel,
@@ -522,6 +523,53 @@ class PathAnalysisRequest(BaseModel):
     roles: Optional[dict] = None
 
 
+def _normalize_roles(roles: Optional[dict]) -> Optional[dict]:
+    """Return a canonical, sorted copy of *roles* for stable hashing.
+
+    List values are sorted element-wise so that callers supplying the same IPs
+    in a different order do not produce a spurious cache miss.
+    """
+    if not roles:
+        return None
+    normalized: dict = {}
+    for key in sorted(roles.keys()):
+        v = roles[key]
+        if isinstance(v, list):
+            v = sorted(str(x) for x in v)
+        normalized[key] = v
+    return normalized
+
+
+def _compute_roles_hash(roles: Optional[dict]) -> str:
+    """SHA-256 hex digest of the normalised *roles* dict."""
+    canonical = json.dumps(_normalize_roles(roles), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _compute_path_cache_key(
+    analysis_id: str,
+    source_ip: str,
+    destination_ip: str,
+    destination_port: Optional[int],
+    roles: Optional[dict],
+    engine_version: str,
+) -> str:
+    """Deterministic SHA-256 cache key for a path analysis request."""
+    parts = json.dumps(
+        {
+            "analysis_id": analysis_id,
+            "source_ip": source_ip,
+            "destination_ip": destination_ip,
+            "destination_port": destination_port,
+            "roles_hash": _compute_roles_hash(roles),
+            "engine_version": engine_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(parts.encode()).hexdigest()
+
+
 @app.post("/api/analyses/{analysis_id}/path-analysis")
 def run_path_analysis(
     analysis_id: str,
@@ -529,15 +577,41 @@ def run_path_analysis(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Run CausalPathEngine against the original PCAP for a specific src→dst pair."""
+    """Run CausalPathEngine against the original PCAP for a specific src→dst pair.
+
+    Results are cached by (analysis_id, source_ip, destination_ip,
+    destination_port, normalised-roles, engine_version).  Cache hits skip the
+    expensive PCAP normalisation step entirely and include ``from_cache: true``
+    in the response.
+    """
+    from core.causal_path import CausalPathEngine, CACHE_ENGINE_VERSION
+
     row = _get_or_404(db, analysis_id, current_user.id)
     if row.status != "completed":
         raise HTTPException(400, "Analysis must be completed before running path analysis")
+
+    # ── Cache lookup ──────────────────────────────────────────────────────────
+    cache_key = _compute_path_cache_key(
+        analysis_id, req.source_ip, req.destination_ip,
+        req.destination_port, req.roles, CACHE_ENGINE_VERSION,
+    )
+    cached = (
+        db.query(PathAnalysisCacheModel)
+        .filter(PathAnalysisCacheModel.cache_key == cache_key)
+        .first()
+    )
+    if cached:
+        result_dict = json.loads(cached.result_json)
+        result_dict["from_cache"] = True
+        track("path_analysis.cache_hit", user_id=current_user.id,
+              properties={"analysis_id": analysis_id})
+        return result_dict
+
+    # ── Cache miss — compute fresh result ─────────────────────────────────────
     if not row.file_path or not Path(row.file_path).exists():
         raise HTTPException(404, "Original PCAP file is no longer available")
 
     from normalizer.pipeline import normalize
-    from core.causal_path import CausalPathEngine
 
     try:
         ctx = normalize(row.file_path)
@@ -551,12 +625,29 @@ def run_path_analysis(
         destination_port=req.destination_port,
         roles=req.roles,
     )
+
+    # ── Store result in cache ─────────────────────────────────────────────────
+    result_dict = result.to_dict()
+    db.add(PathAnalysisCacheModel(
+        cache_key=cache_key,
+        analysis_id=analysis_id,
+        source_ip=req.source_ip,
+        destination_ip=req.destination_ip,
+        destination_port=req.destination_port,
+        roles_hash=_compute_roles_hash(req.roles),
+        engine_version=CACHE_ENGINE_VERSION,
+        result_json=json.dumps(result_dict),
+    ))
+    db.commit()
+
     track("path_analysis.executed", user_id=current_user.id, properties={
         "analysis_id": analysis_id,
         "src": req.source_ip,
         "dst": req.destination_ip,
     })
-    return result.to_dict()
+
+    result_dict["from_cache"] = False
+    return result_dict
 
 
 # ── Path Analysis Feedback ────────────────────────────────────────────────────

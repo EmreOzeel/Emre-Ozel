@@ -21,6 +21,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+# ── Engine version ─────────────────────────────────────────────────────────────
+# Bump this string whenever reasoning logic changes in a way that makes existing
+# cached results stale.  All cache entries that carry a different version are
+# treated as misses regardless of the other key components.
+CACHE_ENGINE_VERSION = "1"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Connection state taxonomy
