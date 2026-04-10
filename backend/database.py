@@ -143,6 +143,26 @@ class FindingTriageModel(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class PathAnalysisRolePresetModel(Base):
+    """
+    Saved role-hint profile for CausalPathEngine.
+
+    Each preset belongs to one user (owner_user_id) and stores four optional
+    IP/subnet lists as JSON arrays.  List entries are stored in sorted order so
+    that two presets with the same IPs in different order compare as identical.
+    """
+    __tablename__ = "path_analysis_role_presets"
+    id                 = Column(Integer, primary_key=True, index=True)
+    owner_user_id      = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name               = Column(String, nullable=False)
+    firewall_ips       = Column(Text, nullable=False, default="[]")    # JSON array
+    load_balancer_vips = Column(Text, nullable=False, default="[]")    # JSON array
+    backend_ips        = Column(Text, nullable=False, default="[]")    # JSON array
+    backend_subnets    = Column(Text, nullable=False, default="[]")    # JSON array
+    created_at         = Column(DateTime, server_default=func.now())
+    updated_at         = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class PathAnalysisCacheModel(Base):
     """
     Cached result of CausalPathEngine.analyze() for one (analysis, src, dst, port, roles, engine_version) tuple.

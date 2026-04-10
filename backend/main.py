@@ -21,6 +21,7 @@ from database import (
     FindingTriageModel,
     PathAnalysisCacheModel,
     PathAnalysisFeedbackModel,
+    PathAnalysisRolePresetModel,
     SuppressionRuleModel,
     TelemetryEventModel,
     UserModel,
@@ -1104,6 +1105,136 @@ def telemetry_summary(
             "failed": failed,
         },
     }
+
+
+# ── Path Analysis Role Presets ────────────────────────────────────────────────
+
+def _preset_lists(raw: Optional[List[str]]) -> List[str]:
+    """Deduplicate and sort a list of IP/CIDR strings for stable storage."""
+    return sorted(set(s.strip() for s in (raw or []) if s.strip()))
+
+
+def _preset_to_dict(p: PathAnalysisRolePresetModel) -> dict:
+    return {
+        "id":                 p.id,
+        "name":               p.name,
+        "firewall_ips":       json.loads(p.firewall_ips),
+        "load_balancer_vips": json.loads(p.load_balancer_vips),
+        "backend_ips":        json.loads(p.backend_ips),
+        "backend_subnets":    json.loads(p.backend_subnets),
+        "created_at":         p.created_at.isoformat() if p.created_at else None,
+        "updated_at":         p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+class RolePresetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    firewall_ips:       Optional[List[str]] = None
+    load_balancer_vips: Optional[List[str]] = None
+    backend_ips:        Optional[List[str]] = None
+    backend_subnets:    Optional[List[str]] = None
+
+
+class RolePresetUpdate(BaseModel):
+    name:               Optional[str]       = Field(default=None, min_length=1, max_length=120)
+    firewall_ips:       Optional[List[str]] = None
+    load_balancer_vips: Optional[List[str]] = None
+    backend_ips:        Optional[List[str]] = None
+    backend_subnets:    Optional[List[str]] = None
+
+
+def _get_preset_or_404(db: Session, preset_id: int, user_id: int) -> PathAnalysisRolePresetModel:
+    p = db.query(PathAnalysisRolePresetModel).filter(
+        PathAnalysisRolePresetModel.id == preset_id
+    ).first()
+    if not p:
+        raise HTTPException(404, "Preset not found")
+    if p.owner_user_id != user_id:
+        raise HTTPException(403, "Not authorized to access this preset")
+    return p
+
+
+@app.post("/api/path-analysis/presets", status_code=201)
+def create_preset(
+    req: RolePresetCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Create a new role preset owned by the current user."""
+    p = PathAnalysisRolePresetModel(
+        owner_user_id=current_user.id,
+        name=req.name.strip(),
+        firewall_ips=       json.dumps(_preset_lists(req.firewall_ips)),
+        load_balancer_vips= json.dumps(_preset_lists(req.load_balancer_vips)),
+        backend_ips=        json.dumps(_preset_lists(req.backend_ips)),
+        backend_subnets=    json.dumps(_preset_lists(req.backend_subnets)),
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return _preset_to_dict(p)
+
+
+@app.get("/api/path-analysis/presets")
+def list_presets(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List all role presets owned by the current user, newest first."""
+    rows = (
+        db.query(PathAnalysisRolePresetModel)
+        .filter(PathAnalysisRolePresetModel.owner_user_id == current_user.id)
+        .order_by(PathAnalysisRolePresetModel.updated_at.desc())
+        .all()
+    )
+    return [_preset_to_dict(p) for p in rows]
+
+
+@app.get("/api/path-analysis/presets/{preset_id}")
+def get_preset(
+    preset_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Get a single preset. Returns 403 if it belongs to a different user."""
+    return _preset_to_dict(_get_preset_or_404(db, preset_id, current_user.id))
+
+
+@app.put("/api/path-analysis/presets/{preset_id}")
+def update_preset(
+    preset_id: int,
+    req: RolePresetUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Update name and/or role lists of an existing preset."""
+    p = _get_preset_or_404(db, preset_id, current_user.id)
+    if req.name is not None:
+        p.name = req.name.strip()
+    if req.firewall_ips is not None:
+        p.firewall_ips = json.dumps(_preset_lists(req.firewall_ips))
+    if req.load_balancer_vips is not None:
+        p.load_balancer_vips = json.dumps(_preset_lists(req.load_balancer_vips))
+    if req.backend_ips is not None:
+        p.backend_ips = json.dumps(_preset_lists(req.backend_ips))
+    if req.backend_subnets is not None:
+        p.backend_subnets = json.dumps(_preset_lists(req.backend_subnets))
+    p.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(p)
+    return _preset_to_dict(p)
+
+
+@app.delete("/api/path-analysis/presets/{preset_id}", status_code=204)
+def delete_preset(
+    preset_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Delete a preset. Returns 403 if it belongs to a different user."""
+    p = _get_preset_or_404(db, preset_id, current_user.id)
+    db.delete(p)
+    db.commit()
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

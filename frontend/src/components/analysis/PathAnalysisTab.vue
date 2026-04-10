@@ -38,6 +38,66 @@
         <!-- Role hints collapsible -->
         <el-collapse v-model="activeCollapse" style="margin-bottom: 12px; border: none">
           <el-collapse-item title="Role Hints (optional)" name="roles">
+
+            <!-- ── Preset bar ───────────────────────────────────────────── -->
+            <div class="preset-bar">
+              <el-select
+                v-model="selectedPresetId"
+                placeholder="Load a saved preset…"
+                clearable
+                size="small"
+                style="flex: 1; min-width: 0"
+                :loading="presetsLoading"
+                @change="applyPreset"
+                @clear="clearPresetSelection"
+              >
+                <el-option
+                  v-for="p in presets"
+                  :key="p.id"
+                  :label="p.name"
+                  :value="p.id"
+                />
+              </el-select>
+
+              <!-- Save / update buttons -->
+              <el-button
+                v-if="selectedPresetId"
+                size="small"
+                type="primary"
+                plain
+                :loading="presetSaving"
+                @click="updatePreset"
+              >Update "{{ selectedPresetName }}"</el-button>
+
+              <el-button
+                size="small"
+                plain
+                :loading="presetSaving"
+                @click="showSaveDialog = true"
+              >
+                <el-icon style="margin-right: 4px"><Plus /></el-icon>Save as preset
+              </el-button>
+
+              <el-button
+                v-if="selectedPresetId"
+                size="small"
+                plain
+                type="danger"
+                :loading="presetDeleting"
+                @click="deletePreset"
+              >Delete</el-button>
+            </div>
+
+            <el-alert
+              v-if="presetError"
+              type="error"
+              :title="presetError"
+              show-icon
+              :closable="true"
+              style="margin-bottom: 8px"
+              @close="presetError = ''"
+            />
+
             <el-form-item label="Firewall IPs">
               <el-input v-model="form.firewall_ips_raw" placeholder="comma-separated, e.g. 10.0.0.254" clearable />
             </el-form-item>
@@ -66,6 +126,37 @@
         </el-form-item>
       </el-form>
     </el-card>
+
+    <!-- Save-as-preset dialog -->
+    <el-dialog
+      v-model="showSaveDialog"
+      title="Save Role Hints as Preset"
+      width="360px"
+      :close-on-click-modal="false"
+    >
+      <el-form size="small" label-width="80px">
+        <el-form-item label="Name" required>
+          <el-input
+            v-model="newPresetName"
+            placeholder="e.g. Production LB cluster"
+            clearable
+            maxlength="120"
+            show-word-limit
+            autofocus
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button size="small" @click="showSaveDialog = false">Cancel</el-button>
+        <el-button
+          size="small"
+          type="primary"
+          :loading="presetSaving"
+          :disabled="!newPresetName.trim()"
+          @click="saveNewPreset"
+        >Save</el-button>
+      </template>
+    </el-dialog>
 
     <!-- Error -->
     <el-alert v-if="error" type="error" :title="error" show-icon :closable="false" />
@@ -358,7 +449,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, reactive, watch } from 'vue'
+import { ref, computed, reactive, watch, onMounted } from 'vue'
+import { Plus } from '@element-plus/icons-vue'
 import api from '@/api'
 import type { PathAnalysisFeedback, PathAnalysisFeedbackVerdict } from '@/types/analysis'
 
@@ -379,6 +471,123 @@ const form = reactive({
   backend_ips_raw: '',
   backend_subnets_raw: '',
 })
+
+// ── Preset state ──────────────────────────────────────────────────────────────
+interface RolePreset {
+  id: number
+  name: string
+  firewall_ips: string[]
+  load_balancer_vips: string[]
+  backend_ips: string[]
+  backend_subnets: string[]
+}
+
+const presets        = ref<RolePreset[]>([])
+const presetsLoading = ref(false)
+const selectedPresetId = ref<number | null>(null)
+const presetSaving   = ref(false)
+const presetDeleting = ref(false)
+const presetError    = ref('')
+const showSaveDialog = ref(false)
+const newPresetName  = ref('')
+
+const selectedPresetName = computed(
+  () => presets.value.find(p => p.id === selectedPresetId.value)?.name ?? ''
+)
+
+async function loadPresets() {
+  presetsLoading.value = true
+  try {
+    const res = await api.get('/path-analysis/presets')
+    presets.value = res.data
+  } catch {
+    // Non-critical — silently ignore
+  } finally {
+    presetsLoading.value = false
+  }
+}
+
+function applyPreset(id: number | null) {
+  if (!id) return
+  const preset = presets.value.find(p => p.id === id)
+  if (!preset) return
+  form.firewall_ips_raw    = preset.firewall_ips.join(', ')
+  form.lb_vips_raw         = preset.load_balancer_vips.join(', ')
+  form.backend_ips_raw     = preset.backend_ips.join(', ')
+  form.backend_subnets_raw = preset.backend_subnets.join(', ')
+  // Expand the Role Hints section so the user sees the populated values
+  if (!activeCollapse.value.includes('roles')) {
+    activeCollapse.value = [...activeCollapse.value, 'roles']
+  }
+}
+
+function clearPresetSelection() {
+  selectedPresetId.value = null
+}
+
+function currentRoleLists() {
+  return {
+    firewall_ips:       parseList(form.firewall_ips_raw),
+    load_balancer_vips: parseList(form.lb_vips_raw),
+    backend_ips:        parseList(form.backend_ips_raw),
+    backend_subnets:    parseList(form.backend_subnets_raw),
+  }
+}
+
+async function saveNewPreset() {
+  if (!newPresetName.value.trim()) return
+  presetSaving.value = true
+  presetError.value  = ''
+  try {
+    const res = await api.post('/path-analysis/presets', {
+      name: newPresetName.value.trim(),
+      ...currentRoleLists(),
+    })
+    presets.value.unshift(res.data)
+    selectedPresetId.value = res.data.id
+    showSaveDialog.value   = false
+    newPresetName.value    = ''
+  } catch (e: any) {
+    presetError.value = e.response?.data?.detail ?? 'Failed to save preset.'
+  } finally {
+    presetSaving.value = false
+  }
+}
+
+async function updatePreset() {
+  if (!selectedPresetId.value) return
+  presetSaving.value = true
+  presetError.value  = ''
+  try {
+    const res = await api.put(`/path-analysis/presets/${selectedPresetId.value}`, currentRoleLists())
+    const idx = presets.value.findIndex(p => p.id === selectedPresetId.value)
+    if (idx !== -1) presets.value[idx] = res.data
+  } catch (e: any) {
+    presetError.value = e.response?.data?.detail ?? 'Failed to update preset.'
+  } finally {
+    presetSaving.value = false
+  }
+}
+
+async function deletePreset() {
+  if (!selectedPresetId.value) return
+  presetDeleting.value = true
+  presetError.value    = ''
+  try {
+    await api.delete(`/path-analysis/presets/${selectedPresetId.value}`)
+    presets.value      = presets.value.filter(p => p.id !== selectedPresetId.value)
+    selectedPresetId.value = null
+    // Clear role fields since the preset is gone
+    form.firewall_ips_raw    = ''
+    form.lb_vips_raw         = ''
+    form.backend_ips_raw     = ''
+    form.backend_subnets_raw = ''
+  } catch (e: any) {
+    presetError.value = e.response?.data?.detail ?? 'Failed to delete preset.'
+  } finally {
+    presetDeleting.value = false
+  }
+}
 
 // ── Feedback state ────────────────────────────────────────────────────────────
 const feedback        = ref<PathAnalysisFeedback | null>(null)
@@ -531,6 +740,9 @@ function clearResult() {
   feedbackError.value   = ''
 }
 
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+onMounted(loadPresets)
+
 // ── Display helpers ───────────────────────────────────────────────────────────
 const outcomeLabel = computed(() => {
   const map: Record<string, string> = {
@@ -597,6 +809,19 @@ function formatDate(iso: string): string {
 .form-card :deep(.el-card__header) { display: flex; align-items: baseline; gap: 10px; }
 .card-title    { font-weight: 600; font-size: 14px; }
 .card-subtitle { font-size: 12px; color: #909399; }
+
+/* Preset bar */
+.preset-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  background: #f9f9fb;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+}
 
 /* Summary strip */
 .result-summary { display: flex; gap: 12px; flex-wrap: wrap; }
