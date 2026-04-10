@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 
 from core.calibration_metrics import compute_calibration_metrics
+from core.causal_path import CausalPathEngine
+from models import PacketRecord
 from tests.fixtures.path_calibration_baseline_corpus import CORPUS
 
 # ── Load baseline ─────────────────────────────────────────────────────────────
@@ -281,4 +283,206 @@ class TestMisleadingNarrativeFrequency:
         assert not failures, (
             "misleading_narrative_frequency increased for one or more steps:\n"
             + "\n".join(failures)
+        )
+
+
+# ── Helpers for impairment-specific guardrail slices ──────────────────────────
+
+def _filter_imp(rows, impairment):
+    """Return rows whose predicted_impairment equals *impairment*."""
+    return [r for r in rows if r.get("predicted_impairment") == impairment]
+
+
+def _hc_incorrect_rate(rows):
+    """
+    Fraction of high-confidence (≥ 75) predictions with verdict == 'incorrect'.
+    Returns None when there are no high-confidence rows.
+    """
+    hc = [r for r in rows if (r.get("predicted_confidence") or 0) >= 75]
+    if not hc:
+        return None
+    n_incorrect = sum(1 for r in hc if r.get("verdict") == "incorrect")
+    return round(n_incorrect / len(hc), 4)
+
+
+def _mean_confidence(rows):
+    """Mean predicted_confidence across rows. Returns None when rows is empty."""
+    if not rows:
+        return None
+    return round(
+        sum(r.get("predicted_confidence") or 0 for r in rows) / len(rows), 4
+    )
+
+
+# ── Per-impairment corpus slices (pre-computed once at module load) ───────────
+
+_BRD_ROWS = _filter_imp(CORPUS, "backend_response_delay")
+_RPP_ROWS = _filter_imp(CORPUS, "return_path_problem")
+
+# Corpus-derived baselines — mirror the values in path_calibration_baseline.json
+_BRD_HC_INCORRECT_BASELINE = _hc_incorrect_rate(_BRD_ROWS)   # 0.1429  (1 of 7)
+_RPP_HC_INCORRECT_BASELINE = _hc_incorrect_rate(_RPP_ROWS)   # 0.5     (1 of 2)
+_RPP_MEAN_CONF_BASELINE    = _mean_confidence(_RPP_ROWS)      # 80.0
+
+_TOL_IMP_HC_INCORRECT = 0.10   # max allowed increase in high-conf incorrect rate
+_TOL_IMP_MEAN_CONF    = 5.0    # max allowed increase in mean confidence (absolute)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# F — backend_response_delay: high-confidence incorrect rate must stay bounded
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBackendResponseDelayGuardrail:
+    """
+    backend_response_delay predictions issued at high confidence (≥ 75) that
+    turn out to be wrong are especially harmful — analysts act on a delay
+    diagnosis that is not warranted.
+
+    Guard: the high-confidence incorrect rate for backend_response_delay rows
+    must not increase by more than 0.10 above the corpus baseline.
+    Baseline: 0.1429  →  limit: 0.2429.
+    """
+
+    def test_hc_incorrect_rate_not_worsened(self):
+        baseline = _BRD_HC_INCORRECT_BASELINE
+
+        if baseline is None:
+            return  # no high-confidence rows in baseline corpus — cannot compare
+
+        current = _hc_incorrect_rate(_filter_imp(CORPUS, "backend_response_delay"))
+        if current is None:
+            current = 0.0
+
+        limit = round(baseline + _TOL_IMP_HC_INCORRECT, 6)
+        assert current <= limit, (
+            f"backend_response_delay high-confidence incorrect rate worsened.\n"
+            f"  baseline : {baseline}\n"
+            f"  current  : {current}\n"
+            f"  limit    : {limit}  (baseline + {_TOL_IMP_HC_INCORRECT})\n"
+            f"  worsened by {round(current - baseline, 4)}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# G — return_path_problem: must stay conservative on confidence and accuracy
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestReturnPathProblemGuardrail:
+    """
+    return_path_problem is the impairment most frequently confused with a
+    capture visibility gap by analysts.  The engine must stay conservative:
+
+    • High-confidence incorrect rate must not drift upward too far.
+    • Mean confidence must not inflate — analysts should not be pushed toward
+      treating an ambiguous capture gap as a confirmed path failure.
+
+    Guards:
+      high-conf incorrect rate ≤ baseline + 0.10  (baseline 0.5  → limit 0.60)
+      mean confidence          ≤ baseline + 5.0   (baseline 80.0 → limit 85.0)
+    """
+
+    def test_hc_incorrect_rate_not_worsened(self):
+        baseline = _RPP_HC_INCORRECT_BASELINE
+
+        if baseline is None:
+            return
+
+        current = _hc_incorrect_rate(_filter_imp(CORPUS, "return_path_problem"))
+        if current is None:
+            current = 0.0
+
+        limit = round(baseline + _TOL_IMP_HC_INCORRECT, 6)
+        assert current <= limit, (
+            f"return_path_problem high-confidence incorrect rate worsened.\n"
+            f"  baseline : {baseline}\n"
+            f"  current  : {current}\n"
+            f"  limit    : {limit}  (baseline + {_TOL_IMP_HC_INCORRECT})\n"
+            f"  worsened by {round(current - baseline, 4)}"
+        )
+
+    def test_mean_confidence_not_inflated(self):
+        baseline = _RPP_MEAN_CONF_BASELINE
+
+        if baseline is None:
+            return
+
+        current = _mean_confidence(_filter_imp(CORPUS, "return_path_problem"))
+        if current is None:
+            return  # no return_path_problem rows now — cannot compare
+
+        ceiling = round(baseline + _TOL_IMP_MEAN_CONF, 6)
+        assert current <= ceiling, (
+            f"return_path_problem mean confidence inflated.\n"
+            f"  baseline : {baseline}\n"
+            f"  current  : {current}\n"
+            f"  ceiling  : {ceiling}  (baseline + {_TOL_IMP_MEAN_CONF})\n"
+            f"  inflation: {round(current - baseline, 4)}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# H — firewall_interference: client-side RSTs must never be mis-labelled
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pkt_h(num, ts, src, dst, sport=54321, dport=80,
+           syn=False, ack=False, rst=False, fin=False, payload=0):
+    """Minimal PacketRecord for firewall guardrail scenarios."""
+    return PacketRecord(
+        num=num, ts=ts, frame_len=60 + payload, protocol="TCP",
+        src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+        ip_proto=6,
+        tcp_flags_syn=syn, tcp_flags_ack=ack,
+        tcp_flags_rst=rst, tcp_flags_fin=fin,
+        tcp_payload_len=payload,
+    )
+
+
+_H_CLIENT = "10.2.0.10"
+_H_SERVER = "10.2.0.20"
+
+
+class TestFirewallInterferenceGuardrail:
+    """
+    Normal client-initiated RST teardowns must never be classified as
+    firewall_interference.  This is a focused engine-level regression guard
+    for the tightened trigger introduced in the recalibration sprint
+    (only server_to_client RSTs or known-firewall-IP RSTs should fire it).
+
+    Covered scenarios:
+      H1 — normal teardown: full handshake + data exchange + client RST
+      H2 — client abort: SYN sent, then client RSTs before handshake completes
+    """
+
+    def _run(self, packets):
+        engine = CausalPathEngine(packets, {}, [], None)
+        return engine.analyze(_H_CLIENT, _H_SERVER, 80)
+
+    def test_h1_normal_teardown_no_firewall_interference(self):
+        """Full handshake + data + client RST must not produce firewall_interference."""
+        packets = [
+            _pkt_h(1, 1.000, _H_CLIENT, _H_SERVER, syn=True),
+            _pkt_h(2, 1.001, _H_SERVER, _H_CLIENT, sport=80, dport=54321, syn=True, ack=True),
+            _pkt_h(3, 1.002, _H_CLIENT, _H_SERVER, ack=True),
+            _pkt_h(4, 1.100, _H_CLIENT, _H_SERVER, payload=100),
+            _pkt_h(5, 1.200, _H_SERVER, _H_CLIENT, sport=80, dport=54321, payload=200),
+            _pkt_h(6, 1.300, _H_CLIENT, _H_SERVER, rst=True),         # client teardown
+        ]
+        result = self._run(packets)
+        assert "firewall_interference" not in result.path_impairments, (
+            f"firewall_interference incorrectly raised for a normal client RST teardown.\n"
+            f"  path_impairments : {result.path_impairments}\n"
+            f"  path_steps       : {result.path_steps}"
+        )
+
+    def test_h2_client_abort_no_firewall_interference(self):
+        """SYN followed immediately by a client RST must not produce firewall_interference."""
+        packets = [
+            _pkt_h(1, 1.000, _H_CLIENT, _H_SERVER, syn=True),
+            _pkt_h(2, 1.010, _H_CLIENT, _H_SERVER, rst=True),         # client aborts
+        ]
+        result = self._run(packets)
+        assert "firewall_interference" not in result.path_impairments, (
+            f"firewall_interference incorrectly raised for a client-abort RST.\n"
+            f"  path_impairments : {result.path_impairments}\n"
+            f"  path_steps       : {result.path_steps}"
         )
