@@ -1,0 +1,44 @@
+{
+  "_meta": {
+    "description": "Calibration baseline for CausalPathEngine post-recalibration (2026-04-10).",
+    "corpus": "Synthetic reference corpus of 24 PathAnalysisFeedback records covering all impairment tokens and confidence bands. Verdicts assigned by engineering judgment of expected post-recalibration behaviour.",
+    "generated_by": "backend/core/calibration_metrics.compute_calibration_metrics",
+    "how_to_update": "Re-run the corpus in tests/fixtures/path_calibration_baseline_corpus.py after intentional engine changes, review diffs, and commit the updated snapshot."
+  },
+  "total": 24,
+  "overconfident_incorrect_rate": 0.1111,
+  "underconfident_correct_rate": 1.0,
+  "confidence_bucket_accuracy": [
+    {"label": "0-39",   "total": 0,  "accuracy_rate": null},
+    {"label": "40-59",  "total": 1,  "accuracy_rate": 1.0},
+    {"label": "60-74",  "total": 5,  "accuracy_rate": 1.0},
+    {"label": "75-89",  "total": 13, "accuracy_rate": 0.8462},
+    {"label": "90-100", "total": 5,  "accuracy_rate": 1.0}
+  ],
+  "impairment_accuracy": [
+    {"predicted_impairment": "backend_response_delay",        "total": 7, "accuracy_rate": 0.8571},
+    {"predicted_impairment": "connection_establishment_failure","total": 6, "accuracy_rate": 1.0},
+    {"predicted_impairment": "none",                          "total": 4, "accuracy_rate": 1.0},
+    {"predicted_impairment": "no_server_response",            "total": 4, "accuracy_rate": 1.0},
+    {"predicted_impairment": "return_path_problem",           "total": 2, "accuracy_rate": 0.5},
+    {"predicted_impairment": "lb_backend_issue",              "total": 1, "accuracy_rate": 1.0}
+  ],
+  "misleading_narrative_frequency": [
+    {
+      "step": "No return traffic from the load balancer toward the client was detected \u2014 this may indicate a path interruption or a capture visibility gap at this monitoring point.",
+      "count": 2
+    },
+    {
+      "step": "The server response took 310.0 ms after connection \u2014 possible delay, though this may still be within the normal baseline.",
+      "count": 1
+    },
+    {
+      "step": "The server response took 280.0 ms after connection \u2014 possible delay, though this may still be within the normal baseline.",
+      "count": 1
+    },
+    {
+      "step": "No LB-to-backend flow was observed \u2014 the load balancer may not have forwarded traffic to any backend, or this flow may not be visible.",
+      "count": 1
+    }
+  ]
+}
