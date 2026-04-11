@@ -48,12 +48,26 @@ class Base(DeclarativeBase):
 
 # ── Models ─────────────────────────────────────────────────────────────────────
 
+class TeamModel(Base):
+    """
+    A team groups several users for the purposes of sharing presets, saved
+    queries and investigation notes.  A user may belong to at most one team
+    (UserModel.team_id).  Items with scope="team" are visible to all members
+    of the owner's team.
+    """
+    __tablename__ = "teams"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class UserModel(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -75,6 +89,19 @@ class AnalysisModel(Base):
     created_at = Column(DateTime, server_default=func.now())
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+    # ── Investigation workflow ────────────────────────────────────────────────
+    # Workflow is independent of the engine's processing ``status``:
+    #   new | in_progress | needs_review | resolved | dismissed
+    workflow_state = Column(
+        String, default="new", nullable=False, index=True
+    )
+    assigned_user_id = Column(
+        Integer, ForeignKey("users.id"), nullable=True, index=True
+    )
+    workflow_updated_at = Column(DateTime, nullable=True)
+    workflow_updated_by = Column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
 
 
 class SuppressionRuleModel(Base):
@@ -171,6 +198,14 @@ class PathAnalysisSavedQueryModel(Base):
     backend_ips        = Column(Text, nullable=False, default="[]")    # JSON array
     backend_subnets    = Column(Text, nullable=False, default="[]")    # JSON array
     note               = Column(Text, nullable=True)
+    # ── Sharing scope ─────────────────────────────────────────────────────────
+    # scope: "private"  — visible to owner only (default)
+    #        "team"     — visible to all members of the owner's team
+    #        "global"   — visible to every authenticated user; admin-managed
+    scope              = Column(String, nullable=False, default="private", index=True)
+    team_id            = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)
+    created_by         = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by         = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at         = Column(DateTime, server_default=func.now())
     updated_at         = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -191,6 +226,11 @@ class PathAnalysisRolePresetModel(Base):
     load_balancer_vips = Column(Text, nullable=False, default="[]")    # JSON array
     backend_ips        = Column(Text, nullable=False, default="[]")    # JSON array
     backend_subnets    = Column(Text, nullable=False, default="[]")    # JSON array
+    # ── Sharing scope (see PathAnalysisSavedQueryModel for semantics) ─────────
+    scope              = Column(String, nullable=False, default="private", index=True)
+    team_id            = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)
+    created_by         = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by         = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at         = Column(DateTime, server_default=func.now())
     updated_at         = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -247,8 +287,110 @@ class PathAnalysisFeedbackModel(Base):
     misleading_step   = Column(Text, nullable=True)         # text of the path_step that misled
     # Metadata
     analyst_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Visibility scope — "private" (default) = only the authoring analyst can
+    # see this feedback; "team" = every member of the analyst's team can see
+    # it (read-only for others).  Values are intentionally a subset of the
+    # role-preset/saved-query scope vocabulary.
+    scope        = Column(String, nullable=False, default="private", index=True)
+    team_id      = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class InvestigationNoteModel(Base):
+    """
+    Free-form analyst note attached to an investigation target
+    (analysis_id + src/dst/port).  Supports private or team-visible scope so
+    that several analysts on the same team can collaborate on the same case.
+
+    Editing and deleting are restricted to the author; other team members see
+    the note read-only.
+    """
+    __tablename__ = "investigation_notes"
+    id               = Column(Integer, primary_key=True, index=True)
+    analysis_id      = Column(String, ForeignKey("analyses.id"), nullable=False, index=True)
+    source_ip        = Column(String, nullable=False)
+    destination_ip   = Column(String, nullable=False)
+    destination_port = Column(Integer, nullable=True)
+    body             = Column(Text, nullable=False, default="")
+    scope            = Column(String, nullable=False, default="private", index=True)
+    team_id          = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)
+    created_by       = Column(Integer, ForeignKey("users.id"), nullable=False)
+    updated_by       = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at       = Column(DateTime, server_default=func.now())
+    updated_at       = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class MonitoredPathModel(Base):
+    """
+    Scheduled drift monitor for a saved path-analysis query.
+
+    Each row binds a saved query (which captures src/dst/port/role hints) to a
+    specific analysis (the PCAP that the periodic re-runs target) and a poll
+    interval.  The latest result is snapshotted on every successful run so that
+    the next run can detect drift against the prior baseline.
+
+    The model intentionally does NOT include a full scheduler — runs are
+    triggered by an in-process tick (see ``run_due_monitors`` in
+    ``monitoring.py``) or by an explicit POST /api/path-monitors/{id}/run.
+    """
+    __tablename__ = "monitored_paths"
+    id                   = Column(Integer, primary_key=True, index=True)
+    saved_query_id       = Column(
+        Integer, ForeignKey("path_analysis_saved_queries.id"),
+        nullable=False, index=True,
+    )
+    analysis_id          = Column(
+        String, ForeignKey("analyses.id"), nullable=False, index=True,
+    )
+    owner_user_id        = Column(
+        Integer, ForeignKey("users.id"), nullable=False, index=True,
+    )
+    schedule_interval_minutes = Column(Integer, nullable=False, default=60)
+    enabled              = Column(Boolean, nullable=False, default=True)
+    last_run_at          = Column(DateTime, nullable=True)
+    last_change_at       = Column(DateTime, nullable=True)
+    # JSON-encoded snapshot of the most recent path-analysis result dict
+    last_result_json     = Column(Text, nullable=True)
+    # JSON-encoded change summary from the most recent drift detection
+    last_change_summary  = Column(Text, nullable=True)
+    # On the most recent run, did drift detection fire?
+    last_drift_severity  = Column(String, nullable=True)   # none|info|warning|critical
+    created_at           = Column(DateTime, server_default=func.now())
+    updated_at           = Column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class NotificationModel(Base):
+    """
+    In-app notification for a single user.
+
+    Notifications are created by server-side triggers on the investigation
+    workflow — see ``_notify`` in main.py.  They are intentionally minimal:
+    a short human-readable message plus a link target (analysis_id).
+
+    type values:
+      assignment        — an analysis was assigned to the recipient
+      review_required   — an analysis transitioned to needs_review
+      resolved          — an analysis transitioned to resolved
+      feedback_alert    — an analyst submitted an "incorrect" verdict
+      mention           — recipient was @mentioned in an investigation note
+      drift_detected    — a monitored path drifted vs. its previous snapshot
+    """
+    __tablename__ = "notifications"
+    id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(
+        Integer, ForeignKey("users.id"), nullable=False, index=True
+    )
+    type           = Column(String, nullable=False, index=True)
+    analysis_id    = Column(
+        String, ForeignKey("analyses.id"), nullable=True, index=True
+    )
+    actor_user_id  = Column(Integer, ForeignKey("users.id"), nullable=True)
+    message        = Column(Text, nullable=False, default="")
+    read_at        = Column(DateTime, nullable=True, index=True)
+    created_at     = Column(DateTime, server_default=func.now(), index=True)
 
 
 # ── Session / init helpers ─────────────────────────────────────────────────────

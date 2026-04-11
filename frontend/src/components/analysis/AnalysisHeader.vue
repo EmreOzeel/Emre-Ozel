@@ -20,6 +20,9 @@
     </div>
 
     <div class="header-right">
+      <!-- Investigation workflow controls (state + assignee) -->
+      <WorkflowControls :analysis-id="analysis.id" />
+
       <!-- Capture quality badge -->
       <el-tag
         v-if="data?.capture_assessment"
@@ -57,6 +60,7 @@ import { computed } from 'vue'
 import { ArrowLeft, Download } from '@element-plus/icons-vue'
 import api from '@/api'
 import type { AnalysisDetail, AnalysisData } from '@/types/analysis'
+import WorkflowControls from './WorkflowControls.vue'
 
 const props = defineProps<{
   analysis: AnalysisDetail

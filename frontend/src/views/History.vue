@@ -51,6 +51,23 @@
           </template>
         </el-table-column>
 
+        <el-table-column label="Workflow" width="200">
+          <template #default="{ row }">
+            <div class="workflow-cell">
+              <el-tag
+                :type="workflowType(row.workflow_state)"
+                size="small"
+                effect="dark"
+              >
+                {{ workflowLabel(row.workflow_state) }}
+              </el-tag>
+              <span v-if="row.assignee_username" class="assignee-text">
+                @{{ row.assignee_username }}
+              </span>
+            </div>
+          </template>
+        </el-table-column>
+
         <el-table-column label="Findings" width="230">
           <template #default="{ row }">
             <div v-if="row.status === 'completed'" class="findings-cell">
@@ -175,6 +192,28 @@ function statusType(row) {
   return { completed: 'success', failed: 'danger', running: 'warning', pending: 'info' }[row.status] || 'info'
 }
 
+function workflowLabel(state) {
+  const labels = {
+    new: 'New',
+    in_progress: 'In Progress',
+    needs_review: 'Needs Review',
+    resolved: 'Resolved',
+    dismissed: 'Dismissed',
+  }
+  return labels[state] || 'New'
+}
+
+function workflowType(state) {
+  const types = {
+    new: 'info',
+    in_progress: 'warning',
+    needs_review: 'danger',
+    resolved: 'success',
+    dismissed: '',
+  }
+  return types[state] ?? 'info'
+}
+
 function formatDate(dateStr) {
   return new Date(dateStr).toLocaleString()
 }
@@ -240,6 +279,18 @@ function formatSize(bytes) {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
+}
+
+.workflow-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.assignee-text {
+  font-size: 12px;
+  color: #606266;
 }
 
 .no-data {

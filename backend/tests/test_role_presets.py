@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -76,9 +76,7 @@ def _make_client(db_session, user_id: int) -> tuple[TestClient, _UserHolder]:
         yield db_session
 
     def _override_user():
-        fake = MagicMock()
-        fake.id = holder.uid
-        return fake
+        return SimpleNamespace(id=holder.uid, is_admin=False, team_id=None)
 
     app.dependency_overrides[get_db]           = _override_db
     app.dependency_overrides[get_current_user] = _override_user

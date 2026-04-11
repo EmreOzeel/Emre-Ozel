@@ -26,6 +26,12 @@
             :label="q.name"
           >
             <span>{{ q.name }}</span>
+            <el-tag
+              :type="scopeTagType(q.scope)"
+              size="small"
+              effect="plain"
+              style="margin-left: 6px"
+            >{{ scopeLabel(q.scope) }}</el-tag>
             <span class="sq-option-sub">
               {{ q.source_ip }} → {{ q.destination_ip
               }}<template v-if="q.destination_port">:{{ q.destination_port }}</template>
@@ -34,7 +40,7 @@
         </el-select>
 
         <el-button
-          v-if="selectedQueryId"
+          v-if="selectedQueryId && selectedQueryEditable"
           size="small"
           type="primary"
           plain
@@ -52,13 +58,29 @@
         </el-button>
 
         <el-button
-          v-if="selectedQueryId"
+          v-if="selectedQueryId && selectedQueryEditable"
           size="small"
           plain
           type="danger"
           :loading="queryDeleting"
           @click="deleteQuery"
         >Delete</el-button>
+
+        <el-button
+          v-if="selectedQueryId"
+          size="small"
+          plain
+          type="success"
+          :loading="monitorCreating"
+          @click="enableMonitoring"
+        >Monitor</el-button>
+
+        <el-tag
+          v-if="selectedQueryId && selectedQuery"
+          :type="scopeTagType(selectedQuery.scope)"
+          size="small"
+          effect="plain"
+        >{{ scopeLabel(selectedQuery.scope) }}<span v-if="!selectedQueryEditable"> · read-only</span></el-tag>
       </div>
 
       <div v-if="selectedQuery?.note" class="sq-note">
@@ -93,6 +115,13 @@
             show-word-limit
             autofocus
           />
+        </el-form-item>
+        <el-form-item label="Scope">
+          <el-radio-group v-model="newQueryScope" size="small">
+            <el-radio-button value="private">Private</el-radio-button>
+            <el-radio-button value="team">Team</el-radio-button>
+            <el-radio-button value="global">Global</el-radio-button>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="Note">
           <el-input
@@ -170,12 +199,20 @@
                   :key="p.id"
                   :label="p.name"
                   :value="p.id"
-                />
+                >
+                  <span>{{ p.name }}</span>
+                  <el-tag
+                    :type="scopeTagType(p.scope)"
+                    size="small"
+                    effect="plain"
+                    style="margin-left: 6px"
+                  >{{ scopeLabel(p.scope) }}</el-tag>
+                </el-option>
               </el-select>
 
               <!-- Save / update buttons -->
               <el-button
-                v-if="selectedPresetId"
+                v-if="selectedPresetId && selectedPresetEditable"
                 size="small"
                 type="primary"
                 plain
@@ -193,13 +230,20 @@
               </el-button>
 
               <el-button
-                v-if="selectedPresetId"
+                v-if="selectedPresetId && selectedPresetEditable"
                 size="small"
                 plain
                 type="danger"
                 :loading="presetDeleting"
                 @click="deletePreset"
               >Delete</el-button>
+
+              <el-tag
+                v-if="selectedPresetId && selectedPreset"
+                :type="scopeTagType(selectedPreset.scope)"
+                size="small"
+                effect="plain"
+              >{{ scopeLabel(selectedPreset.scope) }}<span v-if="!selectedPresetEditable"> · read-only</span></el-tag>
             </div>
 
             <el-alert
@@ -258,6 +302,13 @@
             show-word-limit
             autofocus
           />
+        </el-form-item>
+        <el-form-item label="Scope">
+          <el-radio-group v-model="newPresetScope" size="small">
+            <el-radio-button value="private">Private</el-radio-button>
+            <el-radio-button value="team">Team</el-radio-button>
+            <el-radio-button value="global">Global</el-radio-button>
+          </el-radio-group>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -575,6 +626,7 @@
 <script setup lang="ts">
 import { ref, computed, reactive, watch, onMounted } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import api from '@/api'
 import type { PathAnalysisFeedback, PathAnalysisFeedbackVerdict } from '@/types/analysis'
 
@@ -597,6 +649,8 @@ const form = reactive({
 })
 
 // ── Preset state ──────────────────────────────────────────────────────────────
+type SharingScope = 'private' | 'team' | 'global'
+
 interface RolePreset {
   id: number
   name: string
@@ -604,6 +658,9 @@ interface RolePreset {
   load_balancer_vips: string[]
   backend_ips: string[]
   backend_subnets: string[]
+  scope: SharingScope
+  team_id: number | null
+  can_edit: boolean
 }
 
 const presets        = ref<RolePreset[]>([])
@@ -614,10 +671,13 @@ const presetDeleting = ref(false)
 const presetError    = ref('')
 const showSaveDialog = ref(false)
 const newPresetName  = ref('')
+const newPresetScope = ref<SharingScope>('private')
 
-const selectedPresetName = computed(
-  () => presets.value.find(p => p.id === selectedPresetId.value)?.name ?? ''
+const selectedPreset = computed(
+  () => presets.value.find(p => p.id === selectedPresetId.value) ?? null,
 )
+const selectedPresetName = computed(() => selectedPreset.value?.name ?? '')
+const selectedPresetEditable = computed(() => selectedPreset.value?.can_edit ?? false)
 
 async function loadPresets() {
   presetsLoading.value = true
@@ -665,12 +725,14 @@ async function saveNewPreset() {
   try {
     const res = await api.post('/path-analysis/presets', {
       name: newPresetName.value.trim(),
+      scope: newPresetScope.value,
       ...currentRoleLists(),
     })
     presets.value.unshift(res.data)
     selectedPresetId.value = res.data.id
     showSaveDialog.value   = false
     newPresetName.value    = ''
+    newPresetScope.value   = 'private'
   } catch (e: any) {
     presetError.value = e.response?.data?.detail ?? 'Failed to save preset.'
   } finally {
@@ -877,6 +939,9 @@ interface SavedQuery {
   backend_ips: string[]
   backend_subnets: string[]
   note: string | null
+  scope: SharingScope
+  team_id: number | null
+  can_edit: boolean
 }
 
 const savedQueries      = ref<SavedQuery[]>([])
@@ -884,17 +949,18 @@ const queriesLoading    = ref(false)
 const selectedQueryId   = ref<number | null>(null)
 const querySaving       = ref(false)
 const queryDeleting     = ref(false)
+const monitorCreating   = ref(false)
 const queryError        = ref('')
 const showQueryDialog   = ref(false)
 const newQueryName      = ref('')
 const newQueryNote      = ref('')
+const newQueryScope     = ref<SharingScope>('private')
 
-const selectedQueryName = computed(
-  () => savedQueries.value.find(q => q.id === selectedQueryId.value)?.name ?? ''
-)
 const selectedQuery = computed(
-  () => savedQueries.value.find(q => q.id === selectedQueryId.value) ?? null
+  () => savedQueries.value.find(q => q.id === selectedQueryId.value) ?? null,
 )
+const selectedQueryName = computed(() => selectedQuery.value?.name ?? '')
+const selectedQueryEditable = computed(() => selectedQuery.value?.can_edit ?? false)
 
 async function loadSavedQueries() {
   queriesLoading.value = true
@@ -959,8 +1025,9 @@ async function saveNewQuery() {
   queryError.value  = ''
   try {
     const res = await api.post('/path-analysis/saved-queries', {
-      name: newQueryName.value.trim(),
-      note: newQueryNote.value.trim() || null,
+      name:  newQueryName.value.trim(),
+      note:  newQueryNote.value.trim() || null,
+      scope: newQueryScope.value,
       ...currentQueryPayload(),
     })
     savedQueries.value.unshift(res.data)
@@ -968,6 +1035,7 @@ async function saveNewQuery() {
     showQueryDialog.value = false
     newQueryName.value    = ''
     newQueryNote.value    = ''
+    newQueryScope.value   = 'private'
   } catch (e: any) {
     queryError.value = e.response?.data?.detail ?? 'Failed to save query.'
   } finally {
@@ -1009,6 +1077,26 @@ async function deleteQuery() {
     queryError.value = e.response?.data?.detail ?? 'Failed to delete query.'
   } finally {
     queryDeleting.value = false
+  }
+}
+
+async function enableMonitoring() {
+  if (!selectedQueryId.value) return
+  monitorCreating.value = true
+  queryError.value = ''
+  try {
+    await api.post('/path-monitors', {
+      saved_query_id: selectedQueryId.value,
+      analysis_id:    props.analysisId,
+      schedule_interval_minutes: 60,
+    })
+    ElMessage.success(
+      `Monitoring enabled for "${selectedQueryName.value}". See the Monitoring page for status.`,
+    )
+  } catch (e: any) {
+    queryError.value = e.response?.data?.detail ?? 'Failed to create monitor.'
+  } finally {
+    monitorCreating.value = false
   }
 }
 
@@ -1134,6 +1222,20 @@ function formatDate(iso: string): string {
   } catch {
     return iso
   }
+}
+
+function scopeLabel(s: SharingScope | undefined | null): string {
+  if (s === 'team')   return 'Team'
+  if (s === 'global') return 'Global'
+  return 'Private'
+}
+
+function scopeTagType(
+  s: SharingScope | undefined | null,
+): '' | 'success' | 'warning' | 'info' {
+  if (s === 'team')   return 'success'
+  if (s === 'global') return 'warning'
+  return 'info'
 }
 </script>
 

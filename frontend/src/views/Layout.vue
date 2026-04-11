@@ -19,6 +19,10 @@
           <el-icon><HomeFilled /></el-icon>
           <span>Dashboard</span>
         </el-menu-item>
+        <el-menu-item index="/work-queue">
+          <el-icon><Files /></el-icon>
+          <span>My Work</span>
+        </el-menu-item>
         <el-menu-item index="/history">
           <el-icon><Tickets /></el-icon>
           <span>Analysis History</span>
@@ -35,6 +39,10 @@
           <el-icon><TrendCharts /></el-icon>
           <span>Calibration</span>
         </el-menu-item>
+        <el-menu-item index="/monitoring">
+          <el-icon><AlarmClock /></el-icon>
+          <span>Monitoring</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">
@@ -44,15 +52,18 @@
           </el-avatar>
           <span class="username">{{ auth.user?.username || 'User' }}</span>
         </div>
-        <el-tooltip content="Sign Out" placement="right">
-          <el-button
-            link
-            class="logout-btn"
-            @click="handleLogout"
-          >
-            <el-icon size="18"><SwitchButton /></el-icon>
-          </el-button>
-        </el-tooltip>
+        <div class="footer-actions">
+          <NotificationBell />
+          <el-tooltip content="Sign Out" placement="right">
+            <el-button
+              link
+              class="logout-btn"
+              @click="handleLogout"
+            >
+              <el-icon size="18"><SwitchButton /></el-icon>
+            </el-button>
+          </el-tooltip>
+        </div>
       </div>
     </el-aside>
 
@@ -69,6 +80,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import NotificationBell from '../components/NotificationBell.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -167,6 +179,12 @@ function handleLogout() {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 120px;
+}
+
+.footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .logout-btn {

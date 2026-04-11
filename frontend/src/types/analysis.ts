@@ -379,6 +379,20 @@ export interface FindingTriage {
   updated_at: string | null
 }
 
+// ─── Sharing scope (team workflow) ────────────────────────────────────────────
+
+export type SharingScope = 'private' | 'team' | 'global'
+
+/** Shared fields present on any team-aware object (presets, queries, notes). */
+export interface SharedObjectMeta {
+  scope: SharingScope
+  team_id: number | null
+  owner_user_id?: number | null
+  created_by?: number | null
+  updated_by?: number | null
+  can_edit: boolean
+}
+
 // ─── Path Analysis Feedback ───────────────────────────────────────────────────
 
 export type PathAnalysisFeedbackVerdict = 'correct' | 'partially_correct' | 'incorrect'
@@ -397,6 +411,21 @@ export interface PathAnalysisFeedback {
   actual_root_cause: string | null
   misleading_step: string | null
   analyst_id: number | null
+  scope: Extract<SharingScope, 'private' | 'team'>
+  team_id: number | null
+  can_edit: boolean
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface InvestigationNote extends SharedObjectMeta {
+  id: number
+  analysis_id: string
+  source_ip: string
+  destination_ip: string
+  destination_port: number | null
+  body: string
+  scope: Extract<SharingScope, 'private' | 'team'>
   created_at: string | null
   updated_at: string | null
 }
@@ -415,6 +444,100 @@ export interface PathAnalysisFeedbackSummary {
   weak_narratives: PathAnalysisFeedback[]
 }
 
+// ─── Investigation workflow ──────────────────────────────────────────────────
+
+export type WorkflowState =
+  | 'new'
+  | 'in_progress'
+  | 'needs_review'
+  | 'resolved'
+  | 'dismissed'
+
+export interface WorkflowResponse {
+  analysis_id: string
+  workflow_state: WorkflowState
+  assigned_user_id: number | null
+  assignee_username: string | null
+  workflow_updated_at: string | null
+  workflow_updated_by: number | null
+  owner_user_id: number
+  can_edit_state: boolean
+  can_assign: boolean
+}
+
+export interface UserPickerEntry {
+  id: number
+  username: string
+  team_id: number | null
+  is_admin: boolean
+}
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+export type NotificationType =
+  | 'assignment'
+  | 'review_required'
+  | 'resolved'
+  | 'feedback_alert'
+  | 'mention'
+
+export interface NotificationItem {
+  id: number
+  type: NotificationType
+  analysis_id: string | null
+  analysis_filename: string | null
+  actor_user_id: number | null
+  actor_username: string | null
+  message: string
+  read_at: string | null
+  created_at: string | null
+}
+
+// ─── Work queue ──────────────────────────────────────────────────────────────
+
+export type WorkQueueSectionKey =
+  | 'needs_review'
+  | 'recent_feedback_alerts'
+  | 'assigned_to_me'
+  | 'new_analyses'
+  | 'unresolved_owned'
+  | 'recent_resolved'
+
+export interface WorkQueueItem {
+  analysis_id: string
+  filename: string
+  status: string
+  workflow_state: WorkflowState
+  owner_user_id: number
+  owner_username: string | null
+  assigned_user_id: number | null
+  assignee_username: string | null
+  issue_count: number | null
+  critical_count: number | null
+  workflow_updated_at: string | null
+  created_at: string | null
+  primary_impairment: string | null
+  path_confidence_score: number | null
+  latest_feedback_verdict: string | null
+  latest_feedback_at: string | null
+  latest_notification_type: NotificationType | null
+  latest_notification_at: string | null
+}
+
+export interface WorkQueueSection {
+  key: WorkQueueSectionKey
+  label: string
+  priority: number
+  count: number
+  items: WorkQueueItem[]
+}
+
+export interface WorkQueueResponse {
+  sections: WorkQueueSection[]
+  total_open: number
+  counts: Record<WorkQueueSectionKey, number>
+}
+
 export interface AnalysisSummary {
   id: string
   filename: string
@@ -428,4 +551,10 @@ export interface AnalysisSummary {
   started_at: string | null
   finished_at: string | null
   error: string | null
+  // Investigation workflow fields (present on all list + detail responses)
+  workflow_state?: WorkflowState | null
+  assigned_user_id?: number | null
+  assignee_username?: string | null
+  workflow_updated_at?: string | null
+  owner_user_id?: number | null
 }

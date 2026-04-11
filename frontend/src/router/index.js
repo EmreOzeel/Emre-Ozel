@@ -18,6 +18,11 @@ const routes = [
         component: () => import('../views/Dashboard.vue'),
       },
       {
+        path: 'work-queue',
+        name: 'WorkQueue',
+        component: () => import('../views/WorkQueue.vue'),
+      },
+      {
         path: 'analysis/:id',
         name: 'AnalysisDetail',
         component: () => import('../views/analysis/AnalysisDetail.vue'),
@@ -41,6 +46,11 @@ const routes = [
         path: 'calibration',
         name: 'Calibration',
         component: () => import('../views/CalibrationView.vue'),
+      },
+      {
+        path: 'monitoring',
+        name: 'Monitoring',
+        component: () => import('../views/Monitoring.vue'),
       },
     ]
   },

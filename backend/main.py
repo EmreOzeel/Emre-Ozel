@@ -7,11 +7,12 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from auth import create_token, get_current_user, seed_admin, verify_password
@@ -19,17 +20,32 @@ from config import settings
 from database import (
     AnalysisModel,
     FindingTriageModel,
+    InvestigationNoteModel,
+    MonitoredPathModel,
+    NotificationModel,
     PathAnalysisCacheModel,
     PathAnalysisFeedbackModel,
     PathAnalysisRolePresetModel,
     PathAnalysisSavedQueryModel,
     SuppressionRuleModel,
+    TeamModel,
     TelemetryEventModel,
     UserModel,
     get_db,
     init_db,
 )
+from monitoring import detect_drift, is_due
 from jobs.queue import enqueue, start_worker, stop_worker
+from sharing import (
+    VALID_SCOPES,
+    can_edit as sharing_can_edit,
+    check_can_create,
+    enforce_edit,
+    enforce_view,
+    resolve_team_id,
+    validate_scope,
+    visible_filter,
+)
 from telemetry import track
 
 # ── PCAP magic bytes ──────────────────────────────────────────────────────────
@@ -84,6 +100,19 @@ class MeResponse(BaseModel):
     is_admin: bool
 
 
+# ── Investigation workflow ────────────────────────────────────────────────────
+# Valid workflow states for an analysis (the "investigation" lifecycle).
+# This is orthogonal to AnalysisModel.status, which tracks engine processing.
+VALID_WORKFLOW_STATES = (
+    "new",
+    "in_progress",
+    "needs_review",
+    "resolved",
+    "dismissed",
+)
+_WORKFLOW_PATTERN = "^(new|in_progress|needs_review|resolved|dismissed)$"
+
+
 class AnalysisSummary(BaseModel):
     id: str
     filename: str
@@ -97,6 +126,12 @@ class AnalysisSummary(BaseModel):
     started_at: Optional[str]
     finished_at: Optional[str]
     error: Optional[str]
+    # Investigation workflow fields
+    workflow_state: Optional[str] = None
+    assigned_user_id: Optional[int] = None
+    assignee_username: Optional[str] = None
+    workflow_updated_at: Optional[str] = None
+    owner_user_id: Optional[int] = None
 
 
 class AnalysisStatusResponse(BaseModel):
@@ -166,6 +201,109 @@ class SuppressionCreate(BaseModel):
 class TriageUpdate(BaseModel):
     status: str = Field(pattern="^(new|acknowledged|in_progress|resolved|false_positive)$")
     note: Optional[str] = None
+
+
+class WorkflowStateUpdate(BaseModel):
+    state: str = Field(pattern=_WORKFLOW_PATTERN)
+
+
+class WorkflowAssigneeUpdate(BaseModel):
+    user_id: Optional[int] = None
+
+
+class WorkflowResponse(BaseModel):
+    analysis_id: str
+    workflow_state: str
+    assigned_user_id: Optional[int]
+    assignee_username: Optional[str]
+    workflow_updated_at: Optional[str]
+    workflow_updated_by: Optional[int]
+    owner_user_id: int
+    can_edit_state: bool
+    can_assign: bool
+
+
+class UserPickerEntry(BaseModel):
+    id: int
+    username: str
+    team_id: Optional[int] = None
+    is_admin: bool = False
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+VALID_NOTIFICATION_TYPES = (
+    "assignment",
+    "review_required",
+    "resolved",
+    "feedback_alert",
+    "mention",
+    "drift_detected",
+)
+
+
+class NotificationResponse(BaseModel):
+    id: int
+    type: str
+    analysis_id: Optional[str]
+    analysis_filename: Optional[str]
+    actor_user_id: Optional[int]
+    actor_username: Optional[str]
+    message: str
+    read_at: Optional[str]
+    created_at: Optional[str]
+
+
+class NotificationUnreadCount(BaseModel):
+    unread: int
+
+
+class NotificationMarkReadRequest(BaseModel):
+    ids: Optional[List[int]] = None
+    all: bool = False
+
+
+class NotificationMarkReadResponse(BaseModel):
+    marked: int
+
+
+# ── Work queue ────────────────────────────────────────────────────────────────
+
+class WorkQueueItem(BaseModel):
+    analysis_id: str
+    filename: str
+    status: str                         # engine processing status
+    workflow_state: str
+    owner_user_id: int
+    owner_username: Optional[str] = None
+    assigned_user_id: Optional[int] = None
+    assignee_username: Optional[str] = None
+    issue_count: Optional[int] = None
+    critical_count: Optional[int] = None
+    workflow_updated_at: Optional[str] = None
+    created_at: Optional[str] = None
+    # Latest path-analysis feedback enrichment (if any)
+    primary_impairment: Optional[str] = None
+    path_confidence_score: Optional[int] = None
+    latest_feedback_verdict: Optional[str] = None
+    latest_feedback_at: Optional[str] = None
+    # Latest notification relating to this analysis for the current user
+    latest_notification_type: Optional[str] = None
+    latest_notification_at: Optional[str] = None
+
+
+class WorkQueueSection(BaseModel):
+    key: str
+    label: str
+    priority: int
+    count: int
+    items: List[WorkQueueItem]
+
+
+class WorkQueueResponse(BaseModel):
+    sections: List[WorkQueueSection]
+    total_open: int
+    counts: Dict[str, int]
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -265,16 +403,35 @@ def list_analyses(
     current_user: UserModel = Depends(get_current_user),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
+    assigned_to_me: bool = Query(
+        False,
+        description="If true, also include analyses assigned to the current user.",
+    ),
+    workflow_state: Optional[str] = Query(
+        None, description="Filter by investigation workflow state."
+    ),
 ):
+    q = db.query(AnalysisModel)
+    if assigned_to_me:
+        q = q.filter(
+            or_(
+                AnalysisModel.user_id == current_user.id,
+                AnalysisModel.assigned_user_id == current_user.id,
+            )
+        )
+    else:
+        q = q.filter(AnalysisModel.user_id == current_user.id)
+    if workflow_state:
+        if workflow_state not in VALID_WORKFLOW_STATES:
+            raise HTTPException(400, f"Invalid workflow_state: {workflow_state}")
+        q = q.filter(AnalysisModel.workflow_state == workflow_state)
     rows = (
-        db.query(AnalysisModel)
-        .filter(AnalysisModel.user_id == current_user.id)
-        .order_by(AnalysisModel.created_at.desc())
+        q.order_by(AnalysisModel.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
-    return [_summary(r) for r in rows]
+    return [_summary(r, db) for r in rows]
 
 
 @app.get("/api/analyses/{analysis_id}")
@@ -283,8 +440,8 @@ def get_analysis(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    row = _get_or_404(db, analysis_id, current_user.id)
-    result = _summary(row)
+    row = _get_analysis_for_workflow(db, analysis_id, current_user)
+    result = _summary(row, db)
     if row.result_json:
         try:
             result["data"] = json.loads(row.result_json)
@@ -300,7 +457,7 @@ def get_status(
     current_user: UserModel = Depends(get_current_user),
 ):
     """Lightweight polling endpoint — returns progress without full result payload."""
-    row = _get_or_404(db, analysis_id, current_user.id)
+    row = _get_analysis_for_workflow(db, analysis_id, current_user)
     return {
         "id": row.id,
         "status": row.status,
@@ -315,6 +472,516 @@ def get_status(
     }
 
 
+# ── Investigation workflow ────────────────────────────────────────────────────
+
+@app.get(
+    "/api/analyses/{analysis_id}/workflow",
+    response_model=WorkflowResponse,
+)
+def get_workflow(
+    analysis_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return investigation workflow metadata (state, assignee, permissions)."""
+    row = _get_analysis_for_workflow(db, analysis_id, current_user)
+    return _workflow_dict(row, current_user, db)
+
+
+@app.put(
+    "/api/analyses/{analysis_id}/workflow/state",
+    response_model=WorkflowResponse,
+)
+def update_workflow_state(
+    analysis_id: str,
+    req: WorkflowStateUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Transition the investigation state.
+
+    Permitted for the owner, the current assignee, or any admin.
+    """
+    row = _get_analysis_for_workflow(db, analysis_id, current_user)
+    is_owner = row.user_id == current_user.id
+    is_assignee = (
+        row.assigned_user_id is not None
+        and row.assigned_user_id == current_user.id
+    )
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    if not (is_owner or is_assignee or is_admin):
+        raise HTTPException(403, "Not allowed to change workflow state")
+    prev_state = row.workflow_state or "new"
+    row.workflow_state = req.state
+    row.workflow_updated_at = datetime.utcnow()
+    row.workflow_updated_by = current_user.id
+
+    # ── Notification triggers ────────────────────────────────────────────────
+    if req.state != prev_state:
+        _emit_state_change_notifications(
+            db,
+            row=row,
+            state=req.state,
+            actor_user_id=current_user.id,
+        )
+
+    db.commit()
+    db.refresh(row)
+    track(
+        "workflow.state_changed",
+        user_id=current_user.id,
+        properties={"analysis_id": analysis_id, "state": req.state},
+    )
+    return _workflow_dict(row, current_user, db)
+
+
+@app.put(
+    "/api/analyses/{analysis_id}/workflow/assignee",
+    response_model=WorkflowResponse,
+)
+def update_workflow_assignee(
+    analysis_id: str,
+    req: WorkflowAssigneeUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Assign or unassign an analyst for this investigation.
+
+    Only the owner or an admin may reassign.  The assignee must be an
+    existing user; passing ``user_id=null`` clears the assignment.
+    """
+    row = _get_analysis_for_workflow(db, analysis_id, current_user)
+    is_owner = row.user_id == current_user.id
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    if not (is_owner or is_admin):
+        raise HTTPException(403, "Only the owner or an admin may reassign")
+    if req.user_id is not None:
+        target = db.query(UserModel).filter(UserModel.id == req.user_id).first()
+        if not target:
+            raise HTTPException(404, "Assignee user not found")
+    prev_assignee = row.assigned_user_id
+    row.assigned_user_id = req.user_id
+    row.workflow_updated_at = datetime.utcnow()
+    row.workflow_updated_by = current_user.id
+
+    # ── Notification trigger: notify the new assignee ────────────────────────
+    if req.user_id is not None and req.user_id != prev_assignee:
+        _notify(
+            db,
+            user_id=req.user_id,
+            type="assignment",
+            analysis_id=analysis_id,
+            message=f"You were assigned to investigate “{row.filename}”.",
+            actor_user_id=current_user.id,
+        )
+
+    db.commit()
+    db.refresh(row)
+    track(
+        "workflow.assignee_changed",
+        user_id=current_user.id,
+        properties={"analysis_id": analysis_id, "assignee_id": req.user_id},
+    )
+    return _workflow_dict(row, current_user, db)
+
+
+@app.get("/api/users", response_model=List[UserPickerEntry])
+def list_users_for_picker(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return a minimal user list suitable for an assignee picker.
+
+    - Admins see every user.
+    - Non-admins see themselves and every user in the same team (if any).
+    """
+    q = db.query(UserModel)
+    if not getattr(current_user, "is_admin", False):
+        team_id = getattr(current_user, "team_id", None)
+        if team_id is not None:
+            q = q.filter(
+                or_(
+                    UserModel.id == current_user.id,
+                    UserModel.team_id == team_id,
+                )
+            )
+        else:
+            q = q.filter(UserModel.id == current_user.id)
+    rows = q.order_by(UserModel.username).all()
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "team_id": u.team_id,
+            "is_admin": bool(u.is_admin),
+        }
+        for u in rows
+    ]
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+@app.get("/api/notifications", response_model=List[NotificationResponse])
+def list_notifications(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    unread_only: bool = Query(False),
+):
+    """List the current user's notifications, newest first."""
+    q = db.query(NotificationModel).filter(
+        NotificationModel.user_id == current_user.id
+    )
+    if unread_only:
+        q = q.filter(NotificationModel.read_at.is_(None))
+    rows = (
+        q.order_by(
+            NotificationModel.created_at.desc(),
+            NotificationModel.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    filename_cache: dict = {}
+    username_cache: dict = {}
+    return [
+        _notification_dict(r, filename_cache, username_cache, db) for r in rows
+    ]
+
+
+@app.get(
+    "/api/notifications/unread-count",
+    response_model=NotificationUnreadCount,
+)
+def notification_unread_count(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    count = (
+        db.query(NotificationModel)
+        .filter(
+            NotificationModel.user_id == current_user.id,
+            NotificationModel.read_at.is_(None),
+        )
+        .count()
+    )
+    return {"unread": count}
+
+
+@app.post(
+    "/api/notifications/mark-read",
+    response_model=NotificationMarkReadResponse,
+)
+def mark_notifications_read(
+    req: NotificationMarkReadRequest,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Mark some (or all) of the current user's notifications as read.
+
+    Either pass ``ids=[...]`` to mark specific notifications, or
+    ``all=true`` to mark every unread notification for the caller.
+    Notifications belonging to other users are silently ignored.
+    """
+    if not req.all and not req.ids:
+        raise HTTPException(400, "Either 'ids' or 'all=true' must be provided")
+    now = datetime.utcnow()
+    q = db.query(NotificationModel).filter(
+        NotificationModel.user_id == current_user.id,
+        NotificationModel.read_at.is_(None),
+    )
+    if not req.all:
+        q = q.filter(NotificationModel.id.in_(req.ids or []))
+    rows = q.all()
+    for r in rows:
+        r.read_at = now
+    db.commit()
+    return {"marked": len(rows)}
+
+
+# ── Work queue ────────────────────────────────────────────────────────────────
+
+@app.get("/api/work-queue", response_model=WorkQueueResponse)
+def get_work_queue(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    recent_resolved_limit: int = Query(10, ge=1, le=50),
+    recent_feedback_limit: int = Query(10, ge=1, le=50),
+):
+    """
+    Return the operator work queue for the current user.
+
+    The queue is grouped into ordered sections (highest priority first):
+
+        1. ``needs_review``          — owned or assigned analyses in the
+                                       ``needs_review`` state.
+        2. ``recent_feedback_alerts`` — recent ``incorrect`` analyst verdicts
+                                       on visible analyses.
+        3. ``assigned_to_me``        — actionable analyses assigned to me
+                                       (excludes needs_review/resolved/dismissed).
+        4. ``new_analyses``          — owned, workflow_state == ``new``.
+        5. ``unresolved_owned``      — owned, workflow_state == ``in_progress``.
+        6. ``recent_resolved``       — visible resolved/dismissed analyses
+                                       (last N, purely informational).
+
+    Sections are disjoint: an analysis appearing in an earlier section is
+    excluded from every later one to keep the dashboard unambiguous.
+    Only analyses whose engine ``status == 'completed'`` are returned — items
+    that are still pending/running or have failed processing do not belong on
+    the operational queue.
+    """
+    uid = current_user.id
+
+    # ── Base: all completed, visible analyses for this user ──────────────────
+    visible_clause = or_(
+        AnalysisModel.user_id == uid,
+        AnalysisModel.assigned_user_id == uid,
+    )
+    visible_rows = (
+        db.query(AnalysisModel)
+        .filter(
+            AnalysisModel.status == "completed",
+            visible_clause,
+        )
+        .order_by(
+            AnalysisModel.workflow_updated_at.desc().nullslast(),
+            AnalysisModel.id.desc(),
+        )
+        .all()
+    )
+
+    visible_by_id: Dict[str, AnalysisModel] = {r.id: r for r in visible_rows}
+    visible_ids = list(visible_by_id.keys())
+
+    # ── Batch-fetch usernames used across all item rows ──────────────────────
+    user_ids: set = set()
+    for r in visible_rows:
+        if r.user_id is not None:
+            user_ids.add(r.user_id)
+        if r.assigned_user_id is not None:
+            user_ids.add(r.assigned_user_id)
+    username_map: Dict[int, str] = {}
+    if user_ids:
+        for u in (
+            db.query(UserModel.id, UserModel.username)
+            .filter(UserModel.id.in_(user_ids))
+            .all()
+        ):
+            username_map[u.id] = u.username
+
+    # ── Batch-fetch latest path-feedback per visible analysis ────────────────
+    # Used both to enrich items (primary_impairment, path_confidence_score)
+    # and to build the feedback-alerts section.
+    latest_fb_by_analysis: Dict[str, PathAnalysisFeedbackModel] = {}
+    all_feedback: List[PathAnalysisFeedbackModel] = []
+    if visible_ids:
+        all_feedback = (
+            db.query(PathAnalysisFeedbackModel)
+            .filter(PathAnalysisFeedbackModel.analysis_id.in_(visible_ids))
+            .order_by(
+                PathAnalysisFeedbackModel.updated_at.desc().nullslast(),
+                PathAnalysisFeedbackModel.id.desc(),
+            )
+            .all()
+        )
+        for fb in all_feedback:
+            # First occurrence wins — already sorted newest-first.
+            if fb.analysis_id not in latest_fb_by_analysis:
+                latest_fb_by_analysis[fb.analysis_id] = fb
+
+    # ── Batch-fetch latest notification per analysis for this user ──────────
+    latest_notif_by_analysis: Dict[str, NotificationModel] = {}
+    if visible_ids:
+        notif_rows = (
+            db.query(NotificationModel)
+            .filter(
+                NotificationModel.user_id == uid,
+                NotificationModel.analysis_id.in_(visible_ids),
+            )
+            .order_by(
+                NotificationModel.created_at.desc(),
+                NotificationModel.id.desc(),
+            )
+            .all()
+        )
+        for n in notif_rows:
+            if n.analysis_id not in latest_notif_by_analysis:
+                latest_notif_by_analysis[n.analysis_id] = n
+
+    def _iso(dt) -> Optional[str]:
+        return dt.isoformat() if dt is not None else None
+
+    def _build_item(row: AnalysisModel) -> WorkQueueItem:
+        fb = latest_fb_by_analysis.get(row.id)
+        notif = latest_notif_by_analysis.get(row.id)
+        return WorkQueueItem(
+            analysis_id=row.id,
+            filename=row.filename,
+            status=row.status,
+            workflow_state=row.workflow_state or "new",
+            owner_user_id=row.user_id,
+            owner_username=username_map.get(row.user_id),
+            assigned_user_id=row.assigned_user_id,
+            assignee_username=(
+                username_map.get(row.assigned_user_id)
+                if row.assigned_user_id is not None
+                else None
+            ),
+            issue_count=row.issue_count,
+            critical_count=row.critical_count,
+            workflow_updated_at=_iso(row.workflow_updated_at),
+            created_at=_iso(row.created_at),
+            primary_impairment=(fb.predicted_impairment if fb else None),
+            path_confidence_score=(fb.predicted_confidence if fb else None),
+            latest_feedback_verdict=(fb.verdict if fb else None),
+            latest_feedback_at=_iso(fb.updated_at) if fb else None,
+            latest_notification_type=(notif.type if notif else None),
+            latest_notification_at=_iso(notif.created_at) if notif else None,
+        )
+
+    # ── Build sections (disjoint by priority order) ──────────────────────────
+    assigned_ids: set = set()   # tracks ids already claimed by a higher section
+
+    # 1) needs_review
+    needs_review_items: List[WorkQueueItem] = []
+    for r in visible_rows:
+        if r.workflow_state == "needs_review":
+            needs_review_items.append(_build_item(r))
+            assigned_ids.add(r.id)
+
+    # 2) recent_feedback_alerts — incorrect verdicts on visible analyses,
+    # newest first, limited.  These items use the feedback row's timestamp
+    # (not the analysis' workflow_updated_at) to reflect when the alert fired.
+    feedback_alert_items: List[WorkQueueItem] = []
+    for fb in all_feedback:
+        if fb.verdict != "incorrect":
+            continue
+        row = visible_by_id.get(fb.analysis_id)
+        if row is None:
+            continue
+        if fb.analysis_id in assigned_ids:
+            continue
+        item = _build_item(row)
+        # Override latest_feedback_* with this specific alert
+        item.latest_feedback_verdict = fb.verdict
+        item.latest_feedback_at = _iso(fb.updated_at)
+        feedback_alert_items.append(item)
+        assigned_ids.add(fb.analysis_id)
+        if len(feedback_alert_items) >= recent_feedback_limit:
+            break
+
+    # 3) assigned_to_me — assigned to me, not in needs_review/resolved/dismissed,
+    # excluding items already captured above.
+    assigned_to_me_items: List[WorkQueueItem] = []
+    _excluded_assigned_states = {"needs_review", "resolved", "dismissed"}
+    for r in visible_rows:
+        if r.id in assigned_ids:
+            continue
+        if r.assigned_user_id != uid:
+            continue
+        if (r.workflow_state or "new") in _excluded_assigned_states:
+            continue
+        assigned_to_me_items.append(_build_item(r))
+        assigned_ids.add(r.id)
+
+    # 4) new_analyses — I own it and it is still in the `new` bucket.
+    new_items: List[WorkQueueItem] = []
+    for r in visible_rows:
+        if r.id in assigned_ids:
+            continue
+        if r.user_id != uid:
+            continue
+        if (r.workflow_state or "new") != "new":
+            continue
+        new_items.append(_build_item(r))
+        assigned_ids.add(r.id)
+
+    # 5) unresolved_owned — I own it and I'm actively working it.
+    unresolved_items: List[WorkQueueItem] = []
+    for r in visible_rows:
+        if r.id in assigned_ids:
+            continue
+        if r.user_id != uid:
+            continue
+        if r.workflow_state != "in_progress":
+            continue
+        unresolved_items.append(_build_item(r))
+        assigned_ids.add(r.id)
+
+    # 6) recent_resolved — informational tail.  We intentionally do NOT move
+    # these into `assigned_ids` (already at the bottom anyway).
+    recent_resolved_items: List[WorkQueueItem] = []
+    for r in visible_rows:
+        if (r.workflow_state or "new") not in ("resolved", "dismissed"):
+            continue
+        recent_resolved_items.append(_build_item(r))
+        if len(recent_resolved_items) >= recent_resolved_limit:
+            break
+
+    sections = [
+        WorkQueueSection(
+            key="needs_review",
+            label="Needs review",
+            priority=1,
+            count=len(needs_review_items),
+            items=needs_review_items,
+        ),
+        WorkQueueSection(
+            key="recent_feedback_alerts",
+            label="Feedback alerts",
+            priority=2,
+            count=len(feedback_alert_items),
+            items=feedback_alert_items,
+        ),
+        WorkQueueSection(
+            key="assigned_to_me",
+            label="Assigned to me",
+            priority=3,
+            count=len(assigned_to_me_items),
+            items=assigned_to_me_items,
+        ),
+        WorkQueueSection(
+            key="new_analyses",
+            label="New",
+            priority=4,
+            count=len(new_items),
+            items=new_items,
+        ),
+        WorkQueueSection(
+            key="unresolved_owned",
+            label="In progress",
+            priority=5,
+            count=len(unresolved_items),
+            items=unresolved_items,
+        ),
+        WorkQueueSection(
+            key="recent_resolved",
+            label="Recently resolved",
+            priority=6,
+            count=len(recent_resolved_items),
+            items=recent_resolved_items,
+        ),
+    ]
+
+    # "Open" excludes the informational `recent_resolved` tail.
+    total_open = (
+        len(needs_review_items)
+        + len(feedback_alert_items)
+        + len(assigned_to_me_items)
+        + len(new_items)
+        + len(unresolved_items)
+    )
+    counts = {s.key: s.count for s in sections}
+
+    return WorkQueueResponse(
+        sections=sections,
+        total_open=total_open,
+        counts=counts,
+    )
+
+
 @app.delete("/api/analyses/{analysis_id}", status_code=204)
 def delete_analysis(
     analysis_id: str,
@@ -327,9 +994,18 @@ def delete_analysis(
             Path(row.file_path).unlink()
         except OSError:
             pass
-    # Cascade: triage records
+    # Cascade: triage records, notifications, monitors, path-analysis cache
     db.query(FindingTriageModel).filter(
         FindingTriageModel.analysis_id == analysis_id
+    ).delete()
+    db.query(NotificationModel).filter(
+        NotificationModel.analysis_id == analysis_id
+    ).delete()
+    db.query(MonitoredPathModel).filter(
+        MonitoredPathModel.analysis_id == analysis_id
+    ).delete()
+    db.query(PathAnalysisCacheModel).filter(
+        PathAnalysisCacheModel.analysis_id == analysis_id
     ).delete()
     db.delete(row)
     db.commit()
@@ -889,12 +1565,14 @@ class PathExportRequest(BaseModel):
 
 def _build_export_package(
     req: PathExportRequest,
-    user_id: int,
+    current_user: UserModel,
     db: Session,
 ) -> dict:
     """Shared logic for JSON and HTML export endpoints."""
     from core.causal_path import CACHE_ENGINE_VERSION
     from reporting.investigation_package import build_package
+
+    user_id = current_user.id
 
     # ── Path analysis result ──────────────────────────────────────────────────
     path_result = _load_or_run_path_result(
@@ -930,14 +1608,14 @@ def _build_export_package(
         )
         .first()
     )
-    analyst_feedback = _feedback_dict(feedback_row) if feedback_row else None
+    analyst_feedback = _feedback_dict(feedback_row, current_user) if feedback_row else None
 
     # ── Saved query metadata (optional, informational only) ───────────────────
     saved_query_meta: Optional[dict] = None
     if req.saved_query_id:
         sq = db.query(PathAnalysisSavedQueryModel).filter(
             PathAnalysisSavedQueryModel.id == req.saved_query_id,
-            PathAnalysisSavedQueryModel.owner_user_id == user_id,
+            visible_filter(PathAnalysisSavedQueryModel, current_user),
         ).first()
         if sq:
             saved_query_meta = {"id": sq.id, "name": sq.name, "note": sq.note}
@@ -964,7 +1642,7 @@ def export_investigation_json(
     """Export a structured investigation package as a JSON download."""
     from fastapi.responses import Response
 
-    package = _build_export_package(req, current_user.id, db)
+    package = _build_export_package(req, current_user, db)
     ep = f"{req.source_ip}_{req.destination_ip}"
     if req.destination_port:
         ep += f"_{req.destination_port}"
@@ -988,7 +1666,7 @@ def export_investigation_html(
     from fastapi.responses import Response
     from reporting.investigation_package import render_html
 
-    package = _build_export_package(req, current_user.id, db)
+    package = _build_export_package(req, current_user, db)
     ep = f"{req.source_ip}_{req.destination_ip}"
     if req.destination_port:
         ep += f"_{req.destination_port}"
@@ -1017,6 +1695,8 @@ class PathAnalysisFeedbackCreate(BaseModel):
     analyst_note: Optional[str] = None
     actual_root_cause: Optional[str] = None
     misleading_step: Optional[str] = None
+    # Visibility scope: only "private" or "team" are meaningful for feedback.
+    scope: str = Field(default="private", pattern="^(private|team)$")
 
 
 class PathAnalysisFeedbackResponse(BaseModel):
@@ -1033,6 +1713,9 @@ class PathAnalysisFeedbackResponse(BaseModel):
     actual_root_cause: Optional[str]
     misleading_step: Optional[str]
     analyst_id: Optional[int]
+    scope: str
+    team_id: Optional[int]
+    can_edit: bool
     created_at: Optional[str]
     updated_at: Optional[str]
 
@@ -1052,8 +1735,19 @@ def upsert_path_feedback(
 
     Re-submitting the same source_ip / destination_ip / destination_port
     combination updates the existing record rather than creating a duplicate.
+
+    A successful verdict also advances the investigation workflow state when
+    it is still in ``new`` or ``in_progress``:
+    - ``incorrect``                → ``needs_review``
+    - ``correct`` / ``partially_correct`` → ``resolved``
     """
-    _get_or_404(db, analysis_id, current_user.id)
+    analysis_row = _get_analysis_for_workflow(db, analysis_id, current_user)
+
+    # "team" scope requires that the analyst actually belongs to a team
+    if req.scope == "team" and not getattr(current_user, "team_id", None):
+        raise HTTPException(
+            403, "User must belong to a team to publish team-scoped feedback"
+        )
 
     existing = (
         db.query(PathAnalysisFeedbackModel)
@@ -1075,6 +1769,10 @@ def upsert_path_feedback(
         existing.analyst_note         = req.analyst_note
         existing.actual_root_cause    = req.actual_root_cause
         existing.misleading_step      = req.misleading_step
+        existing.scope                = req.scope
+        existing.team_id              = (
+            current_user.team_id if req.scope == "team" else None
+        )
         row = existing
     else:
         row = PathAnalysisFeedbackModel(
@@ -1090,8 +1788,64 @@ def upsert_path_feedback(
             actual_root_cause=req.actual_root_cause,
             misleading_step=req.misleading_step,
             analyst_id=current_user.id,
+            scope=req.scope,
+            team_id=(current_user.team_id if req.scope == "team" else None),
         )
         db.add(row)
+
+    # ── Auto-transition workflow based on verdict ────────────────────────────
+    # Only move "open" states (new / in_progress); never override a deliberate
+    # resolved / dismissed / needs_review set by an analyst.
+    workflow_auto_state: Optional[str] = None
+    if (analysis_row.workflow_state or "new") in ("new", "in_progress"):
+        if req.verdict == "incorrect":
+            workflow_auto_state = "needs_review"
+        elif req.verdict in ("correct", "partially_correct"):
+            workflow_auto_state = "resolved"
+    if workflow_auto_state is not None:
+        analysis_row.workflow_state = workflow_auto_state
+        analysis_row.workflow_updated_at = datetime.utcnow()
+        analysis_row.workflow_updated_by = current_user.id
+
+    # ── Notification triggers ────────────────────────────────────────────────
+    # 1. feedback_alert — incorrect verdict is a critical signal; alert the
+    #    analysis owner AND the current assignee (if distinct from the actor).
+    if req.verdict == "incorrect":
+        _notify(
+            db,
+            user_id=analysis_row.user_id,
+            type="feedback_alert",
+            analysis_id=analysis_id,
+            message=(
+                f"Feedback marked INCORRECT on “{analysis_row.filename}”. "
+                "The engine result may need review."
+            ),
+            actor_user_id=current_user.id,
+        )
+        if (
+            analysis_row.assigned_user_id is not None
+            and analysis_row.assigned_user_id != analysis_row.user_id
+        ):
+            _notify(
+                db,
+                user_id=analysis_row.assigned_user_id,
+                type="feedback_alert",
+                analysis_id=analysis_id,
+                message=(
+                    f"Feedback marked INCORRECT on “{analysis_row.filename}”. "
+                    "The engine result may need review."
+                ),
+                actor_user_id=current_user.id,
+            )
+
+    # 2. State-change notifications from the auto-transition
+    if workflow_auto_state is not None:
+        _emit_state_change_notifications(
+            db,
+            row=analysis_row,
+            state=workflow_auto_state,
+            actor_user_id=current_user.id,
+        )
 
     db.commit()
     db.refresh(row)
@@ -1099,7 +1853,17 @@ def upsert_path_feedback(
         "analysis_id": analysis_id,
         "verdict": req.verdict,
     })
-    return _feedback_dict(row)
+    if workflow_auto_state is not None:
+        track(
+            "workflow.state_changed",
+            user_id=current_user.id,
+            properties={
+                "analysis_id": analysis_id,
+                "state": workflow_auto_state,
+                "trigger": "feedback",
+            },
+        )
+    return _feedback_dict(row, current_user)
 
 
 @app.get(
@@ -1111,18 +1875,33 @@ def list_path_feedback(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Return all path analysis feedback records for this analysis (current user only)."""
+    """Return all path-analysis feedback records visible to the current user.
+
+    Includes the user's own records plus any team-scoped feedback authored by
+    other members of the same team.  Team feedback authored by others is
+    returned read-only (``can_edit: false``).
+    """
     _get_or_404(db, analysis_id, current_user.id)
+
+    # Own private feedback + any team feedback from the analyst's team
+    own_clause = PathAnalysisFeedbackModel.analyst_id == current_user.id
+    clauses = [own_clause]
+    if getattr(current_user, "team_id", None) is not None:
+        clauses.append(
+            (PathAnalysisFeedbackModel.scope == "team")
+            & (PathAnalysisFeedbackModel.team_id == current_user.team_id)
+        )
+    from sqlalchemy import or_ as _or
     rows = (
         db.query(PathAnalysisFeedbackModel)
         .filter(
             PathAnalysisFeedbackModel.analysis_id == analysis_id,
-            PathAnalysisFeedbackModel.analyst_id  == current_user.id,
+            _or(*clauses),
         )
         .order_by(PathAnalysisFeedbackModel.created_at.desc())
         .all()
     )
-    return [_feedback_dict(r) for r in rows]
+    return [_feedback_dict(r, current_user) for r in rows]
 
 
 @app.get("/api/path-analysis/feedback/summary")
@@ -1167,13 +1946,13 @@ def path_feedback_summary(
     accuracy_rate = round(correct_total / len(rows), 3) if rows else None
 
     overconfident = [
-        _feedback_dict(r)
+        _feedback_dict(r, current_user)
         for r in rows
         if r.predicted_confidence >= 75 and r.verdict == "incorrect"
     ]
 
     weak_narratives = [
-        _feedback_dict(r)
+        _feedback_dict(r, current_user)
         for r in rows
         if r.misleading_step and r.verdict in ("partially_correct", "incorrect")
     ]
@@ -1296,13 +2075,13 @@ def path_feedback_calibration(
     # ── overconfident / underconfident ─────────────────────────────────────────
 
     overconfident = [
-        _feedback_dict(r)
+        _feedback_dict(r, current_user)
         for r in rows
         if r.predicted_confidence >= 75 and r.verdict == "incorrect"
     ]
 
     underconfident = [
-        _feedback_dict(r)
+        _feedback_dict(r, current_user)
         for r in rows
         if r.predicted_confidence <= 50 and r.verdict == "correct"
     ]
@@ -1357,6 +2136,210 @@ def path_feedback_calibration(
         "misleading_steps": misleading_steps,
         "root_cause_mismatches": root_cause_mismatches,
     }
+
+
+# ── Investigation Notes (team-visible collaboration) ─────────────────────────
+
+class InvestigationNoteCreate(BaseModel):
+    source_ip:        str           = Field(min_length=1)
+    destination_ip:   str           = Field(min_length=1)
+    destination_port: Optional[int] = None
+    body:             str           = Field(min_length=1)
+    scope:            str           = Field(default="private", pattern="^(private|team)$")
+
+
+class InvestigationNoteUpdate(BaseModel):
+    body:  Optional[str] = Field(default=None, min_length=1)
+    scope: Optional[str] = Field(default=None, pattern="^(private|team)$")
+
+
+def _note_to_dict(n: InvestigationNoteModel, current_user: UserModel) -> dict:
+    own = n.created_by == current_user.id
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    return {
+        "id":               n.id,
+        "analysis_id":      n.analysis_id,
+        "source_ip":        n.source_ip,
+        "destination_ip":   n.destination_ip,
+        "destination_port": n.destination_port,
+        "body":             n.body,
+        "scope":            n.scope,
+        "team_id":          n.team_id,
+        "created_by":       n.created_by,
+        "updated_by":       n.updated_by,
+        "can_edit":         own or is_admin,
+        "created_at":       n.created_at.isoformat() if n.created_at else None,
+        "updated_at":       n.updated_at.isoformat() if n.updated_at else None,
+    }
+
+
+def _note_visible(current_user: UserModel):
+    """SQLAlchemy filter limiting notes to ones the user may see."""
+    own = InvestigationNoteModel.created_by == current_user.id
+    if getattr(current_user, "is_admin", False):
+        return InvestigationNoteModel.id == InvestigationNoteModel.id  # always true
+    team_id = getattr(current_user, "team_id", None)
+    if team_id is None:
+        return own
+    from sqlalchemy import or_ as _or
+    return _or(
+        own,
+        (InvestigationNoteModel.scope == "team") & (InvestigationNoteModel.team_id == team_id),
+    )
+
+
+@app.get("/api/analyses/{analysis_id}/investigation-notes")
+def list_investigation_notes(
+    analysis_id: str,
+    source_ip: Optional[str] = Query(None),
+    destination_ip: Optional[str] = Query(None),
+    destination_port: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List investigation notes visible to the current user on this analysis.
+
+    If ``source_ip``/``destination_ip``/``destination_port`` query params are
+    provided, the list is narrowed to notes on that exact endpoint tuple.
+    """
+    # Access check against the analysis itself
+    _get_or_404(db, analysis_id, current_user.id)
+    q = db.query(InvestigationNoteModel).filter(
+        InvestigationNoteModel.analysis_id == analysis_id,
+        _note_visible(current_user),
+    )
+    if source_ip:
+        q = q.filter(InvestigationNoteModel.source_ip == source_ip)
+    if destination_ip:
+        q = q.filter(InvestigationNoteModel.destination_ip == destination_ip)
+    if destination_port is not None:
+        q = q.filter(InvestigationNoteModel.destination_port == destination_port)
+    rows = q.order_by(InvestigationNoteModel.created_at.desc()).all()
+    return [_note_to_dict(n, current_user) for n in rows]
+
+
+@app.post("/api/analyses/{analysis_id}/investigation-notes", status_code=201)
+def create_investigation_note(
+    analysis_id: str,
+    req: InvestigationNoteCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Create a new investigation note.
+
+    ``scope`` may be ``private`` (default) or ``team``.  Team scope requires
+    the user to belong to a team.
+    """
+    _get_or_404(db, analysis_id, current_user.id)
+    if req.scope == "team" and not getattr(current_user, "team_id", None):
+        raise HTTPException(
+            403, "User must belong to a team to create team-scoped notes"
+        )
+    n = InvestigationNoteModel(
+        analysis_id=analysis_id,
+        source_ip=req.source_ip.strip(),
+        destination_ip=req.destination_ip.strip(),
+        destination_port=req.destination_port,
+        body=req.body,
+        scope=req.scope,
+        team_id=(current_user.team_id if req.scope == "team" else None),
+        created_by=current_user.id,
+        updated_by=current_user.id,
+    )
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+    return _note_to_dict(n, current_user)
+
+
+@app.put("/api/analyses/{analysis_id}/investigation-notes/{note_id}")
+def update_investigation_note(
+    analysis_id: str,
+    note_id: int,
+    req: InvestigationNoteUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Edit an existing investigation note.
+
+    Only the author (or an admin) may edit.  Members of the same team who did
+    not author the note see it read-only and receive 403 here.
+    """
+    n = db.query(InvestigationNoteModel).filter(
+        InvestigationNoteModel.id == note_id,
+        InvestigationNoteModel.analysis_id == analysis_id,
+    ).first()
+    if n is None:
+        raise HTTPException(404, "Note not found")
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    # Visibility check first
+    visible = (
+        n.created_by == current_user.id
+        or is_admin
+        or (
+            n.scope == "team"
+            and getattr(current_user, "team_id", None) == n.team_id
+            and n.team_id is not None
+        )
+    )
+    if not visible:
+        raise HTTPException(403, "Not authorized to access this note")
+    if not (n.created_by == current_user.id or is_admin):
+        raise HTTPException(
+            403, "Read-only: only the author may edit this team note"
+        )
+    if req.body is not None:
+        n.body = req.body
+    if req.scope is not None and req.scope != n.scope:
+        if req.scope == "team" and not getattr(current_user, "team_id", None):
+            raise HTTPException(
+                403, "User must belong to a team to publish team-scoped notes"
+            )
+        n.scope = req.scope
+        n.team_id = current_user.team_id if req.scope == "team" else None
+    n.updated_by = current_user.id
+    n.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(n)
+    return _note_to_dict(n, current_user)
+
+
+@app.delete(
+    "/api/analyses/{analysis_id}/investigation-notes/{note_id}",
+    status_code=204,
+)
+def delete_investigation_note(
+    analysis_id: str,
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Delete an investigation note.
+
+    Only the author (or an admin) may delete; team members with read-only
+    visibility receive 403.
+    """
+    n = db.query(InvestigationNoteModel).filter(
+        InvestigationNoteModel.id == note_id,
+        InvestigationNoteModel.analysis_id == analysis_id,
+    ).first()
+    if n is None:
+        raise HTTPException(404, "Note not found")
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    if not (n.created_by == current_user.id or is_admin):
+        # Distinguish "not visible at all" vs "read-only"
+        visible = (
+            n.scope == "team"
+            and getattr(current_user, "team_id", None) == n.team_id
+            and n.team_id is not None
+        )
+        if visible:
+            raise HTTPException(
+                403, "Read-only: only the author may delete this team note"
+            )
+        raise HTTPException(403, "Not authorized to access this note")
+    db.delete(n)
+    db.commit()
 
 
 # ── Analyst Triage ────────────────────────────────────────────────────────────
@@ -1460,7 +2443,7 @@ def telemetry_summary(
 
 # ── Path Analysis Saved Queries ───────────────────────────────────────────────
 
-def _query_to_dict(q: PathAnalysisSavedQueryModel) -> dict:
+def _query_to_dict(q: PathAnalysisSavedQueryModel, current_user: Optional[UserModel] = None) -> dict:
     return {
         "id":                 q.id,
         "name":               q.name,
@@ -1473,19 +2456,30 @@ def _query_to_dict(q: PathAnalysisSavedQueryModel) -> dict:
         "backend_ips":        json.loads(q.backend_ips),
         "backend_subnets":    json.loads(q.backend_subnets),
         "note":               q.note,
+        "scope":              q.scope,
+        "team_id":            q.team_id,
+        "owner_user_id":      q.owner_user_id,
+        "created_by":         q.created_by,
+        "updated_by":         q.updated_by,
+        "can_edit":           sharing_can_edit(q, current_user) if current_user is not None else False,
         "created_at":         q.created_at.isoformat() if q.created_at else None,
         "updated_at":         q.updated_at.isoformat() if q.updated_at else None,
     }
 
 
-def _get_query_or_404(db: Session, query_id: int, user_id: int) -> PathAnalysisSavedQueryModel:
+def _get_query_or_404(db: Session, query_id: int, current_user: UserModel) -> PathAnalysisSavedQueryModel:
     q = db.query(PathAnalysisSavedQueryModel).filter(
         PathAnalysisSavedQueryModel.id == query_id
     ).first()
-    if not q:
-        raise HTTPException(404, "Saved query not found")
-    if q.owner_user_id != user_id:
-        raise HTTPException(403, "Not authorized to access this saved query")
+    enforce_view(q, current_user)
+    return q
+
+
+def _get_query_for_edit(db: Session, query_id: int, current_user: UserModel) -> PathAnalysisSavedQueryModel:
+    q = db.query(PathAnalysisSavedQueryModel).filter(
+        PathAnalysisSavedQueryModel.id == query_id
+    ).first()
+    enforce_edit(q, current_user)
     return q
 
 
@@ -1500,6 +2494,7 @@ class SavedQueryCreate(BaseModel):
     backend_ips:        Optional[List[str]] = None
     backend_subnets:    Optional[List[str]] = None
     note:               Optional[str]   = None
+    scope:              str             = Field(default="private", pattern="^(private|team|global)$")
 
 
 class SavedQueryUpdate(BaseModel):
@@ -1513,6 +2508,7 @@ class SavedQueryUpdate(BaseModel):
     backend_ips:        Optional[List[str]] = None
     backend_subnets:    Optional[List[str]] = None
     note:               Optional[str]       = None
+    scope:              Optional[str]       = Field(default=None, pattern="^(private|team|global)$")
     clear_port:         bool                = False   # explicit sentinel to set port→None
     clear_preset:       bool                = False   # explicit sentinel to set preset→None
 
@@ -1523,10 +2519,18 @@ def create_saved_query(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Save a new path-analysis query owned by the current user."""
-    # Validate preset ownership when a preset is referenced
+    """Save a new path-analysis query with an optional sharing scope.
+
+    ``scope`` may be ``private`` (default), ``team`` (requires team
+    membership) or ``global`` (admin only).  The referenced ``role_preset_id``
+    must be visible to the current user under the visibility rules.
+    """
+    check_can_create(req.scope, current_user)
+
+    # Preset must be visible to the caller — private presets owned by others
+    # still return 404/403 through enforce_view in _get_preset_or_404.
     if req.role_preset_id is not None:
-        _get_preset_or_404(db, req.role_preset_id, current_user.id)
+        _get_preset_or_404(db, req.role_preset_id, current_user)
 
     q = PathAnalysisSavedQueryModel(
         owner_user_id=      current_user.id,
@@ -1540,11 +2544,15 @@ def create_saved_query(
         backend_ips=        json.dumps(_preset_lists(req.backend_ips)),
         backend_subnets=    json.dumps(_preset_lists(req.backend_subnets)),
         note=               req.note or None,
+        scope=              req.scope,
+        team_id=            resolve_team_id(req.scope, current_user),
+        created_by=         current_user.id,
+        updated_by=         current_user.id,
     )
     db.add(q)
     db.commit()
     db.refresh(q)
-    return _query_to_dict(q)
+    return _query_to_dict(q, current_user)
 
 
 @app.get("/api/path-analysis/saved-queries")
@@ -1552,14 +2560,15 @@ def list_saved_queries(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """List all saved queries for the current user, newest first."""
+    """List every saved query visible to the current user (private, team,
+    global) — newest first."""
     rows = (
         db.query(PathAnalysisSavedQueryModel)
-        .filter(PathAnalysisSavedQueryModel.owner_user_id == current_user.id)
+        .filter(visible_filter(PathAnalysisSavedQueryModel, current_user))
         .order_by(PathAnalysisSavedQueryModel.updated_at.desc())
         .all()
     )
-    return [_query_to_dict(q) for q in rows]
+    return [_query_to_dict(q, current_user) for q in rows]
 
 
 @app.get("/api/path-analysis/saved-queries/{query_id}")
@@ -1568,8 +2577,8 @@ def get_saved_query(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Get one saved query. Returns 403 if it belongs to a different user."""
-    return _query_to_dict(_get_query_or_404(db, query_id, current_user.id))
+    """Get one saved query.  Returns 403 if the caller cannot see it."""
+    return _query_to_dict(_get_query_or_404(db, query_id, current_user), current_user)
 
 
 @app.put("/api/path-analysis/saved-queries/{query_id}")
@@ -1579,8 +2588,12 @@ def update_saved_query(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Partial update of a saved query. Only provided fields are changed."""
-    q = _get_query_or_404(db, query_id, current_user.id)
+    """Partial update of a saved query.
+
+    Only the author (or an admin) may edit a shared item.  Members of the
+    same team who did not create the row get a 403 read-only response.
+    """
+    q = _get_query_for_edit(db, query_id, current_user)
 
     if req.name is not None:
         q.name = req.name.strip()
@@ -1595,7 +2608,7 @@ def update_saved_query(
     if req.clear_preset:
         q.role_preset_id = None
     elif req.role_preset_id is not None:
-        _get_preset_or_404(db, req.role_preset_id, current_user.id)
+        _get_preset_or_404(db, req.role_preset_id, current_user)
         q.role_preset_id = req.role_preset_id
     if req.firewall_ips is not None:
         q.firewall_ips = json.dumps(_preset_lists(req.firewall_ips))
@@ -1607,10 +2620,15 @@ def update_saved_query(
         q.backend_subnets = json.dumps(_preset_lists(req.backend_subnets))
     if req.note is not None:
         q.note = req.note or None
+    if req.scope is not None and req.scope != q.scope:
+        check_can_create(req.scope, current_user)
+        q.scope = req.scope
+        q.team_id = resolve_team_id(req.scope, current_user)
+    q.updated_by = current_user.id
     q.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(q)
-    return _query_to_dict(q)
+    return _query_to_dict(q, current_user)
 
 
 @app.delete("/api/path-analysis/saved-queries/{query_id}", status_code=204)
@@ -1619,10 +2637,364 @@ def delete_saved_query(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Delete a saved query. Returns 403 if it belongs to a different user."""
-    q = _get_query_or_404(db, query_id, current_user.id)
+    """Delete a saved query.  Only the author (or an admin) may delete."""
+    q = _get_query_for_edit(db, query_id, current_user)
+    db.query(MonitoredPathModel).filter(
+        MonitoredPathModel.saved_query_id == query_id
+    ).delete()
     db.delete(q)
     db.commit()
+
+
+# ── Scheduled Path Monitoring (drift detection) ───────────────────────────────
+#
+# A monitored path binds a saved query (which captures src/dst/port/roles) to
+# a specific analysis (the PCAP that periodic re-runs target) and a poll
+# interval.  Re-runs use the path-analysis cache so an unchanged PCAP costs
+# nothing.  Drift is computed from the previous snapshot via
+# ``monitoring.detect_drift``; when warning/critical drift fires we create a
+# notification and transition the analysis workflow to needs_review.
+
+class MonitoredPathCreate(BaseModel):
+    saved_query_id:            int
+    analysis_id:               str = Field(min_length=1)
+    schedule_interval_minutes: int = Field(default=60, ge=1, le=60 * 24 * 7)
+    enabled:                   bool = True
+
+
+class MonitoredPathUpdate(BaseModel):
+    schedule_interval_minutes: Optional[int] = Field(
+        default=None, ge=1, le=60 * 24 * 7,
+    )
+    enabled: Optional[bool] = None
+
+
+def _roles_from_saved_query(q: PathAnalysisSavedQueryModel) -> Optional[dict]:
+    """Build the CausalPathEngine ``roles`` dict from a saved query row.
+
+    Returns None if all four lists are empty so that the cache key matches
+    callers who passed roles=None.
+    """
+    fw  = json.loads(q.firewall_ips)
+    lbs = json.loads(q.load_balancer_vips)
+    bks = json.loads(q.backend_ips)
+    sub = json.loads(q.backend_subnets)
+    if not (fw or lbs or bks or sub):
+        return None
+    return {
+        "firewall_ips":       fw,
+        "load_balancer_vips": lbs,
+        "backend_ips":        bks,
+        "backend_subnets":    sub,
+    }
+
+
+def _monitor_to_dict(m: MonitoredPathModel, db: Session) -> dict:
+    """Serialize a monitored path with derived display fields.
+
+    Includes the saved-query name and the target analysis filename so the
+    frontend can render the row without N+1 follow-up requests.
+    """
+    sq = db.query(PathAnalysisSavedQueryModel).filter(
+        PathAnalysisSavedQueryModel.id == m.saved_query_id,
+    ).first()
+    arow = db.query(AnalysisModel).filter(
+        AnalysisModel.id == m.analysis_id,
+    ).first()
+    return {
+        "id":                        m.id,
+        "saved_query_id":            m.saved_query_id,
+        "saved_query_name":          sq.name if sq else None,
+        "source_ip":                 sq.source_ip if sq else None,
+        "destination_ip":            sq.destination_ip if sq else None,
+        "destination_port":          sq.destination_port if sq else None,
+        "analysis_id":               m.analysis_id,
+        "analysis_filename":         arow.filename if arow else None,
+        "owner_user_id":             m.owner_user_id,
+        "schedule_interval_minutes": m.schedule_interval_minutes,
+        "enabled":                   m.enabled,
+        "last_run_at":     m.last_run_at.isoformat() if m.last_run_at else None,
+        "last_change_at":  m.last_change_at.isoformat() if m.last_change_at else None,
+        "last_drift_severity":  m.last_drift_severity,
+        "last_change_summary":  json.loads(m.last_change_summary) if m.last_change_summary else None,
+        "has_baseline":         m.last_result_json is not None,
+        "created_at":     m.created_at.isoformat() if m.created_at else None,
+        "updated_at":     m.updated_at.isoformat() if m.updated_at else None,
+    }
+
+
+def _get_monitor_or_404(
+    db: Session, monitor_id: int, current_user: UserModel,
+) -> MonitoredPathModel:
+    """Fetch a monitor the caller owns (or any monitor for an admin).
+
+    We do not implement team-scoped monitors yet — they belong to the
+    creating user only — so this is a simple ownership check.
+    """
+    m = db.query(MonitoredPathModel).filter(
+        MonitoredPathModel.id == monitor_id,
+    ).first()
+    if not m:
+        raise HTTPException(404, "Monitor not found")
+    if m.owner_user_id != current_user.id and not getattr(
+        current_user, "is_admin", False
+    ):
+        raise HTTPException(404, "Monitor not found")
+    return m
+
+
+def _run_monitor(
+    db: Session,
+    monitor: MonitoredPathModel,
+    *,
+    actor_user_id: Optional[int] = None,
+) -> dict:
+    """Execute one monitor tick: re-run path analysis, detect drift, alert.
+
+    The monitor is mutated in place — the caller is responsible for the final
+    ``db.commit()``.  Returns the drift report dict (see
+    ``monitoring.detect_drift``).
+
+    Drift policy:
+      - The first run always succeeds with severity=none and stores a baseline.
+      - Warning/critical drift creates a ``drift_detected`` notification for
+        the monitor owner and transitions the target analysis workflow to
+        ``needs_review`` (unless it is already in a terminal state).
+    """
+    sq = db.query(PathAnalysisSavedQueryModel).filter(
+        PathAnalysisSavedQueryModel.id == monitor.saved_query_id,
+    ).first()
+    if not sq:
+        raise HTTPException(404, "Saved query for monitor no longer exists")
+
+    roles = _roles_from_saved_query(sq)
+
+    # _load_or_run_path_result enforces analysis ownership via _get_or_404,
+    # so the monitor owner must also own the captured analysis — we already
+    # check this at create time.
+    current_result = _load_or_run_path_result(
+        monitor.analysis_id,
+        monitor.owner_user_id,
+        sq.source_ip,
+        sq.destination_ip,
+        sq.destination_port,
+        roles,
+        db,
+    )
+
+    previous = (
+        json.loads(monitor.last_result_json)
+        if monitor.last_result_json
+        else None
+    )
+    report = detect_drift(previous, current_result)
+
+    now = datetime.utcnow()
+    monitor.last_run_at = now
+    monitor.last_result_json = json.dumps(current_result)
+    monitor.last_drift_severity = report["severity"]
+
+    if report["drift_detected"]:
+        monitor.last_change_at = now
+        monitor.last_change_summary = json.dumps({
+            "severity": report["severity"],
+            "changes":  report["changes"],
+            "changed_fields": report["changed_fields"],
+        })
+
+    # Alert + workflow integration: only when the change is action-required.
+    if report["action_required"]:
+        arow = db.query(AnalysisModel).filter(
+            AnalysisModel.id == monitor.analysis_id,
+        ).first()
+        if arow is not None:
+            severity_label = report["severity"].upper()
+            top_change = report["changes"][0] if report["changes"] else "drift detected"
+            message = (
+                f"[{severity_label}] Path "
+                f"{sq.source_ip} → {sq.destination_ip}"
+                f" on “{arow.filename}”: {top_change}"
+            )
+            # actor_user_id is intentionally None: drift is detected by the
+            # system, not by the analyst pressing "Run now", so it should
+            # always notify the owner even when they triggered the run.
+            _notify(
+                db,
+                user_id=monitor.owner_user_id,
+                type="drift_detected",
+                analysis_id=arow.id,
+                message=message,
+                actor_user_id=None,
+            )
+            # Auto-transition the analysis to needs_review unless it is in a
+            # terminal state (resolved/dismissed) the analyst already chose.
+            if arow.workflow_state not in ("resolved", "dismissed", "needs_review"):
+                arow.workflow_state = "needs_review"
+                arow.workflow_updated_at = now
+                arow.workflow_updated_by = actor_user_id
+                _emit_state_change_notifications(
+                    db,
+                    row=arow,
+                    state="needs_review",
+                    actor_user_id=actor_user_id or monitor.owner_user_id,
+                )
+
+    track(
+        "monitor.run",
+        user_id=monitor.owner_user_id,
+        properties={
+            "monitor_id": monitor.id,
+            "severity":   report["severity"],
+            "drift":      report["drift_detected"],
+        },
+    )
+    return report
+
+
+def run_due_monitors(db: Session, *, now: Optional[datetime] = None) -> int:
+    """Run every enabled monitor whose interval has elapsed.
+
+    Used by the in-process tick (or by tests calling it directly).  Returns
+    the number of monitors that ran.  Errors on one monitor are swallowed so
+    one bad monitor cannot block the rest of the batch.
+    """
+    now = now or datetime.utcnow()
+    monitors = db.query(MonitoredPathModel).filter(
+        MonitoredPathModel.enabled.is_(True),
+    ).all()
+    ran = 0
+    for m in monitors:
+        if not is_due(m.last_run_at, m.schedule_interval_minutes, now):
+            continue
+        try:
+            _run_monitor(db, m)
+            ran += 1
+        except HTTPException:
+            # Skip monitors whose target became inaccessible — surface in
+            # the next manual run instead of crashing the batch.
+            db.rollback()
+            continue
+    db.commit()
+    return ran
+
+
+@app.post("/api/path-monitors", status_code=201)
+def create_monitor(
+    req: MonitoredPathCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Create a new scheduled monitor for a saved path query."""
+    sq = _get_query_or_404(db, req.saved_query_id, current_user)
+    # Owner must own the target analysis (so cache reuse + access checks
+    # in _load_or_run_path_result line up).
+    _get_or_404(db, req.analysis_id, current_user.id)
+
+    m = MonitoredPathModel(
+        saved_query_id=req.saved_query_id,
+        analysis_id=req.analysis_id,
+        owner_user_id=current_user.id,
+        schedule_interval_minutes=req.schedule_interval_minutes,
+        enabled=req.enabled,
+    )
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    track("monitor.created", user_id=current_user.id,
+          properties={"monitor_id": m.id})
+    return _monitor_to_dict(m, db)
+
+
+@app.get("/api/path-monitors")
+def list_monitors(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List monitors visible to the current user (own monitors only)."""
+    rows = (
+        db.query(MonitoredPathModel)
+        .filter(MonitoredPathModel.owner_user_id == current_user.id)
+        .order_by(MonitoredPathModel.id.desc())
+        .all()
+    )
+    return [_monitor_to_dict(m, db) for m in rows]
+
+
+@app.get("/api/path-monitors/{monitor_id}")
+def get_monitor(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    return _monitor_to_dict(m, db)
+
+
+@app.put("/api/path-monitors/{monitor_id}")
+def update_monitor(
+    monitor_id: int,
+    req: MonitoredPathUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Toggle a monitor on/off or change its poll interval."""
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    if req.schedule_interval_minutes is not None:
+        m.schedule_interval_minutes = req.schedule_interval_minutes
+    if req.enabled is not None:
+        m.enabled = req.enabled
+    db.commit()
+    db.refresh(m)
+    return _monitor_to_dict(m, db)
+
+
+@app.delete("/api/path-monitors/{monitor_id}", status_code=204)
+def delete_monitor(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    db.delete(m)
+    db.commit()
+
+
+@app.post("/api/path-monitors/{monitor_id}/run")
+def trigger_monitor_run(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Force a monitor to run immediately and return the drift report.
+
+    The interval timer is honoured by ``run_due_monitors`` but bypassed here
+    on purpose — analysts pressing "Run now" expect a fresh comparison.
+    """
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    report = _run_monitor(db, m, actor_user_id=current_user.id)
+    db.commit()
+    db.refresh(m)
+    return {
+        "monitor": _monitor_to_dict(m, db),
+        "report":  report,
+    }
+
+
+@app.post("/api/path-monitors/tick")
+def tick_monitors(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Run every enabled monitor whose interval has elapsed.  Admin only.
+
+    This stands in for a real scheduler — the simplest way to drive monitors
+    in the current deployment is for an external cron / k8s CronJob to POST
+    here every minute or so.
+    """
+    if not getattr(current_user, "is_admin", False):
+        raise HTTPException(403, "Admin access required")
+    ran = run_due_monitors(db)
+    return {"ran": ran}
 
 
 # ── Path Analysis Role Presets ────────────────────────────────────────────────
@@ -1632,7 +3004,7 @@ def _preset_lists(raw: Optional[List[str]]) -> List[str]:
     return sorted(set(s.strip() for s in (raw or []) if s.strip()))
 
 
-def _preset_to_dict(p: PathAnalysisRolePresetModel) -> dict:
+def _preset_to_dict(p: PathAnalysisRolePresetModel, current_user: Optional[UserModel] = None) -> dict:
     return {
         "id":                 p.id,
         "name":               p.name,
@@ -1640,6 +3012,12 @@ def _preset_to_dict(p: PathAnalysisRolePresetModel) -> dict:
         "load_balancer_vips": json.loads(p.load_balancer_vips),
         "backend_ips":        json.loads(p.backend_ips),
         "backend_subnets":    json.loads(p.backend_subnets),
+        "scope":              p.scope,
+        "team_id":            p.team_id,
+        "owner_user_id":      p.owner_user_id,
+        "created_by":         p.created_by,
+        "updated_by":         p.updated_by,
+        "can_edit":           sharing_can_edit(p, current_user) if current_user is not None else False,
         "created_at":         p.created_at.isoformat() if p.created_at else None,
         "updated_at":         p.updated_at.isoformat() if p.updated_at else None,
     }
@@ -1651,6 +3029,7 @@ class RolePresetCreate(BaseModel):
     load_balancer_vips: Optional[List[str]] = None
     backend_ips:        Optional[List[str]] = None
     backend_subnets:    Optional[List[str]] = None
+    scope:              str = Field(default="private", pattern="^(private|team|global)$")
 
 
 class RolePresetUpdate(BaseModel):
@@ -1659,16 +3038,32 @@ class RolePresetUpdate(BaseModel):
     load_balancer_vips: Optional[List[str]] = None
     backend_ips:        Optional[List[str]] = None
     backend_subnets:    Optional[List[str]] = None
+    scope:              Optional[str]       = Field(default=None, pattern="^(private|team|global)$")
 
 
-def _get_preset_or_404(db: Session, preset_id: int, user_id: int) -> PathAnalysisRolePresetModel:
+def _get_preset_or_404(
+    db: Session,
+    preset_id: int,
+    current_user: UserModel,
+) -> PathAnalysisRolePresetModel:
+    """Return a preset the caller is allowed to *view* or raise 404/403."""
     p = db.query(PathAnalysisRolePresetModel).filter(
         PathAnalysisRolePresetModel.id == preset_id
     ).first()
-    if not p:
-        raise HTTPException(404, "Preset not found")
-    if p.owner_user_id != user_id:
-        raise HTTPException(403, "Not authorized to access this preset")
+    enforce_view(p, current_user)
+    return p
+
+
+def _get_preset_for_edit(
+    db: Session,
+    preset_id: int,
+    current_user: UserModel,
+) -> PathAnalysisRolePresetModel:
+    """Return a preset the caller is allowed to *edit* or raise 404/403."""
+    p = db.query(PathAnalysisRolePresetModel).filter(
+        PathAnalysisRolePresetModel.id == preset_id
+    ).first()
+    enforce_edit(p, current_user)
     return p
 
 
@@ -1678,7 +3073,13 @@ def create_preset(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Create a new role preset owned by the current user."""
+    """Create a new role preset.
+
+    ``scope`` determines visibility: ``private`` (default), ``team`` (requires
+    team membership) or ``global`` (admin only).
+    """
+    check_can_create(req.scope, current_user)
+
     p = PathAnalysisRolePresetModel(
         owner_user_id=current_user.id,
         name=req.name.strip(),
@@ -1686,11 +3087,15 @@ def create_preset(
         load_balancer_vips= json.dumps(_preset_lists(req.load_balancer_vips)),
         backend_ips=        json.dumps(_preset_lists(req.backend_ips)),
         backend_subnets=    json.dumps(_preset_lists(req.backend_subnets)),
+        scope=req.scope,
+        team_id=resolve_team_id(req.scope, current_user),
+        created_by=current_user.id,
+        updated_by=current_user.id,
     )
     db.add(p)
     db.commit()
     db.refresh(p)
-    return _preset_to_dict(p)
+    return _preset_to_dict(p, current_user)
 
 
 @app.get("/api/path-analysis/presets")
@@ -1698,14 +3103,14 @@ def list_presets(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """List all role presets owned by the current user, newest first."""
+    """List every role preset visible to the current user, newest first."""
     rows = (
         db.query(PathAnalysisRolePresetModel)
-        .filter(PathAnalysisRolePresetModel.owner_user_id == current_user.id)
+        .filter(visible_filter(PathAnalysisRolePresetModel, current_user))
         .order_by(PathAnalysisRolePresetModel.updated_at.desc())
         .all()
     )
-    return [_preset_to_dict(p) for p in rows]
+    return [_preset_to_dict(p, current_user) for p in rows]
 
 
 @app.get("/api/path-analysis/presets/{preset_id}")
@@ -1714,8 +3119,8 @@ def get_preset(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Get a single preset. Returns 403 if it belongs to a different user."""
-    return _preset_to_dict(_get_preset_or_404(db, preset_id, current_user.id))
+    """Get a single preset.  Returns 403 if the caller cannot view it."""
+    return _preset_to_dict(_get_preset_or_404(db, preset_id, current_user), current_user)
 
 
 @app.put("/api/path-analysis/presets/{preset_id}")
@@ -1725,8 +3130,8 @@ def update_preset(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Update name and/or role lists of an existing preset."""
-    p = _get_preset_or_404(db, preset_id, current_user.id)
+    """Update name, role lists, and/or scope of an existing preset."""
+    p = _get_preset_for_edit(db, preset_id, current_user)
     if req.name is not None:
         p.name = req.name.strip()
     if req.firewall_ips is not None:
@@ -1737,10 +3142,15 @@ def update_preset(
         p.backend_ips = json.dumps(_preset_lists(req.backend_ips))
     if req.backend_subnets is not None:
         p.backend_subnets = json.dumps(_preset_lists(req.backend_subnets))
+    if req.scope is not None and req.scope != p.scope:
+        check_can_create(req.scope, current_user)
+        p.scope = req.scope
+        p.team_id = resolve_team_id(req.scope, current_user)
+    p.updated_by = current_user.id
     p.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(p)
-    return _preset_to_dict(p)
+    return _preset_to_dict(p, current_user)
 
 
 @app.delete("/api/path-analysis/presets/{preset_id}", status_code=204)
@@ -1749,8 +3159,8 @@ def delete_preset(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """Delete a preset. Returns 403 if it belongs to a different user."""
-    p = _get_preset_or_404(db, preset_id, current_user.id)
+    """Delete a preset.  Only the author (or an admin) may delete."""
+    p = _get_preset_for_edit(db, preset_id, current_user)
     db.delete(p)
     db.commit()
 
@@ -1772,6 +3182,183 @@ def _get_or_404(db: Session, analysis_id: str, user_id: int) -> AnalysisModel:
     if not row:
         raise HTTPException(404, "Analysis not found")
     return row
+
+
+def _get_analysis_for_workflow(
+    db: Session, analysis_id: str, current_user: UserModel
+) -> AnalysisModel:
+    """Fetch an analysis that the caller may view/modify for workflow purposes.
+
+    Access is granted to the owner, the current assignee, and any admin.  All
+    other callers receive 404 so we never disclose existence of analyses they
+    cannot see.
+    """
+    row = (
+        db.query(AnalysisModel)
+        .filter(AnalysisModel.id == analysis_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "Analysis not found")
+    is_owner = row.user_id == current_user.id
+    is_assignee = (
+        row.assigned_user_id is not None
+        and row.assigned_user_id == current_user.id
+    )
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    if not (is_owner or is_assignee or is_admin):
+        raise HTTPException(404, "Analysis not found")
+    return row
+
+
+def _emit_state_change_notifications(
+    db: Session,
+    *,
+    row: AnalysisModel,
+    state: str,
+    actor_user_id: int,
+) -> None:
+    """Emit workflow state-change notifications.
+
+    Called whenever a workflow state transitions to a value that warrants a
+    notification — either via an explicit PUT or via feedback auto-transition.
+    Self-notifications are suppressed by ``_notify``.
+
+    Rules:
+      - ``needs_review`` → notify the owner; if the assignee differs from
+        both the owner and the actor, they also get notified.
+      - ``resolved``     → notify the owner.
+    """
+    if state == "needs_review":
+        _notify(
+            db,
+            user_id=row.user_id,
+            type="review_required",
+            analysis_id=row.id,
+            message=f"“{row.filename}” needs review.",
+            actor_user_id=actor_user_id,
+        )
+        if (
+            row.assigned_user_id is not None
+            and row.assigned_user_id != row.user_id
+        ):
+            _notify(
+                db,
+                user_id=row.assigned_user_id,
+                type="review_required",
+                analysis_id=row.id,
+                message=f"“{row.filename}” needs review.",
+                actor_user_id=actor_user_id,
+            )
+    elif state == "resolved":
+        _notify(
+            db,
+            user_id=row.user_id,
+            type="resolved",
+            analysis_id=row.id,
+            message=f"“{row.filename}” was marked resolved.",
+            actor_user_id=actor_user_id,
+        )
+
+
+def _notify(
+    db: Session,
+    *,
+    user_id: int,
+    type: str,
+    analysis_id: Optional[str],
+    message: str,
+    actor_user_id: Optional[int] = None,
+) -> Optional[NotificationModel]:
+    """Create a single notification row.
+
+    Skips self-notifications (recipient == actor) because a user does not
+    need to be told about an action they performed themselves.  Returns the
+    newly-created row, or ``None`` if the notification was skipped.  The
+    caller is responsible for ``db.commit()`` (usually as part of a larger
+    transaction).
+    """
+    if actor_user_id is not None and actor_user_id == user_id:
+        return None
+    if type not in VALID_NOTIFICATION_TYPES:
+        return None
+    row = NotificationModel(
+        user_id=user_id,
+        type=type,
+        analysis_id=analysis_id,
+        actor_user_id=actor_user_id,
+        message=message,
+    )
+    db.add(row)
+    return row
+
+
+def _notification_dict(
+    row: NotificationModel,
+    filename_cache: Optional[dict] = None,
+    username_cache: Optional[dict] = None,
+    db: Optional[Session] = None,
+) -> dict:
+    filename: Optional[str] = None
+    actor_username: Optional[str] = None
+    if row.analysis_id is not None:
+        if filename_cache is not None and row.analysis_id in filename_cache:
+            filename = filename_cache[row.analysis_id]
+        elif db is not None:
+            arow = db.query(AnalysisModel).filter(
+                AnalysisModel.id == row.analysis_id
+            ).first()
+            if arow:
+                filename = arow.filename
+            if filename_cache is not None:
+                filename_cache[row.analysis_id] = filename
+    if row.actor_user_id is not None:
+        if username_cache is not None and row.actor_user_id in username_cache:
+            actor_username = username_cache[row.actor_user_id]
+        elif db is not None:
+            urow = db.query(UserModel).filter(
+                UserModel.id == row.actor_user_id
+            ).first()
+            if urow:
+                actor_username = urow.username
+            if username_cache is not None:
+                username_cache[row.actor_user_id] = actor_username
+    return {
+        "id":                row.id,
+        "type":              row.type,
+        "analysis_id":       row.analysis_id,
+        "analysis_filename": filename,
+        "actor_user_id":     row.actor_user_id,
+        "actor_username":    actor_username,
+        "message":           row.message,
+        "read_at":           row.read_at.isoformat() if row.read_at else None,
+        "created_at":        row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _workflow_dict(row: AnalysisModel, current_user: UserModel, db: Session) -> dict:
+    is_owner = row.user_id == current_user.id
+    is_assignee = (
+        row.assigned_user_id is not None
+        and row.assigned_user_id == current_user.id
+    )
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    assignee_username: Optional[str] = None
+    if row.assigned_user_id is not None:
+        u = db.query(UserModel).filter(UserModel.id == row.assigned_user_id).first()
+        if u:
+            assignee_username = u.username
+    return {
+        "analysis_id": row.id,
+        "workflow_state": row.workflow_state or "new",
+        "assigned_user_id": row.assigned_user_id,
+        "assignee_username": assignee_username,
+        "workflow_updated_at": row.workflow_updated_at.isoformat() if row.workflow_updated_at else None,
+        "workflow_updated_by": row.workflow_updated_by,
+        "owner_user_id": row.user_id,
+        "can_edit_state": is_owner or is_assignee or is_admin,
+        "can_assign": is_owner or is_admin,
+    }
 
 
 def _suppression_dict(r: SuppressionRuleModel) -> dict:
@@ -1804,7 +3391,15 @@ def _triage_dict(r: FindingTriageModel) -> dict:
     }
 
 
-def _feedback_dict(r: PathAnalysisFeedbackModel) -> dict:
+def _feedback_dict(
+    r: PathAnalysisFeedbackModel,
+    current_user: Optional[UserModel] = None,
+) -> dict:
+    # The author is always allowed to edit their own feedback; admins as well.
+    # Other team members see team-scoped feedback read-only.
+    own = current_user is not None and r.analyst_id == current_user.id
+    is_admin = bool(current_user and getattr(current_user, "is_admin", False))
+    can_edit = own or is_admin
     return {
         "id":                   r.id,
         "analysis_id":          r.analysis_id,
@@ -1819,12 +3414,20 @@ def _feedback_dict(r: PathAnalysisFeedbackModel) -> dict:
         "actual_root_cause":    r.actual_root_cause,
         "misleading_step":      r.misleading_step,
         "analyst_id":           r.analyst_id,
+        "scope":                r.scope,
+        "team_id":              r.team_id,
+        "can_edit":             can_edit,
         "created_at":  r.created_at.isoformat() if r.created_at else None,
         "updated_at":  r.updated_at.isoformat() if r.updated_at else None,
     }
 
 
-def _summary(row: AnalysisModel) -> dict:
+def _summary(row: AnalysisModel, db: Optional[Session] = None) -> dict:
+    assignee_username: Optional[str] = None
+    if db is not None and row.assigned_user_id is not None:
+        u = db.query(UserModel).filter(UserModel.id == row.assigned_user_id).first()
+        if u:
+            assignee_username = u.username
     return {
         "id": row.id,
         "filename": row.filename,
@@ -1838,4 +3441,9 @@ def _summary(row: AnalysisModel) -> dict:
         "started_at": row.started_at.isoformat() if row.started_at else None,
         "finished_at": row.finished_at.isoformat() if row.finished_at else None,
         "error": row.error,
+        "workflow_state": row.workflow_state or "new",
+        "assigned_user_id": row.assigned_user_id,
+        "assignee_username": assignee_username,
+        "workflow_updated_at": row.workflow_updated_at.isoformat() if row.workflow_updated_at else None,
+        "owner_user_id": row.user_id,
     }
