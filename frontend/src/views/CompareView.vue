@@ -412,7 +412,142 @@ function fmtBytes(b: number): string {
   return (b / 1024 ** 3).toFixed(2) + ' GB'
 }
 
-// Path-compare logic will be wired here in the next iteration.
+// ── Path Compare state ────────────────────────────────────────────────────────
+
+interface SavedQuery {
+  id: number
+  name: string
+  source_ip: string
+  destination_ip: string
+  destination_port: number | null
+  firewall_ips: string[]
+  load_balancer_vips: string[]
+  backend_ips: string[]
+  backend_subnets: string[]
+}
+
+interface PathCompareResult {
+  baseline_analysis_id: string
+  incident_analysis_id: string
+  source_ip: string
+  destination_ip: string
+  destination_port: number | null
+  baseline_summary: {
+    connection_outcome: string
+    primary_impairment: string | null
+    path_impairments: string[]
+    path_confidence_score: number
+    path_summary: string
+  }
+  incident_summary: {
+    connection_outcome: string
+    primary_impairment: string | null
+    path_impairments: string[]
+    path_confidence_score: number
+    path_summary: string
+  }
+  outcome_changed: boolean
+  outcome_regression: boolean
+  key_differences: string[]
+  impairment_changes: { new: string[]; resolved: string[]; persisting: string[] }
+  timing_differences: Record<string, { baseline: number; incident: number; delta: number; worsened: boolean }>
+  confidence_changes: { baseline: number; incident: number; delta: number; worsened: boolean }
+  evidence_differences: { baseline_only: string[]; incident_only: string[] }
+  most_likely_regression_point: string | null
+}
+
+// Analysis IDs — reuse the general compare selectors (selectedA / selectedB)
+// already declared above.
+
+// Path inputs
+const pcSourceIp        = ref('')
+const pcDestinationIp   = ref('')
+const pcDestinationPort = ref('')  // raw string; parsed to int on submit
+
+// Roles (populated when a saved query is applied)
+const pcRoles = ref<Record<string, string[]> | null>(null)
+
+// Saved queries
+const pcSavedQueries      = ref<SavedQuery[]>([])
+const pcSelectedQueryId   = ref<number | null>(null)
+const pcSavedQueriesLoading = ref(false)
+
+// Request state
+const pcLoading    = ref(false)
+const pcError      = ref('')
+const pcResult     = ref<PathCompareResult | null>(null)
+
+// Load saved queries on mount (non-critical — silently ignore failures)
+onMounted(async () => {
+  pcSavedQueriesLoading.value = true
+  try {
+    const res = await api.get('/path-analysis/saved-queries')
+    pcSavedQueries.value = res.data
+  } catch {
+    // non-critical
+  } finally {
+    pcSavedQueriesLoading.value = false
+  }
+})
+
+function pcApplyQuery(id: number | null) {
+  if (!id) {
+    pcRoles.value = null
+    return
+  }
+  const q = pcSavedQueries.value.find(q => q.id === id)
+  if (!q) return
+  pcSourceIp.value        = q.source_ip
+  pcDestinationIp.value   = q.destination_ip
+  pcDestinationPort.value = q.destination_port != null ? String(q.destination_port) : ''
+  // Build roles object from inline list fields; omit empty lists
+  const roles: Record<string, string[]> = {}
+  if (q.firewall_ips.length)       roles.firewall_ips       = q.firewall_ips
+  if (q.load_balancer_vips.length) roles.load_balancer_vips = q.load_balancer_vips
+  if (q.backend_ips.length)        roles.backend_ips        = q.backend_ips
+  if (q.backend_subnets.length)    roles.backend_subnets    = q.backend_subnets
+  pcRoles.value = Object.keys(roles).length ? roles : null
+}
+
+async function runPathCompare() {
+  // Validation
+  if (!selectedA.value || !selectedB.value) {
+    pcError.value = 'Select both a baseline and an incident analysis first.'
+    return
+  }
+  if (!pcSourceIp.value.trim() || !pcDestinationIp.value.trim()) {
+    pcError.value = 'Source IP and Destination IP are required.'
+    return
+  }
+
+  pcError.value  = ''
+  pcResult.value = null
+  pcLoading.value = true
+
+  const payload: Record<string, any> = {
+    baseline_analysis_id: selectedA.value,
+    incident_analysis_id: selectedB.value,
+    source_ip:            pcSourceIp.value.trim(),
+    destination_ip:       pcDestinationIp.value.trim(),
+  }
+  const port = parseInt(pcDestinationPort.value, 10)
+  if (!isNaN(port) && port > 0 && port <= 65535) payload.destination_port = port
+  if (pcRoles.value) payload.roles = pcRoles.value
+
+  try {
+    const res = await api.post('/path-analysis/compare', payload)
+    pcResult.value = res.data
+  } catch (e: any) {
+    pcError.value = e?.response?.data?.detail || 'Path compare failed.'
+  } finally {
+    pcLoading.value = false
+  }
+}
+
+function pcClear() {
+  pcResult.value = null
+  pcError.value  = ''
+}
 </script>
 
 <style scoped>
