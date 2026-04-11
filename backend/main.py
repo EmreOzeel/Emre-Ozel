@@ -872,6 +872,136 @@ def compare_path_analysis(
     return result
 
 
+# ── Investigation Package Export ──────────────────────────────────────────────
+
+class PathExportRequest(BaseModel):
+    analysis_id: str
+    source_ip: str = Field(min_length=1)
+    destination_ip: str = Field(min_length=1)
+    destination_port: Optional[int] = None
+    roles: Optional[dict] = None
+    saved_query_id: Optional[int] = None
+    # Compare: include a baseline-vs-incident diff in the package
+    include_compare: bool = False
+    baseline_analysis_id: Optional[str] = None
+    incident_analysis_id: Optional[str] = None
+
+
+def _build_export_package(
+    req: PathExportRequest,
+    user_id: int,
+    db: Session,
+) -> dict:
+    """Shared logic for JSON and HTML export endpoints."""
+    from core.causal_path import CACHE_ENGINE_VERSION
+    from reporting.investigation_package import build_package
+
+    # ── Path analysis result ──────────────────────────────────────────────────
+    path_result = _load_or_run_path_result(
+        req.analysis_id, user_id,
+        req.source_ip, req.destination_ip, req.destination_port, req.roles, db,
+    )
+
+    # ── Optional compare ──────────────────────────────────────────────────────
+    compare_result: Optional[dict] = None
+    if req.include_compare and req.baseline_analysis_id and req.incident_analysis_id:
+        baseline = _load_or_run_path_result(
+            req.baseline_analysis_id, user_id,
+            req.source_ip, req.destination_ip, req.destination_port, req.roles, db,
+        )
+        incident = _load_or_run_path_result(
+            req.incident_analysis_id, user_id,
+            req.source_ip, req.destination_ip, req.destination_port, req.roles, db,
+        )
+        cr = _compare_path_results(baseline, incident)
+        cr["baseline_analysis_id"] = req.baseline_analysis_id
+        cr["incident_analysis_id"] = req.incident_analysis_id
+        compare_result = cr
+
+    # ── Analyst feedback (best-match for this src/dst/port/analysis) ──────────
+    feedback_row = (
+        db.query(PathAnalysisFeedbackModel)
+        .filter(
+            PathAnalysisFeedbackModel.analysis_id      == req.analysis_id,
+            PathAnalysisFeedbackModel.source_ip        == req.source_ip,
+            PathAnalysisFeedbackModel.destination_ip   == req.destination_ip,
+            PathAnalysisFeedbackModel.destination_port == req.destination_port,
+            PathAnalysisFeedbackModel.analyst_id       == user_id,
+        )
+        .first()
+    )
+    analyst_feedback = _feedback_dict(feedback_row) if feedback_row else None
+
+    # ── Saved query metadata (optional, informational only) ───────────────────
+    saved_query_meta: Optional[dict] = None
+    if req.saved_query_id:
+        sq = db.query(PathAnalysisSavedQueryModel).filter(
+            PathAnalysisSavedQueryModel.id == req.saved_query_id,
+            PathAnalysisSavedQueryModel.owner_user_id == user_id,
+        ).first()
+        if sq:
+            saved_query_meta = {"id": sq.id, "name": sq.name, "note": sq.note}
+
+    return build_package(
+        analysis_id=req.analysis_id,
+        source_ip=req.source_ip,
+        destination_ip=req.destination_ip,
+        destination_port=req.destination_port,
+        path_result=path_result,
+        engine_version=CACHE_ENGINE_VERSION,
+        compare_result=compare_result,
+        analyst_feedback=analyst_feedback,
+        saved_query_meta=saved_query_meta,
+    )
+
+
+@app.post("/api/path-analysis/export/json")
+def export_investigation_json(
+    req: PathExportRequest,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Export a structured investigation package as a JSON download."""
+    from fastapi.responses import Response
+
+    package = _build_export_package(req, current_user.id, db)
+    ep = f"{req.source_ip}_{req.destination_ip}"
+    if req.destination_port:
+        ep += f"_{req.destination_port}"
+    filename = f"investigation_{ep}.json"
+    track("path_analysis.export", user_id=current_user.id,
+          properties={"format": "json", "analysis_id": req.analysis_id})
+    return Response(
+        content=json.dumps(package, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/path-analysis/export/html")
+def export_investigation_html(
+    req: PathExportRequest,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Export a self-contained investigation package as an HTML download."""
+    from fastapi.responses import Response
+    from reporting.investigation_package import render_html
+
+    package = _build_export_package(req, current_user.id, db)
+    ep = f"{req.source_ip}_{req.destination_ip}"
+    if req.destination_port:
+        ep += f"_{req.destination_port}"
+    filename = f"investigation_{ep}.html"
+    track("path_analysis.export", user_id=current_user.id,
+          properties={"format": "html", "analysis_id": req.analysis_id})
+    return Response(
+        content=render_html(package),
+        media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── Path Analysis Feedback ────────────────────────────────────────────────────
 
 class PathAnalysisFeedbackCreate(BaseModel):
