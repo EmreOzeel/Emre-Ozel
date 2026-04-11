@@ -22,6 +22,7 @@ from database import (
     PathAnalysisCacheModel,
     PathAnalysisFeedbackModel,
     PathAnalysisRolePresetModel,
+    PathAnalysisSavedQueryModel,
     SuppressionRuleModel,
     TelemetryEventModel,
     UserModel,
@@ -1105,6 +1106,173 @@ def telemetry_summary(
             "failed": failed,
         },
     }
+
+
+# ── Path Analysis Saved Queries ───────────────────────────────────────────────
+
+def _query_to_dict(q: PathAnalysisSavedQueryModel) -> dict:
+    return {
+        "id":                 q.id,
+        "name":               q.name,
+        "source_ip":          q.source_ip,
+        "destination_ip":     q.destination_ip,
+        "destination_port":   q.destination_port,
+        "role_preset_id":     q.role_preset_id,
+        "firewall_ips":       json.loads(q.firewall_ips),
+        "load_balancer_vips": json.loads(q.load_balancer_vips),
+        "backend_ips":        json.loads(q.backend_ips),
+        "backend_subnets":    json.loads(q.backend_subnets),
+        "note":               q.note,
+        "created_at":         q.created_at.isoformat() if q.created_at else None,
+        "updated_at":         q.updated_at.isoformat() if q.updated_at else None,
+    }
+
+
+def _get_query_or_404(db: Session, query_id: int, user_id: int) -> PathAnalysisSavedQueryModel:
+    q = db.query(PathAnalysisSavedQueryModel).filter(
+        PathAnalysisSavedQueryModel.id == query_id
+    ).first()
+    if not q:
+        raise HTTPException(404, "Saved query not found")
+    if q.owner_user_id != user_id:
+        raise HTTPException(403, "Not authorized to access this saved query")
+    return q
+
+
+class SavedQueryCreate(BaseModel):
+    name:               str              = Field(min_length=1, max_length=200)
+    source_ip:          str              = Field(min_length=1)
+    destination_ip:     str              = Field(min_length=1)
+    destination_port:   Optional[int]   = None
+    role_preset_id:     Optional[int]   = None
+    firewall_ips:       Optional[List[str]] = None
+    load_balancer_vips: Optional[List[str]] = None
+    backend_ips:        Optional[List[str]] = None
+    backend_subnets:    Optional[List[str]] = None
+    note:               Optional[str]   = None
+
+
+class SavedQueryUpdate(BaseModel):
+    name:               Optional[str]       = Field(default=None, min_length=1, max_length=200)
+    source_ip:          Optional[str]       = Field(default=None, min_length=1)
+    destination_ip:     Optional[str]       = Field(default=None, min_length=1)
+    destination_port:   Optional[int]       = None
+    role_preset_id:     Optional[int]       = None
+    firewall_ips:       Optional[List[str]] = None
+    load_balancer_vips: Optional[List[str]] = None
+    backend_ips:        Optional[List[str]] = None
+    backend_subnets:    Optional[List[str]] = None
+    note:               Optional[str]       = None
+    clear_port:         bool                = False   # explicit sentinel to set port→None
+    clear_preset:       bool                = False   # explicit sentinel to set preset→None
+
+
+@app.post("/api/path-analysis/saved-queries", status_code=201)
+def create_saved_query(
+    req: SavedQueryCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Save a new path-analysis query owned by the current user."""
+    # Validate preset ownership when a preset is referenced
+    if req.role_preset_id is not None:
+        _get_preset_or_404(db, req.role_preset_id, current_user.id)
+
+    q = PathAnalysisSavedQueryModel(
+        owner_user_id=      current_user.id,
+        name=               req.name.strip(),
+        source_ip=          req.source_ip.strip(),
+        destination_ip=     req.destination_ip.strip(),
+        destination_port=   req.destination_port,
+        role_preset_id=     req.role_preset_id,
+        firewall_ips=       json.dumps(_preset_lists(req.firewall_ips)),
+        load_balancer_vips= json.dumps(_preset_lists(req.load_balancer_vips)),
+        backend_ips=        json.dumps(_preset_lists(req.backend_ips)),
+        backend_subnets=    json.dumps(_preset_lists(req.backend_subnets)),
+        note=               req.note or None,
+    )
+    db.add(q)
+    db.commit()
+    db.refresh(q)
+    return _query_to_dict(q)
+
+
+@app.get("/api/path-analysis/saved-queries")
+def list_saved_queries(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List all saved queries for the current user, newest first."""
+    rows = (
+        db.query(PathAnalysisSavedQueryModel)
+        .filter(PathAnalysisSavedQueryModel.owner_user_id == current_user.id)
+        .order_by(PathAnalysisSavedQueryModel.updated_at.desc())
+        .all()
+    )
+    return [_query_to_dict(q) for q in rows]
+
+
+@app.get("/api/path-analysis/saved-queries/{query_id}")
+def get_saved_query(
+    query_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Get one saved query. Returns 403 if it belongs to a different user."""
+    return _query_to_dict(_get_query_or_404(db, query_id, current_user.id))
+
+
+@app.put("/api/path-analysis/saved-queries/{query_id}")
+def update_saved_query(
+    query_id: int,
+    req: SavedQueryUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Partial update of a saved query. Only provided fields are changed."""
+    q = _get_query_or_404(db, query_id, current_user.id)
+
+    if req.name is not None:
+        q.name = req.name.strip()
+    if req.source_ip is not None:
+        q.source_ip = req.source_ip.strip()
+    if req.destination_ip is not None:
+        q.destination_ip = req.destination_ip.strip()
+    if req.clear_port:
+        q.destination_port = None
+    elif req.destination_port is not None:
+        q.destination_port = req.destination_port
+    if req.clear_preset:
+        q.role_preset_id = None
+    elif req.role_preset_id is not None:
+        _get_preset_or_404(db, req.role_preset_id, current_user.id)
+        q.role_preset_id = req.role_preset_id
+    if req.firewall_ips is not None:
+        q.firewall_ips = json.dumps(_preset_lists(req.firewall_ips))
+    if req.load_balancer_vips is not None:
+        q.load_balancer_vips = json.dumps(_preset_lists(req.load_balancer_vips))
+    if req.backend_ips is not None:
+        q.backend_ips = json.dumps(_preset_lists(req.backend_ips))
+    if req.backend_subnets is not None:
+        q.backend_subnets = json.dumps(_preset_lists(req.backend_subnets))
+    if req.note is not None:
+        q.note = req.note or None
+    q.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(q)
+    return _query_to_dict(q)
+
+
+@app.delete("/api/path-analysis/saved-queries/{query_id}", status_code=204)
+def delete_saved_query(
+    query_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Delete a saved query. Returns 403 if it belongs to a different user."""
+    q = _get_query_or_404(db, query_id, current_user.id)
+    db.delete(q)
+    db.commit()
 
 
 # ── Path Analysis Role Presets ────────────────────────────────────────────────

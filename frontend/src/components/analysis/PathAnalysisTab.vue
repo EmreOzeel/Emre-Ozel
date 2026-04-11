@@ -1,6 +1,120 @@
 <template>
   <div class="path-analysis-tab">
 
+    <!-- ── Saved Queries bar ───────────────────────────────────────────────── -->
+    <el-card class="saved-queries-card" shadow="never">
+      <template #header>
+        <span class="card-title">Saved Queries</span>
+        <span class="card-subtitle">Reusable investigation targets</span>
+      </template>
+
+      <div class="sq-bar">
+        <el-select
+          v-model="selectedQueryId"
+          placeholder="Load a saved query…"
+          clearable
+          size="small"
+          style="flex: 1; min-width: 0"
+          :loading="queriesLoading"
+          @change="applyQuery"
+          @clear="clearQuerySelection"
+        >
+          <el-option
+            v-for="q in savedQueries"
+            :key="q.id"
+            :value="q.id"
+            :label="q.name"
+          >
+            <span>{{ q.name }}</span>
+            <span class="sq-option-sub">
+              {{ q.source_ip }} → {{ q.destination_ip
+              }}<template v-if="q.destination_port">:{{ q.destination_port }}</template>
+            </span>
+          </el-option>
+        </el-select>
+
+        <el-button
+          v-if="selectedQueryId"
+          size="small"
+          type="primary"
+          plain
+          :loading="querySaving"
+          @click="updateQuery"
+        >Update "{{ selectedQueryName }}"</el-button>
+
+        <el-button
+          size="small"
+          plain
+          :loading="querySaving"
+          @click="showQueryDialog = true"
+        >
+          <el-icon style="margin-right: 4px"><Plus /></el-icon>Save current query
+        </el-button>
+
+        <el-button
+          v-if="selectedQueryId"
+          size="small"
+          plain
+          type="danger"
+          :loading="queryDeleting"
+          @click="deleteQuery"
+        >Delete</el-button>
+      </div>
+
+      <div v-if="selectedQuery?.note" class="sq-note">
+        {{ selectedQuery.note }}
+      </div>
+
+      <el-alert
+        v-if="queryError"
+        type="error"
+        :title="queryError"
+        show-icon
+        :closable="true"
+        style="margin-top: 8px"
+        @close="queryError = ''"
+      />
+    </el-card>
+
+    <!-- Save-query dialog -->
+    <el-dialog
+      v-model="showQueryDialog"
+      title="Save Current Query"
+      width="400px"
+      :close-on-click-modal="false"
+    >
+      <el-form size="small" label-width="80px">
+        <el-form-item label="Name" required>
+          <el-input
+            v-model="newQueryName"
+            placeholder="e.g. Client → LB health check"
+            clearable
+            maxlength="200"
+            show-word-limit
+            autofocus
+          />
+        </el-form-item>
+        <el-form-item label="Note">
+          <el-input
+            v-model="newQueryNote"
+            type="textarea"
+            :rows="2"
+            placeholder="Optional context for this investigation"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button size="small" @click="showQueryDialog = false">Cancel</el-button>
+        <el-button
+          size="small"
+          type="primary"
+          :loading="querySaving"
+          :disabled="!newQueryName.trim()"
+          @click="saveNewQuery"
+        >Save</el-button>
+      </template>
+    </el-dialog>
+
     <!-- Input form -->
     <el-card class="form-card" shadow="never">
       <template #header>
@@ -740,8 +854,159 @@ function clearResult() {
   feedbackError.value   = ''
 }
 
+// ── Saved queries state ───────────────────────────────────────────────────────
+interface SavedQuery {
+  id: number
+  name: string
+  source_ip: string
+  destination_ip: string
+  destination_port: number | null
+  role_preset_id: number | null
+  firewall_ips: string[]
+  load_balancer_vips: string[]
+  backend_ips: string[]
+  backend_subnets: string[]
+  note: string | null
+}
+
+const savedQueries      = ref<SavedQuery[]>([])
+const queriesLoading    = ref(false)
+const selectedQueryId   = ref<number | null>(null)
+const querySaving       = ref(false)
+const queryDeleting     = ref(false)
+const queryError        = ref('')
+const showQueryDialog   = ref(false)
+const newQueryName      = ref('')
+const newQueryNote      = ref('')
+
+const selectedQueryName = computed(
+  () => savedQueries.value.find(q => q.id === selectedQueryId.value)?.name ?? ''
+)
+const selectedQuery = computed(
+  () => savedQueries.value.find(q => q.id === selectedQueryId.value) ?? null
+)
+
+async function loadSavedQueries() {
+  queriesLoading.value = true
+  try {
+    const res = await api.get('/path-analysis/saved-queries')
+    savedQueries.value = res.data
+  } catch {
+    // Non-critical — silently ignore
+  } finally {
+    queriesLoading.value = false
+  }
+}
+
+function applyQuery(id: number | null) {
+  if (!id) return
+  const q = savedQueries.value.find(q => q.id === id)
+  if (!q) return
+
+  // Populate all form fields from the saved query
+  form.source_ip           = q.source_ip
+  form.destination_ip      = q.destination_ip
+  form.destination_port_raw = q.destination_port != null ? String(q.destination_port) : ''
+  form.firewall_ips_raw    = q.firewall_ips.join(', ')
+  form.lb_vips_raw         = q.load_balancer_vips.join(', ')
+  form.backend_ips_raw     = q.backend_ips.join(', ')
+  form.backend_subnets_raw = q.backend_subnets.join(', ')
+
+  // Sync preset selector if the query references one
+  if (q.role_preset_id != null && presets.value.some(p => p.id === q.role_preset_id)) {
+    selectedPresetId.value = q.role_preset_id
+  } else {
+    selectedPresetId.value = null
+  }
+
+  // Expand role hints so the user sees what was loaded
+  if (!activeCollapse.value.includes('roles')) {
+    activeCollapse.value = [...activeCollapse.value, 'roles']
+  }
+}
+
+function clearQuerySelection() {
+  selectedQueryId.value = null
+}
+
+function currentQueryPayload() {
+  const port = parseInt(form.destination_port_raw, 10)
+  return {
+    source_ip:          form.source_ip.trim(),
+    destination_ip:     form.destination_ip.trim(),
+    destination_port:   !isNaN(port) && port > 0 ? port : null,
+    role_preset_id:     selectedPresetId.value,
+    firewall_ips:       parseList(form.firewall_ips_raw),
+    load_balancer_vips: parseList(form.lb_vips_raw),
+    backend_ips:        parseList(form.backend_ips_raw),
+    backend_subnets:    parseList(form.backend_subnets_raw),
+  }
+}
+
+async function saveNewQuery() {
+  if (!newQueryName.value.trim()) return
+  querySaving.value = true
+  queryError.value  = ''
+  try {
+    const res = await api.post('/path-analysis/saved-queries', {
+      name: newQueryName.value.trim(),
+      note: newQueryNote.value.trim() || null,
+      ...currentQueryPayload(),
+    })
+    savedQueries.value.unshift(res.data)
+    selectedQueryId.value = res.data.id
+    showQueryDialog.value = false
+    newQueryName.value    = ''
+    newQueryNote.value    = ''
+  } catch (e: any) {
+    queryError.value = e.response?.data?.detail ?? 'Failed to save query.'
+  } finally {
+    querySaving.value = false
+  }
+}
+
+async function updateQuery() {
+  if (!selectedQueryId.value) return
+  querySaving.value = true
+  queryError.value  = ''
+  try {
+    const res = await api.put(
+      `/path-analysis/saved-queries/${selectedQueryId.value}`,
+      {
+        ...currentQueryPayload(),
+        clear_port:   currentQueryPayload().destination_port == null,
+        clear_preset: selectedPresetId.value == null,
+      },
+    )
+    const idx = savedQueries.value.findIndex(q => q.id === selectedQueryId.value)
+    if (idx !== -1) savedQueries.value[idx] = res.data
+  } catch (e: any) {
+    queryError.value = e.response?.data?.detail ?? 'Failed to update query.'
+  } finally {
+    querySaving.value = false
+  }
+}
+
+async function deleteQuery() {
+  if (!selectedQueryId.value) return
+  queryDeleting.value = true
+  queryError.value    = ''
+  try {
+    await api.delete(`/path-analysis/saved-queries/${selectedQueryId.value}`)
+    savedQueries.value  = savedQueries.value.filter(q => q.id !== selectedQueryId.value)
+    selectedQueryId.value = null
+  } catch (e: any) {
+    queryError.value = e.response?.data?.detail ?? 'Failed to delete query.'
+  } finally {
+    queryDeleting.value = false
+  }
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
-onMounted(loadPresets)
+onMounted(() => {
+  loadPresets()
+  loadSavedQueries()
+})
 
 // ── Display helpers ───────────────────────────────────────────────────────────
 const outcomeLabel = computed(() => {
@@ -804,6 +1069,19 @@ function formatDate(iso: string): string {
 
 <style scoped>
 .path-analysis-tab { display: flex; flex-direction: column; gap: 12px; }
+
+/* Saved queries */
+.saved-queries-card :deep(.el-card__header) { display: flex; align-items: baseline; gap: 10px; }
+.sq-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.sq-option-sub {
+  margin-left: 8px; font-size: 11px; color: #909399; font-family: monospace;
+}
+.sq-note {
+  margin-top: 8px; font-size: 12px; color: #606266;
+  border-left: 3px solid #dcdfe6; padding-left: 8px;
+}
 
 /* Form card header */
 .form-card :deep(.el-card__header) { display: flex; align-items: baseline; gap: 10px; }

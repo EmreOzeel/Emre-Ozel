@@ -143,6 +143,38 @@ class FindingTriageModel(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class PathAnalysisSavedQueryModel(Base):
+    """
+    A saved path-analysis investigation target.
+
+    A query captures the full set of inputs needed to re-run a path analysis:
+    source IP, destination IP, optional port, and role hints.  Role hints may
+    be stored either as an explicit reference to a PathAnalysisRolePresetModel
+    (role_preset_id) or as inline JSON arrays — or both (the inline values
+    override the preset when present).
+
+    List fields are stored in sorted, deduplicated order (same normalisation
+    as PathAnalysisRolePresetModel) so that ordering in the original request
+    never causes false inequality.
+    """
+    __tablename__ = "path_analysis_saved_queries"
+    id                 = Column(Integer, primary_key=True, index=True)
+    owner_user_id      = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name               = Column(String, nullable=False)
+    source_ip          = Column(String, nullable=False)
+    destination_ip     = Column(String, nullable=False)
+    destination_port   = Column(Integer, nullable=True)
+    role_preset_id     = Column(Integer, ForeignKey("path_analysis_role_presets.id"),
+                                nullable=True)
+    firewall_ips       = Column(Text, nullable=False, default="[]")    # JSON array
+    load_balancer_vips = Column(Text, nullable=False, default="[]")    # JSON array
+    backend_ips        = Column(Text, nullable=False, default="[]")    # JSON array
+    backend_subnets    = Column(Text, nullable=False, default="[]")    # JSON array
+    note               = Column(Text, nullable=True)
+    created_at         = Column(DateTime, server_default=func.now())
+    updated_at         = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class PathAnalysisRolePresetModel(Base):
     """
     Saved role-hint profile for CausalPathEngine.
