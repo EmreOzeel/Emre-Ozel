@@ -684,54 +684,87 @@ function pcClear() {
 .hd-label.danger { color: #f56c6c; }
 .hd-label.success { color: #67c23a; }
 
-/* ── Path Compare shell ──────────────────────────────────────────────────── */
+/* ── Path Compare ────────────────────────────────────────────────────────── */
 .path-compare-divider-label {
   font-size: 13px; font-weight: 700; color: #409eff; letter-spacing: .04em;
 }
 
+/* inputs card */
 .pc-inputs-card { margin-bottom: 12px; }
-
-.pc-selectors {
-  display: flex; align-items: flex-end; gap: 12px; margin-bottom: 12px;
-}
-.pc-sel-col  { flex: 1; }
-.pc-sel-placeholder {
-  font-size: 12px; color: #c0c4cc; padding: 6px 0; font-style: italic;
-}
-
-.pc-query-row {
-  display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap;
-}
-.pc-query-col { flex: 1; min-width: 180px; }
-.pc-or        { font-weight: 700; color: #c0c4cc; padding: 0 4px; }
-.pc-manual-row { display: flex; gap: 10px; flex: 2; flex-wrap: wrap; }
+.pc-selectors   { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 12px; }
+.pc-sel-col     { flex: 1; }
+.pc-sel-placeholder { font-size: 12px; color: #c0c4cc; padding: 6px 0; font-style: italic; }
+.pc-query-row   { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.pc-query-col   { flex: 1; min-width: 180px; }
+.pc-or          { font-weight: 700; color: #c0c4cc; padding: 0 4px; }
+.pc-manual-row  { display: flex; gap: 10px; flex: 2; flex-wrap: wrap; }
 .pc-field-placeholder {
   font-size: 12px; color: #c0c4cc; padding: 6px 8px;
   border: 1px dashed #dcdfe6; border-radius: 4px;
   font-style: italic; min-width: 120px;
 }
 
-.pc-results-shell { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+/* results stack */
+.pc-results-shell { display: flex; flex-direction: column; gap: 12px; margin-top: 8px; }
 
-.pc-section-card :deep(.el-card__header) { padding: 10px 16px; }
-.pc-section-title { font-weight: 600; font-size: 13px; }
+/* section cards */
+.pc-section-card :deep(.el-card__header) {
+  padding: 10px 16px;
+  background: #fafafa;
+  border-bottom: 1px solid #ebeef5;
+}
+.pc-section-title { font-weight: 600; font-size: 13px; color: #303133; }
 
-.pc-regression-card { border-left: 3px solid #f56c6c; }
+/* regression point — left accent + tinted background */
+.pc-regression-card {
+  border-left: 4px solid #f56c6c;
+}
+.pc-regression-card :deep(.el-card__header) {
+  background: #fff5f5;
+  border-bottom-color: #fde2e2;
+}
+.pc-regression-card :deep(.el-card__body) {
+  background: #fffafa;
+}
 
+/* baseline / incident side-by-side */
 .pc-side-by-side {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
 }
 .pc-side-card :deep(.el-card__header) { padding: 10px 16px; }
 
-.pc-placeholder {
-  font-size: 12px; color: #c0c4cc; font-style: italic; padding: 8px 0;
+/* baseline header — neutral blue tint */
+.pc-side-card:first-child :deep(.el-card__header) {
+  background: #f0f7ff;
+  border-bottom-color: #d0e8ff;
+}
+/* incident header — orange/red tint to signal attention */
+.pc-side-card:last-child :deep(.el-card__header) {
+  background: #fff8f0;
+  border-bottom-color: #ffe4c0;
 }
 
-.pc-summary-table { font-size: 12px; border-collapse: collapse; width: 100%; }
-.pc-summary-table td { padding: 4px 8px 4px 0; vertical-align: top; }
-.pc-summary-table td:first-child { color: #909399; white-space: nowrap; width: 140px; }
+/* summary key-value tables */
+.pc-summary-table {
+  font-size: 12px; border-collapse: collapse; width: 100%;
+}
+.pc-summary-table tr + tr td { border-top: 1px solid #f4f4f5; }
+.pc-summary-table td { padding: 5px 8px 5px 0; vertical-align: top; }
+.pc-summary-table td:first-child {
+  color: #909399; white-space: nowrap; width: 140px; font-weight: 500;
+}
 
-.pc-timing-table { font-size: 12px; border-collapse: collapse; width: 100%; }
-.pc-timing-table th { text-align: left; color: #909399; font-weight: 600; padding: 4px 8px 4px 0; border-bottom: 1px solid #ebeef5; }
-.pc-timing-table td { padding: 4px 8px 4px 0; }
+/* timing table */
+.pc-timing-table {
+  font-size: 12px; border-collapse: collapse; width: 100%;
+}
+.pc-timing-table th {
+  text-align: left; color: #909399; font-weight: 600;
+  padding: 4px 8px 6px 0; border-bottom: 1px solid #ebeef5;
+}
+.pc-timing-table td { padding: 5px 8px 5px 0; }
+.pc-timing-table tr + tr td { border-top: 1px solid #f5f5f5; }
+
+/* placeholder (inputs not yet replaced by real controls) */
+.pc-placeholder { font-size: 12px; color: #c0c4cc; font-style: italic; padding: 8px 0; }
 </style>
