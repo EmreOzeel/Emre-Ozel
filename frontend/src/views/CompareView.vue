@@ -261,59 +261,120 @@
       </div>
     </el-card>
 
-    <!-- ── Results shell (shown after compare runs) ───────────────────────── -->
-    <div class="pc-results-shell">
+    <!-- ── Results (rendered when pcResult is set) ───────────────────────── -->
+    <template v-if="pcResult">
 
-      <!-- Most likely regression point — prominent banner -->
-      <el-card shadow="never" class="pc-section-card pc-regression-card">
+      <!-- Most likely regression point -->
+      <el-card v-if="pcResult.most_likely_regression_point" shadow="never" class="pc-section-card pc-regression-card">
         <template #header><span class="pc-section-title">Most Likely Regression Point</span></template>
-        <div class="pc-placeholder">Regression point will appear here</div>
+        <p style="margin: 0; font-size: 13px">{{ pcResult.most_likely_regression_point }}</p>
       </el-card>
 
       <!-- Key differences -->
-      <el-card shadow="never" class="pc-section-card">
+      <el-card v-if="pcResult.key_differences.length" shadow="never" class="pc-section-card">
         <template #header><span class="pc-section-title">Key Differences</span></template>
-        <div class="pc-placeholder">Bulleted list of what changed</div>
+        <ul style="margin: 0; padding-left: 18px; font-size: 13px">
+          <li v-for="(d, i) in pcResult.key_differences" :key="i">{{ d }}</li>
+        </ul>
       </el-card>
 
-      <!-- Side-by-side: baseline summary | incident summary -->
+      <!-- Baseline / Incident summaries -->
       <div class="pc-side-by-side">
         <el-card shadow="never" class="pc-side-card">
           <template #header><span class="pc-section-title">Baseline Summary</span></template>
-          <div class="pc-placeholder">Outcome · Primary Impairment · Confidence · Path Summary</div>
+          <table class="pc-summary-table">
+            <tr><td>Outcome</td><td>{{ pcResult.baseline_summary.connection_outcome }}</td></tr>
+            <tr><td>Primary Impairment</td><td>{{ pcResult.baseline_summary.primary_impairment ?? '—' }}</td></tr>
+            <tr><td>All Impairments</td><td>{{ pcResult.baseline_summary.path_impairments.join(', ') || '—' }}</td></tr>
+            <tr><td>Confidence</td><td>{{ pcResult.baseline_summary.path_confidence_score }}%</td></tr>
+          </table>
+          <p v-if="pcResult.baseline_summary.path_summary" style="margin: 8px 0 0; font-size: 12px; color: #606266">
+            {{ pcResult.baseline_summary.path_summary }}
+          </p>
         </el-card>
 
         <el-card shadow="never" class="pc-side-card">
           <template #header><span class="pc-section-title">Incident Summary</span></template>
-          <div class="pc-placeholder">Outcome · Primary Impairment · Confidence · Path Summary</div>
+          <table class="pc-summary-table">
+            <tr><td>Outcome</td><td>{{ pcResult.incident_summary.connection_outcome }}</td></tr>
+            <tr><td>Primary Impairment</td><td>{{ pcResult.incident_summary.primary_impairment ?? '—' }}</td></tr>
+            <tr><td>All Impairments</td><td>{{ pcResult.incident_summary.path_impairments.join(', ') || '—' }}</td></tr>
+            <tr><td>Confidence</td><td>{{ pcResult.incident_summary.path_confidence_score }}%</td></tr>
+          </table>
+          <p v-if="pcResult.incident_summary.path_summary" style="margin: 8px 0 0; font-size: 12px; color: #606266">
+            {{ pcResult.incident_summary.path_summary }}
+          </p>
         </el-card>
       </div>
 
       <!-- Impairment changes -->
       <el-card shadow="never" class="pc-section-card">
         <template #header><span class="pc-section-title">Impairment Changes</span></template>
-        <div class="pc-placeholder">New · Resolved · Persisting impairment tags</div>
+        <table class="pc-summary-table">
+          <tr>
+            <td>New</td>
+            <td>{{ pcResult.impairment_changes.new.join(', ') || '—' }}</td>
+          </tr>
+          <tr>
+            <td>Resolved</td>
+            <td>{{ pcResult.impairment_changes.resolved.join(', ') || '—' }}</td>
+          </tr>
+          <tr>
+            <td>Persisting</td>
+            <td>{{ pcResult.impairment_changes.persisting.join(', ') || '—' }}</td>
+          </tr>
+        </table>
       </el-card>
 
       <!-- Timing differences -->
-      <el-card shadow="never" class="pc-section-card">
+      <el-card v-if="Object.keys(pcResult.timing_differences).length" shadow="never" class="pc-section-card">
         <template #header><span class="pc-section-title">Timing Differences</span></template>
-        <div class="pc-placeholder">Metric / Baseline ms / Incident ms / Delta table</div>
+        <table class="pc-timing-table">
+          <thead><tr><th>Metric</th><th>Baseline (ms)</th><th>Incident (ms)</th><th>Delta</th></tr></thead>
+          <tbody>
+            <tr v-for="(td, key) in pcResult.timing_differences" :key="key">
+              <td>{{ key }}</td>
+              <td>{{ td.baseline }}</td>
+              <td>{{ td.incident }}</td>
+              <td>{{ td.delta > 0 ? '+' : '' }}{{ td.delta }}</td>
+            </tr>
+          </tbody>
+        </table>
       </el-card>
 
       <!-- Confidence changes -->
       <el-card shadow="never" class="pc-section-card">
         <template #header><span class="pc-section-title">Confidence Changes</span></template>
-        <div class="pc-placeholder">Baseline % · Incident % · Delta</div>
+        <table class="pc-summary-table">
+          <tr><td>Baseline</td><td>{{ pcResult.confidence_changes.baseline }}%</td></tr>
+          <tr><td>Incident</td><td>{{ pcResult.confidence_changes.incident }}%</td></tr>
+          <tr>
+            <td>Delta</td>
+            <td>{{ pcResult.confidence_changes.delta > 0 ? '+' : '' }}{{ pcResult.confidence_changes.delta }}</td>
+          </tr>
+        </table>
       </el-card>
 
       <!-- Evidence differences -->
-      <el-card shadow="never" class="pc-section-card">
+      <el-card
+        v-if="pcResult.evidence_differences.incident_only.length || pcResult.evidence_differences.baseline_only.length"
+        shadow="never"
+        class="pc-section-card"
+      >
         <template #header><span class="pc-section-title">Evidence Differences</span></template>
-        <div class="pc-placeholder">Incident-only evidence types · Baseline-only evidence types</div>
+        <table class="pc-summary-table">
+          <tr>
+            <td>New in incident</td>
+            <td>{{ pcResult.evidence_differences.incident_only.join(', ') || '—' }}</td>
+          </tr>
+          <tr>
+            <td>Gone from baseline</td>
+            <td>{{ pcResult.evidence_differences.baseline_only.join(', ') || '—' }}</td>
+          </tr>
+        </table>
       </el-card>
 
-    </div>
+    </template>
   </div>
 </template>
 
@@ -665,4 +726,12 @@ function pcClear() {
 .pc-placeholder {
   font-size: 12px; color: #c0c4cc; font-style: italic; padding: 8px 0;
 }
+
+.pc-summary-table { font-size: 12px; border-collapse: collapse; width: 100%; }
+.pc-summary-table td { padding: 4px 8px 4px 0; vertical-align: top; }
+.pc-summary-table td:first-child { color: #909399; white-space: nowrap; width: 140px; }
+
+.pc-timing-table { font-size: 12px; border-collapse: collapse; width: 100%; }
+.pc-timing-table th { text-align: left; color: #909399; font-weight: 600; padding: 4px 8px 4px 0; border-bottom: 1px solid #ebeef5; }
+.pc-timing-table td { padding: 4px 8px 4px 0; }
 </style>
