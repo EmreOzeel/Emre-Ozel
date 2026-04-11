@@ -374,6 +374,16 @@
         </table>
       </el-card>
 
+      <!-- Export -->
+      <div class="export-bar">
+        <el-button size="small" plain :loading="pcExportJsonLoading" @click="pcExportJson">
+          Export JSON
+        </el-button>
+        <el-button size="small" plain :loading="pcExportHtmlLoading" @click="pcExportHtml">
+          Export HTML Report
+        </el-button>
+      </div>
+
     </template>
   </div>
 </template>
@@ -609,6 +619,58 @@ function pcClear() {
   pcResult.value = null
   pcError.value  = ''
 }
+
+// ── Path Compare Export ───────────────────────────────────────────────────────
+const pcExportJsonLoading = ref(false)
+const pcExportHtmlLoading = ref(false)
+
+function pcTriggerDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function pcBuildExportPayload() {
+  return {
+    analysis_id:          pcResult.value!.incident_analysis_id,
+    source_ip:            pcResult.value!.source_ip,
+    destination_ip:       pcResult.value!.destination_ip,
+    destination_port:     pcResult.value!.destination_port,
+    roles:                pcRoles.value,
+    include_compare:      true,
+    baseline_analysis_id: pcResult.value!.baseline_analysis_id,
+    incident_analysis_id: pcResult.value!.incident_analysis_id,
+  }
+}
+
+async function pcExportJson() {
+  if (!pcResult.value) return
+  pcExportJsonLoading.value = true
+  try {
+    const res = await api.post('/path-analysis/export/json', pcBuildExportPayload(), { responseType: 'blob' })
+    pcTriggerDownload(res.data, `investigation_compare_${pcResult.value.incident_analysis_id}.json`)
+  } catch {
+    // Silent
+  } finally {
+    pcExportJsonLoading.value = false
+  }
+}
+
+async function pcExportHtml() {
+  if (!pcResult.value) return
+  pcExportHtmlLoading.value = true
+  try {
+    const res = await api.post('/path-analysis/export/html', pcBuildExportPayload(), { responseType: 'blob' })
+    pcTriggerDownload(res.data, `investigation_compare_${pcResult.value.incident_analysis_id}.html`)
+  } catch {
+    // Silent
+  } finally {
+    pcExportHtmlLoading.value = false
+  }
+}
 </script>
 
 <style scoped>
@@ -767,4 +829,7 @@ function pcClear() {
 
 /* placeholder (inputs not yet replaced by real controls) */
 .pc-placeholder { font-size: 12px; color: #c0c4cc; font-style: italic; padding: 8px 0; }
+
+/* Export */
+.export-bar { display: flex; gap: 8px; padding-top: 4px; }
 </style>

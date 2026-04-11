@@ -558,6 +558,16 @@
         />
       </el-card>
 
+      <!-- Export -->
+      <div class="export-bar">
+        <el-button size="small" plain :loading="exportJsonLoading" @click="exportJson">
+          Export JSON
+        </el-button>
+        <el-button size="small" plain :loading="exportHtmlLoading" @click="exportHtml">
+          Export HTML Report
+        </el-button>
+      </div>
+
     </template>
   </div>
 </template>
@@ -1002,6 +1012,66 @@ async function deleteQuery() {
   }
 }
 
+// ── Export ────────────────────────────────────────────────────────────────────
+const exportJsonLoading = ref(false)
+const exportHtmlLoading = ref(false)
+
+function buildExportPayload() {
+  const port = parseInt(form.destination_port_raw, 10)
+  const fw = parseList(form.firewall_ips_raw)
+  const lb = parseList(form.lb_vips_raw)
+  const be = parseList(form.backend_ips_raw)
+  const sn = parseList(form.backend_subnets_raw)
+  const roles: Record<string, string[]> = {}
+  if (fw.length) roles.firewall_ips = fw
+  if (lb.length) roles.load_balancer_vips = lb
+  if (be.length) roles.backend_ips = be
+  if (sn.length) roles.backend_subnets = sn
+  return {
+    analysis_id:      props.analysisId,
+    source_ip:        result.value!.source_ip,
+    destination_ip:   result.value!.destination_ip,
+    destination_port: result.value?.destination_port ?? null,
+    roles:            Object.keys(roles).length ? roles : null,
+    saved_query_id:   selectedQueryId.value ?? null,
+  }
+}
+
+function triggerDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function exportJson() {
+  if (!result.value) return
+  exportJsonLoading.value = true
+  try {
+    const res = await api.post('/path-analysis/export/json', buildExportPayload(), { responseType: 'blob' })
+    triggerDownload(res.data, `investigation_${props.analysisId}.json`)
+  } catch {
+    // Silent — download errors are transient and hard to surface usefully
+  } finally {
+    exportJsonLoading.value = false
+  }
+}
+
+async function exportHtml() {
+  if (!result.value) return
+  exportHtmlLoading.value = true
+  try {
+    const res = await api.post('/path-analysis/export/html', buildExportPayload(), { responseType: 'blob' })
+    triggerDownload(res.data, `investigation_${props.analysisId}.html`)
+  } catch {
+    // Silent
+  } finally {
+    exportHtmlLoading.value = false
+  }
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 onMounted(() => {
   loadPresets()
@@ -1170,4 +1240,7 @@ function formatDate(iso: string): string {
 }
 .fb-prediction { background: #fafafa; border-radius: 4px; padding: 6px 8px; }
 .fb-prediction .fb-value { font-family: monospace; font-size: 12px; }
+
+/* Export */
+.export-bar { display: flex; gap: 8px; padding-top: 4px; }
 </style>
