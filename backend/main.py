@@ -572,6 +572,69 @@ def _compute_path_cache_key(
     return hashlib.sha256(parts.encode()).hexdigest()
 
 
+def _load_or_run_path_result(
+    analysis_id: str,
+    user_id: int,
+    source_ip: str,
+    destination_ip: str,
+    destination_port: Optional[int],
+    roles: Optional[dict],
+    db: Session,
+) -> dict:
+    """Return a path-analysis result dict, using the cache when available.
+
+    Shared by ``run_path_analysis`` and ``compare_path_analysis`` so that
+    the cache + engine execution logic is not duplicated.  Raises HTTPException
+    on any error (analysis not found, not completed, PCAP missing, parse fail).
+    """
+    from core.causal_path import CausalPathEngine, CACHE_ENGINE_VERSION
+
+    row = _get_or_404(db, analysis_id, user_id)
+    if row.status != "completed":
+        raise HTTPException(400, f"Analysis {analysis_id} must be completed")
+
+    cache_key = _compute_path_cache_key(
+        analysis_id, source_ip, destination_ip,
+        destination_port, roles, CACHE_ENGINE_VERSION,
+    )
+    cached = (
+        db.query(PathAnalysisCacheModel)
+        .filter(PathAnalysisCacheModel.cache_key == cache_key)
+        .first()
+    )
+    if cached:
+        return json.loads(cached.result_json)
+
+    if not row.file_path or not Path(row.file_path).exists():
+        raise HTTPException(404, f"PCAP file for analysis {analysis_id} is no longer available")
+
+    from normalizer.pipeline import normalize
+
+    try:
+        ctx = normalize(row.file_path)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to parse PCAP for {analysis_id}: {e}")
+
+    engine = CausalPathEngine(ctx.packets, ctx.flows, ctx.findings, ctx)
+    result = engine.analyze(source_ip, destination_ip,
+                            destination_port=destination_port, roles=roles)
+    result_dict = result.to_dict()
+
+    db.add(PathAnalysisCacheModel(
+        cache_key=cache_key,
+        analysis_id=analysis_id,
+        source_ip=source_ip,
+        destination_ip=destination_ip,
+        destination_port=destination_port,
+        roles_hash=_compute_roles_hash(roles),
+        engine_version=CACHE_ENGINE_VERSION,
+        result_json=json.dumps(result_dict),
+    ))
+    db.commit()
+
+    return result_dict
+
+
 @app.post("/api/analyses/{analysis_id}/path-analysis")
 def run_path_analysis(
     analysis_id: str,
@@ -586,13 +649,14 @@ def run_path_analysis(
     expensive PCAP normalisation step entirely and include ``from_cache: true``
     in the response.
     """
-    from core.causal_path import CausalPathEngine, CACHE_ENGINE_VERSION
+    from core.causal_path import CACHE_ENGINE_VERSION
 
+    # Check cache first to avoid the _load_or_run_path_result check (it would
+    # 400 on non-completed, but we want the same error message as before).
     row = _get_or_404(db, analysis_id, current_user.id)
     if row.status != "completed":
         raise HTTPException(400, "Analysis must be completed before running path analysis")
 
-    # ── Cache lookup ──────────────────────────────────────────────────────────
     cache_key = _compute_path_cache_key(
         analysis_id, req.source_ip, req.destination_ip,
         req.destination_port, req.roles, CACHE_ENGINE_VERSION,
@@ -609,38 +673,10 @@ def run_path_analysis(
               properties={"analysis_id": analysis_id})
         return result_dict
 
-    # ── Cache miss — compute fresh result ─────────────────────────────────────
-    if not row.file_path or not Path(row.file_path).exists():
-        raise HTTPException(404, "Original PCAP file is no longer available")
-
-    from normalizer.pipeline import normalize
-
-    try:
-        ctx = normalize(row.file_path)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to parse PCAP: {e}")
-
-    engine = CausalPathEngine(ctx.packets, ctx.flows, ctx.findings, ctx)
-    result = engine.analyze(
-        req.source_ip,
-        req.destination_ip,
-        destination_port=req.destination_port,
-        roles=req.roles,
+    result_dict = _load_or_run_path_result(
+        analysis_id, current_user.id,
+        req.source_ip, req.destination_ip, req.destination_port, req.roles, db,
     )
-
-    # ── Store result in cache ─────────────────────────────────────────────────
-    result_dict = result.to_dict()
-    db.add(PathAnalysisCacheModel(
-        cache_key=cache_key,
-        analysis_id=analysis_id,
-        source_ip=req.source_ip,
-        destination_ip=req.destination_ip,
-        destination_port=req.destination_port,
-        roles_hash=_compute_roles_hash(req.roles),
-        engine_version=CACHE_ENGINE_VERSION,
-        result_json=json.dumps(result_dict),
-    ))
-    db.commit()
 
     track("path_analysis.executed", user_id=current_user.id, properties={
         "analysis_id": analysis_id,
@@ -650,6 +686,190 @@ def run_path_analysis(
 
     result_dict["from_cache"] = False
     return result_dict
+
+
+# ── Path Compare ──────────────────────────────────────────────────────────────
+
+class PathCompareRequest(BaseModel):
+    baseline_analysis_id: str
+    incident_analysis_id: str
+    source_ip: str = Field(min_length=1)
+    destination_ip: str = Field(min_length=1)
+    destination_port: Optional[int] = None
+    roles: Optional[dict] = None
+
+
+_OUTCOME_SEVERITY: dict[str, int] = {
+    "success": 0, "partial_success": 1, "failure": 2, "unknown": 3,
+}
+
+_REGRESSION_HINTS: dict[str, str] = {
+    "backend_response_delay": "Backend server response time increased significantly",
+    "return_path_problem":    "Return path or asymmetric routing issue emerged",
+    "firewall_interference":  "Firewall policy may have changed or is now blocking traffic",
+    "lb_backend_issue":       "Load balancer or backend pool health degraded",
+    "connection_refused":     "Connection actively refused — service or port may have changed",
+    "no_response":            "Complete loss of response from destination",
+    "tls_failure":            "TLS negotiation failure introduced",
+    "packet_loss":            "Significant packet loss detected on the path",
+    "syn_timeout":            "TCP SYN timed out — destination may be unreachable",
+}
+
+
+def _compare_path_results(baseline: dict, incident: dict) -> dict:
+    """Produce a structured diff between two PathAnalysisResult dicts."""
+
+    def _summary(r: dict) -> dict:
+        return {
+            "connection_outcome":    r.get("connection_outcome", "unknown"),
+            "primary_impairment":    r.get("primary_impairment"),
+            "path_impairments":      r.get("path_impairments", []),
+            "path_confidence_score": r.get("path_confidence_score", 0),
+            "path_summary":          r.get("path_summary", ""),
+            "likely_failure_point":  r.get("likely_failure_point", ""),
+        }
+
+    baseline_summary = _summary(baseline)
+    incident_summary = _summary(incident)
+
+    # Outcome regression
+    b_outcome = baseline.get("connection_outcome", "unknown")
+    i_outcome = incident.get("connection_outcome", "unknown")
+    outcome_changed    = b_outcome != i_outcome
+    outcome_regression = (
+        _OUTCOME_SEVERITY.get(i_outcome, 3) > _OUTCOME_SEVERITY.get(b_outcome, 3)
+    )
+
+    # Impairment diff
+    b_imps = set(baseline.get("path_impairments", []))
+    i_imps = set(incident.get("path_impairments", []))
+    new_impairments       = sorted(i_imps - b_imps)
+    resolved_impairments  = sorted(b_imps - i_imps)
+    persisting_impairments = sorted(b_imps & i_imps)
+
+    # Timing diff (numeric values only)
+    b_timing = baseline.get("timing_breakdown", {}) or {}
+    i_timing = incident.get("timing_breakdown", {}) or {}
+    timing_differences: dict = {}
+    for key in sorted(set(b_timing) | set(i_timing)):
+        b_val = b_timing.get(key)
+        i_val = i_timing.get(key)
+        if isinstance(b_val, (int, float)) and isinstance(i_val, (int, float)):
+            delta = round(i_val - b_val, 3)
+            timing_differences[key] = {
+                "baseline": b_val,
+                "incident": i_val,
+                "delta":    delta,
+                "worsened": delta > 0,
+            }
+
+    # Confidence diff
+    b_conf = baseline.get("path_confidence_score", 0)
+    i_conf = incident.get("path_confidence_score", 0)
+    conf_delta = i_conf - b_conf
+    confidence_changes = {
+        "baseline": b_conf,
+        "incident": i_conf,
+        "delta":    conf_delta,
+        "worsened": conf_delta < 0,
+    }
+
+    # Evidence diff (by type token)
+    b_ev_types = {e.get("type") for e in baseline.get("evidence_items", [])}
+    i_ev_types = {e.get("type") for e in incident.get("evidence_items", [])}
+    evidence_differences = {
+        "baseline_only": sorted(b_ev_types - i_ev_types),
+        "incident_only": sorted(i_ev_types - b_ev_types),
+    }
+
+    # Key differences narrative
+    key_differences: list[str] = []
+    if outcome_changed:
+        verb = "degraded" if outcome_regression else "changed"
+        key_differences.append(
+            f"Connection outcome {verb}: "
+            f"{b_outcome.replace('_', ' ')} → {i_outcome.replace('_', ' ')}"
+        )
+    for imp in new_impairments:
+        key_differences.append(f"New impairment detected: {imp.replace('_', ' ')}")
+    for imp in resolved_impairments:
+        key_differences.append(f"Impairment resolved: {imp.replace('_', ' ')}")
+    if abs(conf_delta) >= 10:
+        direction = "dropped" if conf_delta < 0 else "improved"
+        key_differences.append(
+            f"Path confidence {direction} by {abs(conf_delta)} points "
+            f"({b_conf}% → {i_conf}%)"
+        )
+
+    # Most likely regression point
+    regression_point: Optional[str] = None
+    for imp in new_impairments:
+        hint = _REGRESSION_HINTS.get(imp)
+        if hint:
+            regression_point = hint
+            break
+    if not regression_point and outcome_regression:
+        if i_outcome == "failure":
+            regression_point = (
+                "Complete connection failure — destination unreachable or not responding"
+            )
+        else:
+            regression_point = (
+                "Partial degradation — connection established but impaired"
+            )
+
+    return {
+        "baseline_summary":         baseline_summary,
+        "incident_summary":         incident_summary,
+        "outcome_changed":          outcome_changed,
+        "outcome_regression":       outcome_regression,
+        "key_differences":          key_differences,
+        "impairment_changes": {
+            "new":        new_impairments,
+            "resolved":   resolved_impairments,
+            "persisting": persisting_impairments,
+        },
+        "timing_differences":       timing_differences,
+        "confidence_changes":       confidence_changes,
+        "evidence_differences":     evidence_differences,
+        "most_likely_regression_point": regression_point,
+    }
+
+
+@app.post("/api/path-analysis/compare")
+def compare_path_analysis(
+    req: PathCompareRequest,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Compare the same src→dst path across two analyses (baseline vs incident).
+
+    Runs or loads cached path analysis for both analysis IDs, then returns a
+    structured diff that highlights regressions, new impairments, timing
+    changes, and the most likely failure point.
+    """
+    baseline = _load_or_run_path_result(
+        req.baseline_analysis_id, current_user.id,
+        req.source_ip, req.destination_ip, req.destination_port, req.roles, db,
+    )
+    incident = _load_or_run_path_result(
+        req.incident_analysis_id, current_user.id,
+        req.source_ip, req.destination_ip, req.destination_port, req.roles, db,
+    )
+
+    result = _compare_path_results(baseline, incident)
+    result["baseline_analysis_id"] = req.baseline_analysis_id
+    result["incident_analysis_id"] = req.incident_analysis_id
+    result["source_ip"]            = req.source_ip
+    result["destination_ip"]       = req.destination_ip
+    result["destination_port"]     = req.destination_port
+
+    track("path_analysis.compare", user_id=current_user.id, properties={
+        "baseline_id": req.baseline_analysis_id,
+        "incident_id": req.incident_analysis_id,
+    })
+
+    return result
 
 
 # ── Path Analysis Feedback ────────────────────────────────────────────────────
