@@ -97,11 +97,17 @@ def startup():
     init_db()
     seed_admin()
     start_worker()
+    if settings.COLLECTOR_ENABLED:
+        from collector.service import start_collector
+        start_collector()
 
 
 @app.on_event("shutdown")
 def shutdown():
     stop_worker()
+    if settings.COLLECTOR_ENABLED:
+        from collector.service import stop_collector
+        stop_collector()
 
 
 # ── Pydantic response schemas ─────────────────────────────────────────────────
@@ -3546,6 +3552,192 @@ def get_baseline(
     m = _get_monitor_or_404(db, monitor_id, current_user)
     baseline = json.loads(m.baseline_json) if m.baseline_json else {}
     return {"baseline": baseline}
+
+
+# ── Live events API ──────────────────────────────────────────────────────────
+
+from database import LiveEventModel
+
+
+def _live_event_dict(r: LiveEventModel) -> dict:
+    return {
+        "id":                    r.id,
+        "source_id":             r.source_id,
+        "device_type":           r.device_type,
+        "device_role":           r.device_role,
+        "parser_id":             r.parser_id,
+        "event_time":            r.event_time.isoformat() if r.event_time else None,
+        "received_at":           r.received_at.isoformat() if r.received_at else None,
+        "source_ip":             r.source_ip,
+        "destination_ip":        r.destination_ip,
+        "source_port":           r.source_port,
+        "destination_port":      r.destination_port,
+        "protocol":              r.protocol,
+        "action":                r.action,
+        "reason":                r.reason,
+        "bytes_in":              r.bytes_in,
+        "bytes_out":             r.bytes_out,
+        "packets_in":            r.packets_in,
+        "packets_out":           r.packets_out,
+        "duration_ms":           r.duration_ms,
+        "nat_source_ip":         r.nat_source_ip,
+        "nat_destination_ip":    r.nat_destination_ip,
+        "nat_source_port":       r.nat_source_port,
+        "nat_destination_port":  r.nat_destination_port,
+        "application":           r.application,
+        "service":               r.service,
+        "backend_ip":            r.backend_ip,
+        "backend_port":          r.backend_port,
+        "response_time_ms":      r.response_time_ms,
+        "health_status":         r.health_status,
+    }
+
+
+@app.get("/api/live-events")
+def list_live_events(
+    source_ip: Optional[str] = None,
+    destination_ip: Optional[str] = None,
+    action: Optional[str] = None,
+    source_id: Optional[str] = None,
+    device_type: Optional[str] = None,
+    protocol: Optional[str] = None,
+    application: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Query ingested live events with optional filters.
+
+    Returns the most recent events first.  All filters are optional and
+    combined with AND.
+    """
+    q = db.query(LiveEventModel)
+    if source_ip:
+        q = q.filter(LiveEventModel.source_ip == source_ip)
+    if destination_ip:
+        q = q.filter(LiveEventModel.destination_ip == destination_ip)
+    if action:
+        q = q.filter(LiveEventModel.action == action)
+    if source_id:
+        q = q.filter(LiveEventModel.source_id == source_id)
+    if device_type:
+        q = q.filter(LiveEventModel.device_type == device_type)
+    if protocol:
+        q = q.filter(LiveEventModel.protocol == protocol.upper())
+    if application:
+        q = q.filter(LiveEventModel.application == application)
+    total = q.count()
+    rows = (
+        q.order_by(LiveEventModel.event_time.desc(), LiveEventModel.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "events": [_live_event_dict(r) for r in rows],
+    }
+
+
+@app.get("/api/live-events/stats")
+def live_events_stats(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Aggregated statistics over ingested live events.
+
+    Returns counts by action, device_type, top talkers, and a time
+    histogram for the last 24 hours.
+    """
+    from sqlalchemy import func as sqlfunc
+
+    total = db.query(LiveEventModel).count()
+
+    # By action
+    action_counts = dict(
+        db.query(LiveEventModel.action, sqlfunc.count(LiveEventModel.id))
+        .group_by(LiveEventModel.action)
+        .all()
+    )
+
+    # By device type
+    device_counts = dict(
+        db.query(LiveEventModel.device_type, sqlfunc.count(LiveEventModel.id))
+        .group_by(LiveEventModel.device_type)
+        .all()
+    )
+
+    # By parser
+    parser_counts = dict(
+        db.query(LiveEventModel.parser_id, sqlfunc.count(LiveEventModel.id))
+        .group_by(LiveEventModel.parser_id)
+        .all()
+    )
+
+    # Top source IPs (by event count)
+    top_sources = [
+        {"ip": ip, "count": c}
+        for ip, c in (
+            db.query(LiveEventModel.source_ip, sqlfunc.count(LiveEventModel.id))
+            .group_by(LiveEventModel.source_ip)
+            .order_by(sqlfunc.count(LiveEventModel.id).desc())
+            .limit(10)
+            .all()
+        )
+    ]
+
+    # Top destination IPs
+    top_destinations = [
+        {"ip": ip, "count": c}
+        for ip, c in (
+            db.query(LiveEventModel.destination_ip, sqlfunc.count(LiveEventModel.id))
+            .group_by(LiveEventModel.destination_ip)
+            .order_by(sqlfunc.count(LiveEventModel.id).desc())
+            .limit(10)
+            .all()
+        )
+    ]
+
+    # Top denied sources (deny + drop + reset)
+    denied_actions = ("deny", "drop", "reset")
+    top_denied = [
+        {"ip": ip, "count": c}
+        for ip, c in (
+            db.query(LiveEventModel.source_ip, sqlfunc.count(LiveEventModel.id))
+            .filter(LiveEventModel.action.in_(denied_actions))
+            .group_by(LiveEventModel.source_ip)
+            .order_by(sqlfunc.count(LiveEventModel.id).desc())
+            .limit(10)
+            .all()
+        )
+    ]
+
+    # Collector status
+    from collector.service import collector_stats
+    collector = collector_stats()
+
+    return {
+        "total_events": total,
+        "by_action": action_counts,
+        "by_device_type": device_counts,
+        "by_parser": parser_counts,
+        "top_sources": top_sources,
+        "top_destinations": top_destinations,
+        "top_denied_sources": top_denied,
+        "collector": collector,
+    }
+
+
+@app.get("/api/collector/status")
+def get_collector_status(
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return the current collector service status."""
+    from collector.service import collector_stats
+    return collector_stats()
 
 
 # ── Path Analysis Role Presets ────────────────────────────────────────────────

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import List
 
 from pydantic_settings import BaseSettings
@@ -26,6 +24,16 @@ class Settings(BaseSettings):
     # ── Analysis limits ───────────────────────────────────────────────────────
     ANALYSIS_TIMEOUT_SEC: int = 300
     MAX_ANALYSES_PER_USER: int = 0
+
+    # ── Live collector ───────────────────────────────────────────────────────
+    COLLECTOR_ENABLED: bool = False
+    SYSLOG_HOST: str = "0.0.0.0"
+    SYSLOG_PORT: int = 5514
+    COLLECTOR_FLUSH_INTERVAL: float = 1.0
+    COLLECTOR_BATCH_SIZE: int = 100
+    COLLECTOR_SOURCE_ID: str = ""
+    COLLECTOR_DEVICE_ROLE: str = "unknown"
+    RETENTION_DAYS: int = 7
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: List[str] = ["*"]

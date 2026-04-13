@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import List
 
 from pydantic_settings import BaseSettings
@@ -31,6 +29,16 @@ class Settings(BaseSettings):
     # ── Analysis limits ───────────────────────────────────────────────────────
     ANALYSIS_TIMEOUT_SEC: int = 300   # wall-clock limit per analysis job
     MAX_ANALYSES_PER_USER: int = 0    # 0 = unlimited
+
+    # ── Live collector ───────────────────────────────────────────────────────
+    COLLECTOR_ENABLED: bool = False     # opt-in: set to True to start listener
+    SYSLOG_HOST: str = "0.0.0.0"
+    SYSLOG_PORT: int = 5514
+    COLLECTOR_FLUSH_INTERVAL: float = 1.0   # seconds
+    COLLECTOR_BATCH_SIZE: int = 100
+    COLLECTOR_SOURCE_ID: str = ""       # override; empty = auto-detect
+    COLLECTOR_DEVICE_ROLE: str = "unknown"
+    RETENTION_DAYS: int = 7             # live events older than this are purged
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     # Restrict in production: ["https://your-domain.com"]

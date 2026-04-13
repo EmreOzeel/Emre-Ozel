@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -506,6 +507,62 @@ class NotificationModel(Base):
     message        = Column(Text, nullable=False, default="")
     read_at        = Column(DateTime, nullable=True, index=True)
     created_at     = Column(DateTime, server_default=func.now(), index=True)
+
+
+class LiveEventModel(Base):
+    """
+    Normalized live network event ingested from syslog, NetFlow, or webhook.
+
+    Each row represents one firewall/LB/router log entry or flow record,
+    normalised to a common schema by the collector's parser pipeline.
+    The table is append-heavy and time-indexed; a background retention
+    sweep deletes rows older than ``RETENTION_DAYS``.
+
+    Fields are intentionally nullable because not every source populates
+    every column — a firewall deny log has no ``bytes_out`` or
+    ``response_time_ms``, while a load-balancer health-check log has no
+    ``nat_source_ip``.
+    """
+    __tablename__ = "live_events"
+    id                   = Column(Integer, primary_key=True)
+    # ── Source identification ─────────────────────────────────────────────────
+    source_id            = Column(String, nullable=False, index=True)     # device hostname/IP
+    device_type          = Column(String, nullable=False, index=True)     # firewall|load_balancer|router|flow_exporter
+    device_role          = Column(String, nullable=True)                  # perimeter|internal|dmz|unknown
+    parser_id            = Column(String, nullable=False)                 # paloalto|fortigate|cisco_asa|cef|generic_kv
+    # ── Timing ────────────────────────────────────────────────────────────────
+    event_time           = Column(DateTime, nullable=False, index=True)   # from the device
+    received_at          = Column(DateTime, server_default=func.now(), nullable=False)
+    # ── 5-tuple ───────────────────────────────────────────────────────────────
+    source_ip            = Column(String, nullable=False, index=True)
+    destination_ip       = Column(String, nullable=False, index=True)
+    source_port          = Column(Integer, nullable=True)
+    destination_port     = Column(Integer, nullable=True)
+    protocol             = Column(String, nullable=True)                  # TCP|UDP|ICMP|…
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    action               = Column(String, nullable=False, index=True)     # allow|deny|drop|reset|nat|forward|health_check
+    reason               = Column(String, nullable=True)                  # policy name, reset reason, …
+    # ── Volume ────────────────────────────────────────────────────────────────
+    bytes_in             = Column(Integer, nullable=True)
+    bytes_out            = Column(Integer, nullable=True)
+    packets_in           = Column(Integer, nullable=True)
+    packets_out          = Column(Integer, nullable=True)
+    duration_ms          = Column(Integer, nullable=True)
+    # ── NAT ───────────────────────────────────────────────────────────────────
+    nat_source_ip        = Column(String, nullable=True)
+    nat_destination_ip   = Column(String, nullable=True)
+    nat_source_port      = Column(Integer, nullable=True)
+    nat_destination_port = Column(Integer, nullable=True)
+    # ── Application / service ─────────────────────────────────────────────────
+    application          = Column(String, nullable=True)                  # app-id from NGFW
+    service              = Column(String, nullable=True)
+    # ── Load-balancer specific ────────────────────────────────────────────────
+    backend_ip           = Column(String, nullable=True)
+    backend_port         = Column(Integer, nullable=True)
+    response_time_ms     = Column(Float, nullable=True)
+    health_status        = Column(String, nullable=True)                  # up|down|degraded
+    # ── Raw ───────────────────────────────────────────────────────────────────
+    raw_line             = Column(Text, nullable=True)                    # original log (truncated)
 
 
 # ── Session / init helpers ─────────────────────────────────────────────────────
