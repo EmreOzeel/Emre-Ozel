@@ -22,6 +22,9 @@ from database import (
     FindingTriageModel,
     InvestigationNoteModel,
     MonitoredPathModel,
+    MonitoredPathRunModel,
+    MonitorOutcomeModel,
+    MonitorSuppressionModel,
     NotificationModel,
     PathAnalysisCacheModel,
     PathAnalysisFeedbackModel,
@@ -34,7 +37,21 @@ from database import (
     get_db,
     init_db,
 )
-from monitoring import detect_drift, is_due
+from monitoring import (
+    VALID_OUTCOMES,
+    VALID_ROOT_CAUSE_TYPES,
+    VALID_SUPPRESSION_KINDS,
+    adjust_action,
+    apply_baseline,
+    apply_suppressions,
+    compute_risk_score,
+    compute_system_insights,
+    decide_action,
+    detect_drift,
+    is_due,
+    learn_from_outcomes,
+    summarize_history,
+)
 from jobs.queue import enqueue, start_worker, stop_worker
 from sharing import (
     VALID_SCOPES,
@@ -1001,6 +1018,22 @@ def delete_analysis(
     db.query(NotificationModel).filter(
         NotificationModel.analysis_id == analysis_id
     ).delete()
+    # Cascade history rows for any monitors targeting this analysis
+    monitor_ids = [
+        m.id for m in db.query(MonitoredPathModel).filter(
+            MonitoredPathModel.analysis_id == analysis_id
+        ).all()
+    ]
+    if monitor_ids:
+        db.query(MonitoredPathRunModel).filter(
+            MonitoredPathRunModel.monitored_path_id.in_(monitor_ids)
+        ).delete(synchronize_session=False)
+        db.query(MonitorOutcomeModel).filter(
+            MonitorOutcomeModel.monitored_path_id.in_(monitor_ids)
+        ).delete(synchronize_session=False)
+        db.query(MonitorSuppressionModel).filter(
+            MonitorSuppressionModel.monitored_path_id.in_(monitor_ids)
+        ).delete(synchronize_session=False)
     db.query(MonitoredPathModel).filter(
         MonitoredPathModel.analysis_id == analysis_id
     ).delete()
@@ -2639,6 +2672,21 @@ def delete_saved_query(
 ):
     """Delete a saved query.  Only the author (or an admin) may delete."""
     q = _get_query_for_edit(db, query_id, current_user)
+    monitor_ids = [
+        m.id for m in db.query(MonitoredPathModel).filter(
+            MonitoredPathModel.saved_query_id == query_id
+        ).all()
+    ]
+    if monitor_ids:
+        db.query(MonitoredPathRunModel).filter(
+            MonitoredPathRunModel.monitored_path_id.in_(monitor_ids)
+        ).delete(synchronize_session=False)
+        db.query(MonitorOutcomeModel).filter(
+            MonitorOutcomeModel.monitored_path_id.in_(monitor_ids)
+        ).delete(synchronize_session=False)
+        db.query(MonitorSuppressionModel).filter(
+            MonitorSuppressionModel.monitored_path_id.in_(monitor_ids)
+        ).delete(synchronize_session=False)
     db.query(MonitoredPathModel).filter(
         MonitoredPathModel.saved_query_id == query_id
     ).delete()
@@ -2689,11 +2737,98 @@ def _roles_from_saved_query(q: PathAnalysisSavedQueryModel) -> Optional[dict]:
     }
 
 
+def _load_outcome_dicts(db: Session, monitor_id: int) -> list:
+    """Return outcome records as plain dicts for the learning module."""
+    rows = (
+        db.query(MonitorOutcomeModel)
+        .filter(MonitorOutcomeModel.monitored_path_id == monitor_id)
+        .order_by(MonitorOutcomeModel.created_at.asc())
+        .all()
+    )
+    return [
+        {
+            "outcome":        r.outcome,
+            "root_cause_type": r.root_cause_type,
+            "signal_drivers": json.loads(r.signal_drivers_json) if r.signal_drivers_json else [],
+        }
+        for r in rows
+    ]
+
+
+def _load_suppression_dicts(db: Session, monitor_id: int) -> list:
+    rows = (
+        db.query(MonitorSuppressionModel)
+        .filter(MonitorSuppressionModel.monitored_path_id == monitor_id)
+        .all()
+    )
+    return [
+        {
+            "id":      r.id,
+            "kind":    r.kind,
+            "value":   r.value,
+            "reason":  r.reason,
+            "enabled": r.enabled,
+            "until":   r.until,
+        }
+        for r in rows
+    ]
+
+
+def _load_baseline(db: Session, monitor_id: int):
+    """Return the baseline dict for a monitor (or None)."""
+    m = db.query(MonitoredPathModel).filter(
+        MonitoredPathModel.id == monitor_id
+    ).first()
+    if not m or not m.baseline_json:
+        return None
+    return json.loads(m.baseline_json)
+
+
+def _compute_monitor_risk(db: Session, monitor_id: int) -> dict:
+    """Build the trend digest, score the risk, decide an action, then
+    adjust it via historical outcome learnings, baseline expectations,
+    and active suppression rules.
+
+    Pipeline:
+      runs → summarize_history → compute_risk_score → decide_action
+        → adjust_action(learnings)
+        → apply_baseline(baseline)
+        → apply_suppressions(rules)
+
+    Returns a dict combining the risk fields with the final action so the
+    list endpoint can render everything with no follow-ups.
+    """
+    rows = _load_history_rows(db, monitor_id, limit=50)
+    runs = [_run_to_dict(r) for r in rows]
+    summary = summarize_history(runs)
+    risk = compute_risk_score(summary)
+    action = decide_action(summary, risk)
+
+    # Outcome-aware adjustments
+    outcome_dicts = _load_outcome_dicts(db, monitor_id)
+    learnings = learn_from_outcomes(outcome_dicts)
+    action = adjust_action(action, learnings)
+
+    # Baseline adaptation
+    baseline = _load_baseline(db, monitor_id)
+    action = apply_baseline(action, summary, baseline)
+
+    # Suppression rules (must be last — analyst explicitly said "shut up")
+    suppressions = _load_suppression_dicts(db, monitor_id)
+    action = apply_suppressions(action, suppressions, now=datetime.utcnow())
+
+    return {**risk, "action": action, "learnings": learnings}
+
+
 def _monitor_to_dict(m: MonitoredPathModel, db: Session) -> dict:
     """Serialize a monitored path with derived display fields.
 
     Includes the saved-query name and the target analysis filename so the
     frontend can render the row without N+1 follow-up requests.
+    Also includes ``run_count`` so the list view can show "no history yet"
+    versus "100 runs over the last month" without a follow-up call, and a
+    dynamically-computed ``risk_score`` / ``risk_level`` / ``risk_drivers``
+    so the list page can sort and badge each row directly.
     """
     sq = db.query(PathAnalysisSavedQueryModel).filter(
         PathAnalysisSavedQueryModel.id == m.saved_query_id,
@@ -2701,6 +2836,12 @@ def _monitor_to_dict(m: MonitoredPathModel, db: Session) -> dict:
     arow = db.query(AnalysisModel).filter(
         AnalysisModel.id == m.analysis_id,
     ).first()
+    run_count = (
+        db.query(MonitoredPathRunModel)
+        .filter(MonitoredPathRunModel.monitored_path_id == m.id)
+        .count()
+    )
+    risk = _compute_monitor_risk(db, m.id)
     return {
         "id":                        m.id,
         "saved_query_id":            m.saved_query_id,
@@ -2718,6 +2859,26 @@ def _monitor_to_dict(m: MonitoredPathModel, db: Session) -> dict:
         "last_drift_severity":  m.last_drift_severity,
         "last_change_summary":  json.loads(m.last_change_summary) if m.last_change_summary else None,
         "has_baseline":         m.last_result_json is not None,
+        "run_count":            run_count,
+        "risk_score":           risk["risk_score"],
+        "risk_level":           risk["risk_level"],
+        "risk_drivers":         risk["drivers"],
+        # Action engine output (see monitoring.decide_action)
+        "action_required":      risk["action"]["action_required"],
+        "action_label":         risk["action"]["action_label"],
+        "priority":             risk["action"]["priority"],
+        "recommended_action":   risk["action"]["recommended_action"],
+        "action_focus":         risk["action"]["focus"],
+        "suppressed":           risk["action"].get("suppressed", False),
+        "suppressed_rules":     risk["action"].get("suppressed_rules", []),
+        "baseline_applied":     risk["action"].get("baseline_applied", False),
+        # Outcome learnings
+        "last_outcome":         m.last_outcome,
+        "last_outcome_at":      m.last_outcome_at.isoformat() if m.last_outcome_at else None,
+        "outcome_count":        risk.get("learnings", {}).get("total", 0),
+        "outcome_hints":        risk.get("learnings", {}).get("hints", []),
+        "dominant_root_cause":  risk.get("learnings", {}).get("dominant_root_cause"),
+        "fp_rate":              risk.get("learnings", {}).get("fp_rate", 0),
         "created_at":     m.created_at.isoformat() if m.created_at else None,
         "updated_at":     m.updated_at.isoformat() if m.updated_at else None,
     }
@@ -2801,6 +2962,26 @@ def _run_monitor(
             "changes":  report["changes"],
             "changed_fields": report["changed_fields"],
         })
+
+    # ── History row (one per run, lightweight projection) ────────────────────
+    # Stored even when there's no drift so the trend view can plot
+    # confidence/timing over time.  The full result still lives on the
+    # MonitoredPathModel.last_result_json column for the next comparison.
+    db.add(MonitoredPathRunModel(
+        monitored_path_id=monitor.id,
+        run_at=now,
+        connection_outcome=current_result.get("connection_outcome", "unknown"),
+        primary_impairment=current_result.get("primary_impairment"),
+        path_confidence_score=int(
+            current_result.get("path_confidence_score") or 0
+        ),
+        drift_severity=report["severity"],
+        action_required=report["action_required"],
+        timing_json=json.dumps(current_result.get("timing_breakdown") or {}),
+        impairments_json=json.dumps(
+            current_result.get("path_impairments") or []
+        ),
+    ))
 
     # Alert + workflow integration: only when the change is action-required.
     if report["action_required"]:
@@ -2910,14 +3091,23 @@ def list_monitors(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
-    """List monitors visible to the current user (own monitors only)."""
+    """List monitors visible to the current user, ranked highest risk first.
+
+    Risk is computed dynamically per row from the trend digest — see
+    ``_compute_monitor_risk``.  Ties (e.g. several brand-new monitors at
+    risk=0) fall back to creation order so the ordering remains stable
+    across calls.
+    """
     rows = (
         db.query(MonitoredPathModel)
         .filter(MonitoredPathModel.owner_user_id == current_user.id)
-        .order_by(MonitoredPathModel.id.desc())
         .all()
     )
-    return [_monitor_to_dict(m, db) for m in rows]
+    serialized = [_monitor_to_dict(m, db) for m in rows]
+    serialized.sort(
+        key=lambda d: (-int(d.get("risk_score") or 0), -int(d.get("id") or 0)),
+    )
+    return serialized
 
 
 @app.get("/api/path-monitors/{monitor_id}")
@@ -2955,6 +3145,15 @@ def delete_monitor(
     current_user: UserModel = Depends(get_current_user),
 ):
     m = _get_monitor_or_404(db, monitor_id, current_user)
+    db.query(MonitoredPathRunModel).filter(
+        MonitoredPathRunModel.monitored_path_id == monitor_id
+    ).delete()
+    db.query(MonitorOutcomeModel).filter(
+        MonitorOutcomeModel.monitored_path_id == monitor_id
+    ).delete()
+    db.query(MonitorSuppressionModel).filter(
+        MonitorSuppressionModel.monitored_path_id == monitor_id
+    ).delete()
     db.delete(m)
     db.commit()
 
@@ -2995,6 +3194,358 @@ def tick_monitors(
         raise HTTPException(403, "Admin access required")
     ran = run_due_monitors(db)
     return {"ran": ran}
+
+
+@app.get("/api/system-insights")
+def system_insights(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return system-wide intelligence across all monitors visible to the
+    current user.
+
+    Combines global outcome aggregation, signal effectiveness, correlation
+    detection (shared destination / shared impairment), and system risk
+    distribution into a single payload for the dashboard widget.
+    """
+    # Monitors owned by the current user (same scope as list_monitors).
+    monitor_rows = (
+        db.query(MonitoredPathModel)
+        .filter(MonitoredPathModel.owner_user_id == current_user.id)
+        .all()
+    )
+    monitor_dicts = [_monitor_to_dict(m, db) for m in monitor_rows]
+
+    # All outcomes across those monitors.
+    monitor_ids = [m.id for m in monitor_rows]
+    if monitor_ids:
+        outcome_rows = (
+            db.query(MonitorOutcomeModel)
+            .filter(MonitorOutcomeModel.monitored_path_id.in_(monitor_ids))
+            .all()
+        )
+        outcomes = [
+            {
+                "outcome":         r.outcome,
+                "root_cause_type": r.root_cause_type,
+                "signal_drivers":  json.loads(r.signal_drivers_json) if r.signal_drivers_json else [],
+                "monitored_path_id": r.monitored_path_id,
+            }
+            for r in outcome_rows
+        ]
+    else:
+        outcomes = []
+
+    # Recent runs — last 50 per monitor so the correlation detector has a
+    # window into current state without loading the whole history.
+    recent_runs: list = []
+    for mid in monitor_ids:
+        rows = _load_history_rows(db, mid, limit=50)
+        recent_runs.extend(_run_to_dict(r) for r in rows)
+
+    return compute_system_insights(monitor_dicts, outcomes, recent_runs)
+
+
+# ── Monitor history + trend endpoints ────────────────────────────────────────
+
+def _run_to_dict(r: MonitoredPathRunModel) -> dict:
+    return {
+        "id":                    r.id,
+        "monitored_path_id":     r.monitored_path_id,
+        "run_at":                r.run_at.isoformat() if r.run_at else None,
+        "connection_outcome":    r.connection_outcome,
+        "primary_impairment":    r.primary_impairment,
+        "path_confidence_score": r.path_confidence_score,
+        "drift_severity":        r.drift_severity,
+        "action_required":       r.action_required,
+        "timing":                json.loads(r.timing_json) if r.timing_json else {},
+        "impairments":           json.loads(r.impairments_json) if r.impairments_json else [],
+    }
+
+
+def _load_history_rows(
+    db: Session, monitor_id: int, limit: Optional[int] = None,
+):
+    """Return run rows for a monitor in chronological order (oldest → newest).
+
+    Trend analysis is most natural in chronological order, but the API list
+    endpoint reverses to newest-first for human display.  Keeping the
+    canonical fetch order in one helper avoids confusion.
+    """
+    rows = (
+        db.query(MonitoredPathRunModel)
+        .filter(MonitoredPathRunModel.monitored_path_id == monitor_id)
+        .order_by(
+            MonitoredPathRunModel.run_at.asc(),
+            MonitoredPathRunModel.id.asc(),
+        )
+        .all()
+    )
+    if limit and len(rows) > limit:
+        rows = rows[-limit:]
+    return rows
+
+
+@app.get("/api/path-monitors/{monitor_id}/history")
+def get_monitor_history(
+    monitor_id: int,
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return the most recent ``limit`` runs for a monitor (newest first)."""
+    _get_monitor_or_404(db, monitor_id, current_user)
+    rows = _load_history_rows(db, monitor_id, limit=limit)
+    # Newest-first for display.
+    return [_run_to_dict(r) for r in reversed(rows)]
+
+
+@app.get("/api/path-monitors/{monitor_id}/trend")
+def get_monitor_trend(
+    monitor_id: int,
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return a trend digest computed over the most recent ``limit`` runs.
+
+    The digest is intentionally a single flat dict (see
+    ``monitoring.summarize_history``) so the frontend trend panel can render
+    it without conditional plumbing.
+    """
+    _get_monitor_or_404(db, monitor_id, current_user)
+    rows = _load_history_rows(db, monitor_id, limit=limit)
+    # summarize_history wants the chronological dicts — same shape we store.
+    runs_for_summary = [_run_to_dict(r) for r in rows]
+    return summarize_history(runs_for_summary)
+
+
+# ── Monitor outcomes (feedback loop) ─────────────────────────────────────────
+
+class MonitorOutcomeCreate(BaseModel):
+    outcome: str = Field(
+        pattern="^(issue_confirmed|false_positive|transient_issue|root_cause_identified)$",
+    )
+    root_cause_type: Optional[str] = Field(
+        default=None,
+        pattern="^(network|firewall|app|dns|unknown)$",
+    )
+    note: Optional[str] = None
+
+
+@app.post("/api/path-monitors/{monitor_id}/outcomes", status_code=201)
+def record_outcome(
+    monitor_id: int,
+    req: MonitorOutcomeCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Record an analyst outcome after investigating a monitored path.
+
+    Snapshots the current risk drivers onto the outcome row so that the
+    learning module can later correlate signal → outcome.
+    """
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+
+    if req.outcome == "root_cause_identified" and not req.root_cause_type:
+        raise HTTPException(400, "root_cause_type required for root_cause_identified")
+
+    # Snapshot the current risk drivers
+    risk = _compute_monitor_risk(db, m.id)
+    drivers = risk.get("drivers") or []
+
+    now = datetime.utcnow()
+    row = MonitorOutcomeModel(
+        monitored_path_id=m.id,
+        outcome=req.outcome,
+        root_cause_type=req.root_cause_type,
+        note=req.note,
+        signal_drivers_json=json.dumps(drivers),
+        analyst_id=current_user.id,
+        created_at=now,
+    )
+    db.add(row)
+
+    # Denormalise for quick list display
+    m.last_outcome = req.outcome
+    m.last_outcome_at = now
+
+    db.commit()
+    db.refresh(row)
+    return _outcome_to_dict(row)
+
+
+@app.get("/api/path-monitors/{monitor_id}/outcomes")
+def list_outcomes(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List all outcome records for a monitor (newest first)."""
+    _get_monitor_or_404(db, monitor_id, current_user)
+    rows = (
+        db.query(MonitorOutcomeModel)
+        .filter(MonitorOutcomeModel.monitored_path_id == monitor_id)
+        .order_by(MonitorOutcomeModel.created_at.desc())
+        .all()
+    )
+    return [_outcome_to_dict(r) for r in rows]
+
+
+@app.get("/api/path-monitors/{monitor_id}/learnings")
+def get_learnings(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return the aggregated learning digest for a monitor."""
+    _get_monitor_or_404(db, monitor_id, current_user)
+    outcome_dicts = _load_outcome_dicts(db, monitor_id)
+    return learn_from_outcomes(outcome_dicts)
+
+
+def _outcome_to_dict(r: MonitorOutcomeModel) -> dict:
+    return {
+        "id":              r.id,
+        "monitored_path_id": r.monitored_path_id,
+        "outcome":         r.outcome,
+        "root_cause_type": r.root_cause_type,
+        "note":            r.note,
+        "signal_drivers":  json.loads(r.signal_drivers_json) if r.signal_drivers_json else [],
+        "analyst_id":      r.analyst_id,
+        "created_at":      r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+# ── Monitor suppressions ─────────────────────────────────────────────────────
+
+class MonitorSuppressionCreate(BaseModel):
+    kind: str = Field(pattern="^(mute|snooze|impairment|severity)$")
+    value: Optional[str] = None
+    reason: Optional[str] = None
+    until: Optional[str] = None      # ISO 8601 datetime
+
+
+@app.post("/api/path-monitors/{monitor_id}/suppressions", status_code=201)
+def create_suppression(
+    monitor_id: int,
+    req: MonitorSuppressionCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    until_dt = None
+    if req.until:
+        try:
+            until_dt = datetime.fromisoformat(req.until)
+        except (ValueError, TypeError):
+            raise HTTPException(400, "Invalid 'until' datetime")
+    if req.kind == "snooze" and until_dt is None:
+        raise HTTPException(400, "'until' is required for snooze rules")
+    row = MonitorSuppressionModel(
+        monitored_path_id=m.id,
+        kind=req.kind,
+        value=req.value,
+        reason=req.reason,
+        until=until_dt,
+        created_by=current_user.id,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _suppression_rule_dict(row)
+
+
+@app.get("/api/path-monitors/{monitor_id}/suppressions")
+def list_suppressions(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    _get_monitor_or_404(db, monitor_id, current_user)
+    rows = (
+        db.query(MonitorSuppressionModel)
+        .filter(MonitorSuppressionModel.monitored_path_id == monitor_id)
+        .order_by(MonitorSuppressionModel.id.desc())
+        .all()
+    )
+    return [_suppression_rule_dict(r) for r in rows]
+
+
+@app.delete(
+    "/api/path-monitors/{monitor_id}/suppressions/{rule_id}",
+    status_code=204,
+)
+def delete_suppression(
+    monitor_id: int,
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    _get_monitor_or_404(db, monitor_id, current_user)
+    row = db.query(MonitorSuppressionModel).filter(
+        MonitorSuppressionModel.id == rule_id,
+        MonitorSuppressionModel.monitored_path_id == monitor_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Suppression rule not found")
+    db.delete(row)
+    db.commit()
+
+
+def _suppression_rule_dict(r: MonitorSuppressionModel) -> dict:
+    return {
+        "id":         r.id,
+        "kind":       r.kind,
+        "value":      r.value,
+        "reason":     r.reason,
+        "enabled":    r.enabled,
+        "until":      r.until.isoformat() if r.until else None,
+        "created_by": r.created_by,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+# ── Monitor baseline expectations ────────────────────────────────────────────
+
+class BaselineUpdate(BaseModel):
+    accepted_delay_max_ms: Optional[float] = None
+    accepted_confidence_min: Optional[int] = None
+    known_noisy_impairments: Optional[List[str]] = None
+    known_visibility_gaps: Optional[List[str]] = None
+
+
+@app.put("/api/path-monitors/{monitor_id}/baseline")
+def update_baseline(
+    monitor_id: int,
+    req: BaselineUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    baseline = {}
+    if req.accepted_delay_max_ms is not None:
+        baseline["accepted_delay_max_ms"] = req.accepted_delay_max_ms
+    if req.accepted_confidence_min is not None:
+        baseline["accepted_confidence_min"] = req.accepted_confidence_min
+    if req.known_noisy_impairments is not None:
+        baseline["known_noisy_impairments"] = req.known_noisy_impairments
+    if req.known_visibility_gaps is not None:
+        baseline["known_visibility_gaps"] = req.known_visibility_gaps
+    m.baseline_json = json.dumps(baseline) if baseline else None
+    db.commit()
+    return {"baseline": baseline}
+
+
+@app.get("/api/path-monitors/{monitor_id}/baseline")
+def get_baseline(
+    monitor_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    m = _get_monitor_or_404(db, monitor_id, current_user)
+    baseline = json.loads(m.baseline_json) if m.baseline_json else {}
+    return {"baseline": baseline}
 
 
 # ── Path Analysis Role Presets ────────────────────────────────────────────────

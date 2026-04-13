@@ -356,10 +356,125 @@ class MonitoredPathModel(Base):
     last_change_summary  = Column(Text, nullable=True)
     # On the most recent run, did drift detection fire?
     last_drift_severity  = Column(String, nullable=True)   # none|info|warning|critical
+    # Last analyst-supplied outcome (denormalised for fast list display).
+    last_outcome         = Column(String, nullable=True)
+    last_outcome_at      = Column(DateTime, nullable=True)
+    # ── Baseline expectations (JSON) ──────────────────────────────────────────
+    # Stored as a single JSON blob so the schema doesn't need a migration
+    # every time we add a new knob.  Parsed by ``apply_baseline()`` in
+    # monitoring.py.  Shape:
+    #   {
+    #     "accepted_delay_max_ms":      float | null,
+    #     "accepted_confidence_min":    int   | null,
+    #     "known_noisy_impairments":    ["imp", ...],
+    #     "known_visibility_gaps":      ["gap note", ...],
+    #   }
+    baseline_json        = Column(Text, nullable=True)
     created_at           = Column(DateTime, server_default=func.now())
     updated_at           = Column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class MonitorSuppressionModel(Base):
+    """
+    Temporary or permanent suppression rule on a monitored path.
+
+    kind values:
+      mute           — suppress ALL alerts for the duration
+      snooze         — suppress ALL alerts until ``until`` datetime
+      impairment     — suppress a specific impairment token
+      severity       — suppress drifts at or below a given severity
+
+    ``until`` is required for snooze, optional for the others (null = permanent
+    until explicitly deleted).  The runtime checks ``is_active()`` which
+    respects both ``enabled`` and ``until``.
+    """
+    __tablename__ = "monitor_suppressions"
+    id                 = Column(Integer, primary_key=True, index=True)
+    monitored_path_id  = Column(
+        Integer, ForeignKey("monitored_paths.id"),
+        nullable=False, index=True,
+    )
+    kind               = Column(String, nullable=False)         # mute|snooze|impairment|severity
+    # For kind=impairment: the specific token to suppress.
+    # For kind=severity: the max severity to suppress (e.g. "info").
+    value              = Column(String, nullable=True)
+    reason             = Column(Text, nullable=True)
+    enabled            = Column(Boolean, nullable=False, default=True)
+    until              = Column(DateTime, nullable=True)
+    created_by         = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at         = Column(DateTime, server_default=func.now())
+
+
+class MonitorOutcomeModel(Base):
+    """
+    Analyst-supplied outcome recorded after investigating a monitored path.
+
+    Each row captures one "verdict cycle": the analyst looked at the data,
+    decided whether the alert was real, and optionally identified a root
+    cause.  ``signal_drivers_json`` snapshots the risk drivers that led to
+    the alert so the learning module can build signal → outcome counters
+    without re-computing historical risk scores.
+
+    outcome values:
+      issue_confirmed   — alert was a real operational issue
+      false_positive    — alert noise; path was fine
+      transient_issue   — real but self-resolved; brief blip
+      root_cause_identified — real; analyst pinned down the cause
+
+    root_cause_type (only when outcome == root_cause_identified):
+      network | firewall | app | dns | unknown
+    """
+    __tablename__ = "monitor_outcomes"
+    id                  = Column(Integer, primary_key=True, index=True)
+    monitored_path_id   = Column(
+        Integer, ForeignKey("monitored_paths.id"),
+        nullable=False, index=True,
+    )
+    outcome             = Column(String, nullable=False, index=True)
+    root_cause_type     = Column(String, nullable=True)          # network|firewall|app|dns|unknown
+    note                = Column(Text, nullable=True)
+    # Snapshot of risk_drivers at the time the outcome was recorded so the
+    # learning module can correlate signals → outcomes without lookback.
+    signal_drivers_json = Column(Text, nullable=True)            # JSON array of driver strings
+    analyst_id          = Column(
+        Integer, ForeignKey("users.id"), nullable=True, index=True,
+    )
+    created_at          = Column(DateTime, server_default=func.now(), index=True)
+
+
+class MonitoredPathRunModel(Base):
+    """
+    One historical run record per monitored-path execution.
+
+    Stored on every successful ``_run_monitor`` call (manual or scheduled).
+    The full path-analysis result still lives in
+    ``MonitoredPathModel.last_result_json`` so the next drift comparison can
+    use it; this table keeps a small fixed-shape projection — only the
+    fields the trend view actually plots — so we can scan a year of history
+    cheaply without parsing JSON.
+
+    ``timing_json`` is the original ``timing_breakdown`` dict (small) so the
+    trend module can render any backend-delay-style key without us picking
+    a winning column up front.
+    """
+    __tablename__ = "monitored_path_runs"
+    id                    = Column(Integer, primary_key=True, index=True)
+    monitored_path_id     = Column(
+        Integer, ForeignKey("monitored_paths.id"),
+        nullable=False, index=True,
+    )
+    run_at                = Column(
+        DateTime, server_default=func.now(), nullable=False, index=True,
+    )
+    connection_outcome    = Column(String, nullable=False)   # success|partial_success|failure|unknown
+    primary_impairment    = Column(String, nullable=True)
+    path_confidence_score = Column(Integer, nullable=False, default=0)
+    drift_severity        = Column(String, nullable=False, default="none")  # none|info|warning|critical
+    action_required       = Column(Boolean, nullable=False, default=False)
+    timing_json           = Column(Text, nullable=True)      # JSON object
+    impairments_json      = Column(Text, nullable=True)      # JSON array of impairment tokens
 
 
 class NotificationModel(Base):
