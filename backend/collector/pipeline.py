@@ -93,6 +93,13 @@ class Pipeline:
             "parsed": 0,
             "dropped": 0,
         }
+        self._flow_engine = None
+        self._flow_lock = None
+
+    def set_flow_engine(self, engine, lock) -> None:
+        """Attach a FlowEngine so normalised events are also routed to it."""
+        self._flow_engine = engine
+        self._flow_lock = lock
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -123,6 +130,50 @@ class Pipeline:
 
         event = self._normalise(parsed, parser, line)
         self._stats["parsed"] += 1
+        self._feed_flow_engine(event)
+        return event
+
+    def process_flow(
+        self,
+        flow: Dict[str, Any],
+        parser_id: str = "netflow_v9",
+    ) -> Optional[Dict[str, Any]]:
+        """Normalise a pre-parsed flow dict (from NetFlow/IPFIX).
+
+        Unlike ``process_line``, this skips parser detection because the
+        flow is already structured.  The same field whitelist and default
+        logic from ``_normalise`` is applied.
+        """
+        self._stats["received"] += 1
+
+        if not flow or not flow.get("source_ip"):
+            self._stats["dropped"] += 1
+            return None
+
+        now = datetime.utcnow()
+
+        event: Dict[str, Any] = {
+            "source_id":   self.source_id,
+            "device_type": "flow_exporter",
+            "device_role": self.device_role,
+            "parser_id":   parser_id,
+            "received_at": now,
+            "raw_line":    None,
+        }
+
+        for key in _NORMALISED_FIELDS:
+            val = flow.get(key)
+            if val is not None:
+                event[key] = val
+
+        if not event.get("event_time"):
+            event["event_time"] = now
+        event.setdefault("source_ip", "0.0.0.0")
+        event.setdefault("destination_ip", "0.0.0.0")
+        event.setdefault("action", "allow")
+
+        self._stats["parsed"] += 1
+        self._feed_flow_engine(event)
         return event
 
     def buffer(self, event: Dict[str, Any]) -> None:
@@ -159,6 +210,16 @@ class Pipeline:
 
     def reset_stats(self) -> None:
         self._stats = {"received": 0, "parsed": 0, "dropped": 0}
+
+    def _feed_flow_engine(self, event: Dict[str, Any]) -> None:
+        """Route a normalised event to the attached FlowEngine (if any)."""
+        if self._flow_engine is None:
+            return
+        if self._flow_lock is not None:
+            with self._flow_lock:
+                self._flow_engine.process_event(event)
+        else:
+            self._flow_engine.process_event(event)
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

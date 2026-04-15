@@ -43,6 +43,18 @@
           <el-icon><AlarmClock /></el-icon>
           <span>Monitoring</span>
         </el-menu-item>
+        <el-menu-item index="/live-events">
+          <el-icon><Monitor /></el-icon>
+          <span>Live Events</span>
+        </el-menu-item>
+        <el-menu-item index="/live-flows">
+          <el-icon><Connection /></el-icon>
+          <span>Live Flows</span>
+        </el-menu-item>
+        <el-menu-item index="/live-incidents">
+          <el-icon><Warning /></el-icon>
+          <span>Incidents</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">

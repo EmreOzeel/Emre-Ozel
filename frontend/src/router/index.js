@@ -52,6 +52,21 @@ const routes = [
         name: 'Monitoring',
         component: () => import('../views/Monitoring.vue'),
       },
+      {
+        path: 'live-events',
+        name: 'LiveEvents',
+        component: () => import('../views/LiveEvents.vue'),
+      },
+      {
+        path: 'live-flows',
+        name: 'LiveFlows',
+        component: () => import('../views/LiveFlows.vue'),
+      },
+      {
+        path: 'live-incidents',
+        name: 'LiveIncidents',
+        component: () => import('../views/LiveIncidents.vue'),
+      },
     ]
   },
   {

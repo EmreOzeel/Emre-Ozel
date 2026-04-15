@@ -139,8 +139,7 @@ def client(seeded_db):
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user] = _override_user
 
-    with TestClient(app, raise_server_exceptions=True) as c:
-        yield c
+    yield TestClient(app, raise_server_exceptions=True)
 
     app.dependency_overrides.clear()
 

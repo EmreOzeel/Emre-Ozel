@@ -563,6 +563,184 @@ class LiveEventModel(Base):
     health_status        = Column(String, nullable=True)                  # up|down|degraded
     # ── Raw ───────────────────────────────────────────────────────────────────
     raw_line             = Column(Text, nullable=True)                    # original log (truncated)
+    # ── Suppression ───────────────────────────────────────────────────────────
+    suppressed           = Column(Boolean, nullable=True, default=False)
+
+
+class LiveFlowModel(Base):
+    """
+    Reconstructed flow/session summary from live events.
+
+    Each row represents one network conversation (5-tuple) observed over
+    a window of time.  Flows are assembled in-memory by ``FlowEngine``
+    (collector/flows.py) and flushed to DB when they expire or reach a
+    terminal state.
+
+    state values:
+      active    — still receiving events
+      completed — allowed flow that timed out normally
+      reset     — at least one RST/reset observed
+      denied    — only deny events, no allow
+      dropped   — only drop events, no allow
+      expired   — timed out without reaching a terminal action
+    """
+    __tablename__ = "live_flows"
+    id                   = Column(Integer, primary_key=True)
+    # ── Source identification ─────────────────────────────────────────────────
+    source_id            = Column(String, nullable=False, index=True)
+    device_type          = Column(String, nullable=False)
+    device_role          = Column(String, nullable=True)
+    parser_id            = Column(String, nullable=False)
+    # ── 5-tuple (flow key) ───────────────────────────────────────────────────
+    source_ip            = Column(String, nullable=False, index=True)
+    destination_ip       = Column(String, nullable=False, index=True)
+    source_port          = Column(Integer, nullable=True)
+    destination_port     = Column(Integer, nullable=True)
+    protocol             = Column(String, nullable=True, index=True)
+    # ── Timing ────────────────────────────────────────────────────────────────
+    first_seen           = Column(DateTime, nullable=False, index=True)
+    last_seen            = Column(DateTime, nullable=False, index=True)
+    duration_ms          = Column(Integer, nullable=True)
+    # ── Counters ──────────────────────────────────────────────────────────────
+    event_count          = Column(Integer, nullable=False, default=0)
+    total_bytes_in       = Column(Integer, nullable=False, default=0)
+    total_bytes_out      = Column(Integer, nullable=False, default=0)
+    total_packets_in     = Column(Integer, nullable=False, default=0)
+    total_packets_out    = Column(Integer, nullable=False, default=0)
+    # ── Action counters ───────────────────────────────────────────────────────
+    allow_count          = Column(Integer, nullable=False, default=0)
+    deny_count           = Column(Integer, nullable=False, default=0)
+    drop_count           = Column(Integer, nullable=False, default=0)
+    reset_count          = Column(Integer, nullable=False, default=0)
+    alert_count          = Column(Integer, nullable=False, default=0)
+    # ── Derived summaries ─────────────────────────────────────────────────────
+    action_summary       = Column(String, nullable=True)     # mostly_allow|mostly_deny|reset_seen|mixed
+    reason_summary       = Column(String, nullable=True)     # most common reason
+    # ── NAT ───────────────────────────────────────────────────────────────────
+    nat_source_ip        = Column(String, nullable=True)
+    nat_destination_ip   = Column(String, nullable=True)
+    nat_source_port      = Column(Integer, nullable=True)
+    nat_destination_port = Column(Integer, nullable=True)
+    # ── Application / service ─────────────────────────────────────────────────
+    application          = Column(String, nullable=True)
+    service              = Column(String, nullable=True)
+    backend_ip           = Column(String, nullable=True)
+    backend_port         = Column(Integer, nullable=True)
+    # ── State ─────────────────────────────────────────────────────────────────
+    state                = Column(String, nullable=False, default="active", index=True)
+    raw_event_count      = Column(Integer, nullable=False, default=0)
+    # ── Behavioral classification ─────────────────────────────────────────────
+    flow_type            = Column(String, nullable=True, index=True)     # normal|unstable|blocked|suspicious|scanning
+    reset_ratio          = Column(Float, nullable=True)
+    deny_ratio           = Column(Float, nullable=True)
+    burst_score          = Column(Float, nullable=True)
+    asymmetric_behavior  = Column(Boolean, nullable=True, default=False)
+    suspicious_reasons   = Column(Text, nullable=True)                   # JSON array
+    # ── Suppression ───────────────────────────────────────────────────────────
+    suppressed           = Column(Boolean, nullable=True, default=False)
+    # ── Timestamps ────────────────────────────────────────────────────────────
+    created_at           = Column(DateTime, server_default=func.now())
+    updated_at           = Column(DateTime, server_default=func.now())
+
+
+class LiveIncidentModel(Base):
+    """
+    Incident derived from repeated live behavior detections.
+
+    Groups correlated behaviors for the same ``source_ip`` +
+    ``behavior_type`` into a single trackable object so the analyst
+    doesn't drown in duplicate notifications.
+
+    status values: open | investigating | resolved | dismissed
+    severity values: low | medium | high | critical
+    """
+    __tablename__ = "live_incidents"
+    id                = Column(Integer, primary_key=True)
+    source_ip         = Column(String, nullable=False, index=True)
+    behavior_type     = Column(String, nullable=False, index=True)
+    severity          = Column(String, nullable=False, default="low", index=True)
+    status            = Column(String, nullable=False, default="open", index=True)
+    first_seen        = Column(DateTime, nullable=False)
+    last_seen         = Column(DateTime, nullable=False)
+    event_count       = Column(Integer, nullable=False, default=1)
+    linked_flow_count = Column(Integer, nullable=False, default=0)
+    latest_confidence = Column(Float, nullable=True)
+    summary           = Column(Text, nullable=True)
+    # ── Enrichment ────────────────────────────────────────────────────────────
+    top_destination_ips    = Column(Text, nullable=True)     # JSON list, max 5
+    top_ports              = Column(Text, nullable=True)     # JSON list, max 5
+    total_distinct_destinations = Column(Integer, nullable=True)
+    total_distinct_ports   = Column(Integer, nullable=True)
+    sample_flows           = Column(Text, nullable=True)     # JSON list of 3 flow summaries
+    last_activity_summary  = Column(Text, nullable=True)
+    # ── Asset impact ──────────────────────────────────────────────────────────
+    impacted_assets_count       = Column(Integer, nullable=True)
+    highest_target_criticality  = Column(String, nullable=True)
+    target_summary              = Column(Text, nullable=True)
+    # ── Priority & aging ──────────────────────────────────────────────────────
+    priority_score    = Column(Float, nullable=True)
+    last_activity_at  = Column(DateTime, nullable=True)
+    decay_factor      = Column(Float, nullable=True)
+    created_at        = Column(DateTime, server_default=func.now())
+    updated_at        = Column(DateTime, server_default=func.now())
+
+
+class AttackSessionModel(Base):
+    """
+    Groups related incidents from the same source IP into a single
+    attack session based on temporal proximity and behavior diversity.
+    """
+    __tablename__ = "attack_sessions"
+    id              = Column(Integer, primary_key=True, index=True)
+    source_ip       = Column(String, nullable=False, index=True)
+    start_time      = Column(DateTime, nullable=False)
+    last_activity   = Column(DateTime, nullable=False)
+    incident_ids    = Column(Text, nullable=False, default="[]")     # JSON list of ints
+    behaviors       = Column(Text, nullable=False, default="[]")     # JSON list of behavior_type strings
+    severity        = Column(String, nullable=False, default="low")  # low|medium|high|critical
+    priority_score  = Column(Float, nullable=False, default=0)
+    status          = Column(String, nullable=False, default="active", index=True)  # active|idle|closed
+    total_incidents = Column(Integer, nullable=False, default=0)
+    total_destinations = Column(Integer, nullable=False, default=0)
+    total_ports     = Column(Integer, nullable=False, default=0)
+    # ── Enrichment ────────────────────────────────────────────────────────────
+    top_destination_ips       = Column(Text, nullable=True)    # JSON list, max 5
+    top_ports                 = Column(Text, nullable=True)    # JSON list, max 5
+    target_summary            = Column(Text, nullable=True)
+    highest_target_criticality = Column(String, nullable=True) # low|medium|high|critical
+    session_summary           = Column(Text, nullable=True)
+    recommended_next_step     = Column(Text, nullable=True)
+    # ── Intent & timeline ─────────────────────────────────────────────────────
+    behavior_timeline         = Column(Text, nullable=True)    # JSON list of {time, behavior}
+    behavior_sequence         = Column(String, nullable=True)  # e.g. "scanning → unstable → suspicious"
+    attack_intent             = Column(String, nullable=True)
+    # ── Confidence & decision ─────────────────────────────────────────────────
+    attack_intents            = Column(Text, nullable=True)    # JSON list of {intent, confidence}
+    intent_confidence         = Column(Float, nullable=True)   # 0.0–1.0, primary intent confidence
+    activity_rate             = Column(Float, nullable=True)   # flows per minute
+    burst_flag                = Column(Boolean, nullable=True, default=False)
+    recommended_action        = Column(String, nullable=True)  # monitor|investigate|contain|block
+    created_at      = Column(DateTime, server_default=func.now())
+    updated_at      = Column(DateTime, server_default=func.now())
+
+
+class AssetModel(Base):
+    """
+    Known network asset for criticality scoring.
+
+    Maps IP addresses to asset metadata so the incident enrichment
+    layer can assess target impact.
+    """
+    __tablename__ = "assets"
+    id            = Column(Integer, primary_key=True, index=True)
+    ip_address    = Column(String, nullable=False, unique=True, index=True)
+    hostname      = Column(String, nullable=True)
+    asset_type    = Column(String, nullable=False, default="workstation")  # server|workstation|network|external
+    criticality   = Column(String, nullable=False, default="low")          # low|medium|high|critical
+    environment   = Column(String, nullable=True)                          # prod|dev|test
+    tags          = Column(Text, nullable=True)                            # JSON array
+    created_at    = Column(DateTime, server_default=func.now())
+    updated_at    = Column(DateTime, server_default=func.now())
 
 
 # ── Session / init helpers ─────────────────────────────────────────────────────

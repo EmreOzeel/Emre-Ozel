@@ -12,6 +12,18 @@ services:
       - DEFAULT_PASS=${DEFAULT_PASS:-admin123}
       - DB_PATH=/data/pcap.db
       - UPLOAD_DIR=/data/uploads
+      # ── Live collector ──────────────────────────────────────────────
+      - COLLECTOR_ENABLED=${COLLECTOR_ENABLED:-true}
+      - SYSLOG_HOST=${SYSLOG_HOST:-0.0.0.0}
+      - SYSLOG_PORT=${SYSLOG_PORT:-5514}
+      - COLLECTOR_FLUSH_INTERVAL=${COLLECTOR_FLUSH_INTERVAL:-1.0}
+      - COLLECTOR_BATCH_SIZE=${COLLECTOR_BATCH_SIZE:-100}
+      - COLLECTOR_SOURCE_ID=${COLLECTOR_SOURCE_ID:-}
+      - COLLECTOR_DEVICE_ROLE=${COLLECTOR_DEVICE_ROLE:-perimeter}
+      - RETENTION_DAYS=${RETENTION_DAYS:-7}
+    ports:
+      - "5514:5514/udp"
+      - "5514:5514/tcp"
     volumes:
       - pcap-data:/data
     networks:

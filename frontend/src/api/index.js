@@ -27,4 +27,50 @@ api.interceptors.response.use(
   }
 )
 
+// ── Live events helpers ──────────────────────────────────────────────────────
+
+export function fetchLiveEvents(params = {}) {
+  return api.get('/live-events', { params })
+}
+
+export function fetchLiveEventsStats() {
+  return api.get('/live-events/stats')
+}
+
+export function fetchLiveEventsTimeline(params = {}) {
+  return api.get('/live-events/timeline', { params })
+}
+
+export function fetchLiveFlows(params = {}) {
+  return api.get('/live-flows', { params })
+}
+
+export function fetchLiveFlowsStats() {
+  return api.get('/live-flows/stats')
+}
+
+export function fetchLiveFlowsTimeline(params = {}) {
+  return api.get('/live-flows/timeline', { params })
+}
+
+export function fetchLiveRiskScores(params = {}) {
+  return api.get('/live-events/risk-scores', { params })
+}
+
+export function fetchLiveIncidents(params = {}) {
+  return api.get('/live-incidents', { params })
+}
+
+export function fetchLiveIncidentDetail(id) {
+  return api.get(`/live-incidents/${id}`)
+}
+
+export function fetchUpdateIncidentStatus(id, status) {
+  return api.put(`/live-incidents/${id}/status`, { status })
+}
+
+export function fetchCollectorStatus() {
+  return api.get('/collector/status')
+}
+
 export default api

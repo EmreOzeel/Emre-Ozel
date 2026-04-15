@@ -3554,6 +3554,529 @@ def get_baseline(
     return {"baseline": baseline}
 
 
+# ── Dashboard summary ────────────────────────────────────────────────────────
+
+_risk_cache: dict = {"ts": 0.0, "data": []}
+_RISK_CACHE_TTL = 30.0  # seconds
+
+
+@app.get("/api/dashboard/summary")
+def dashboard_summary(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Single endpoint that returns everything the dashboard needs.
+
+    Aggregates collector status, live event counts, risk scores,
+    auto-detection notifications, work-queue counts, and analysis
+    stats into one response so the frontend needs only one fetch
+    on page load.
+    """
+    import time as _time
+    from sqlalchemy import func as sqlfunc, case
+
+    now = datetime.utcnow()
+    five_min_ago = now - __import__("datetime").timedelta(minutes=5)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # ── Collector ────────────────────────────────────────────────────────
+    from collector.service import collector_stats
+    collector = collector_stats()
+
+    # ── Live events (last 5 min) ─────────────────────────────────────────
+    from database import LiveEventModel
+    le_q = db.query(
+        sqlfunc.count(LiveEventModel.id).label("total"),
+        sqlfunc.sum(case((LiveEventModel.action == "allow", 1), else_=0)).label("allow"),
+        sqlfunc.sum(case((LiveEventModel.action == "deny", 1), else_=0)).label("deny"),
+        sqlfunc.sum(case((LiveEventModel.action == "drop", 1), else_=0)).label("drop"),
+    ).filter(LiveEventModel.event_time >= five_min_ago).first()
+
+    live_total = int(le_q.total or 0) if le_q else 0
+    live_allow = int(le_q.allow or 0) if le_q else 0
+    live_deny  = int(le_q.deny or 0) if le_q else 0
+    live_drop  = int(le_q.drop or 0) if le_q else 0
+
+    # ── Risk scores (cached) ─────────────────────────────────────────────
+    mono = _time.monotonic()
+    if mono - _risk_cache["ts"] > _RISK_CACHE_TTL:
+        from collector.live_risk import compute_live_risk_scores
+        _risk_cache["data"] = compute_live_risk_scores(db, now=now)
+        _risk_cache["ts"] = mono
+
+    all_risk = _risk_cache["data"]
+    top5 = [e for e in all_risk if e["risk_score"] >= 30][:5]
+    top_entry = all_risk[0] if all_risk else None
+
+    # ── Auto-detections ──────────────────────────────────────────────────
+    auto_notifs = (
+        db.query(NotificationModel)
+        .filter(
+            NotificationModel.user_id == current_user.id,
+            NotificationModel.type == "drift_detected",
+            NotificationModel.message.startswith("[AUTO]"),
+        )
+        .order_by(NotificationModel.created_at.desc())
+        .limit(5)
+        .all()
+    )
+    auto_detections = [
+        {
+            "id":          n.id,
+            "message":     n.message,
+            "analysis_id": n.analysis_id,
+            "created_at":  n.created_at.isoformat() if n.created_at else None,
+        }
+        for n in auto_notifs
+    ]
+
+    # ── Work queue counts (current user) ─────────────────────────────────
+    uid = current_user.id
+    is_admin = bool(getattr(current_user, "is_admin", False))
+    wq_base = db.query(AnalysisModel).filter(
+        AnalysisModel.status == "completed",
+    )
+    if not is_admin:
+        wq_base = wq_base.filter(
+            or_(
+                AnalysisModel.user_id == uid,
+                AnalysisModel.assigned_user_id == uid,
+            )
+        )
+
+    total_open = wq_base.filter(
+        AnalysisModel.workflow_state.in_(("new", "in_progress", "needs_review")),
+    ).count()
+    needs_review = wq_base.filter(
+        AnalysisModel.workflow_state == "needs_review",
+    ).count()
+    new_analyses = wq_base.filter(
+        AnalysisModel.workflow_state == "new",
+    ).count()
+
+    # ── Analysis stats (current user) ────────────────────────────────────
+    my_analyses = db.query(AnalysisModel).filter(
+        AnalysisModel.user_id == uid,
+    )
+    total_analyses = my_analyses.count()
+    pending = my_analyses.filter(
+        AnalysisModel.status.in_(("pending", "running")),
+    ).count()
+    completed_today = my_analyses.filter(
+        AnalysisModel.status == "completed",
+        AnalysisModel.finished_at >= midnight,
+    ).count()
+    failed_today = my_analyses.filter(
+        AnalysisModel.status == "failed",
+        AnalysisModel.finished_at >= midnight,
+    ).count()
+
+    return {
+        "collector": collector,
+        "live_events": {
+            "total_last_5min":  live_total,
+            "allow_last_5min":  live_allow,
+            "deny_last_5min":   live_deny,
+            "drop_last_5min":   live_drop,
+            "top_risk_ip":      top_entry["source_ip"] if top_entry else None,
+            "top_risk_score":   top_entry["risk_score"] if top_entry else None,
+        },
+        "risk_scores": top5,
+        "auto_detections": auto_detections,
+        "work_queue": {
+            "total_open":    total_open,
+            "needs_review":  needs_review,
+            "new_analyses":  new_analyses,
+        },
+        "analyses": {
+            "total":           total_analyses,
+            "completed_today": completed_today,
+            "failed_today":    failed_today,
+            "pending":         pending,
+        },
+    }
+
+
+# ── Live flows API ───────────────────────────────────────────────────────────
+
+from database import LiveFlowModel
+
+
+def _live_flow_dict(r: LiveFlowModel) -> dict:
+    return {
+        "id":                    r.id,
+        "source_id":             r.source_id,
+        "device_type":           r.device_type,
+        "device_role":           r.device_role,
+        "parser_id":             r.parser_id,
+        "source_ip":             r.source_ip,
+        "destination_ip":        r.destination_ip,
+        "source_port":           r.source_port,
+        "destination_port":      r.destination_port,
+        "protocol":              r.protocol,
+        "first_seen":            r.first_seen.isoformat() if r.first_seen else None,
+        "last_seen":             r.last_seen.isoformat() if r.last_seen else None,
+        "duration_ms":           r.duration_ms,
+        "event_count":           r.event_count,
+        "total_bytes_in":        r.total_bytes_in,
+        "total_bytes_out":       r.total_bytes_out,
+        "total_packets_in":      r.total_packets_in,
+        "total_packets_out":     r.total_packets_out,
+        "allow_count":           r.allow_count,
+        "deny_count":            r.deny_count,
+        "drop_count":            r.drop_count,
+        "reset_count":           r.reset_count,
+        "alert_count":           r.alert_count,
+        "action_summary":        r.action_summary,
+        "reason_summary":        r.reason_summary,
+        "nat_source_ip":         r.nat_source_ip,
+        "nat_destination_ip":    r.nat_destination_ip,
+        "application":           r.application,
+        "service":               r.service,
+        "backend_ip":            r.backend_ip,
+        "state":                 r.state,
+        "flow_type":             r.flow_type,
+        "reset_ratio":           r.reset_ratio,
+        "deny_ratio":            r.deny_ratio,
+        "burst_score":           r.burst_score,
+        "asymmetric_behavior":   r.asymmetric_behavior,
+        "suspicious_reasons":    json.loads(r.suspicious_reasons) if r.suspicious_reasons else [],
+        "suppressed":            r.suppressed,
+    }
+
+
+@app.get("/api/live-flows")
+def list_live_flows(
+    source_ip: Optional[str] = None,
+    destination_ip: Optional[str] = None,
+    protocol: Optional[str] = None,
+    state: Optional[str] = None,
+    application: Optional[str] = None,
+    action_summary: Optional[str] = None,
+    flow_type: Optional[str] = None,
+    suppressed: Optional[bool] = None,
+    limit: int = Query(100, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Query reconstructed live flows with optional filters."""
+    q = db.query(LiveFlowModel)
+    if source_ip:
+        q = q.filter(LiveFlowModel.source_ip == source_ip)
+    if destination_ip:
+        q = q.filter(LiveFlowModel.destination_ip == destination_ip)
+    if protocol:
+        q = q.filter(LiveFlowModel.protocol == protocol.upper())
+    if state:
+        q = q.filter(LiveFlowModel.state == state)
+    if application:
+        q = q.filter(LiveFlowModel.application == application)
+    if action_summary:
+        q = q.filter(LiveFlowModel.action_summary == action_summary)
+    if flow_type:
+        q = q.filter(LiveFlowModel.flow_type == flow_type)
+    if suppressed is not None:
+        q = q.filter(LiveFlowModel.suppressed.is_(suppressed))
+    total = q.count()
+    rows = (
+        q.order_by(LiveFlowModel.last_seen.desc(), LiveFlowModel.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "flows": [_live_flow_dict(r) for r in rows],
+    }
+
+
+@app.get("/api/live-flows/stats")
+def live_flows_stats(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Aggregated statistics over reconstructed live flows."""
+    from sqlalchemy import func as sqlfunc
+
+    total = db.query(LiveFlowModel).count()
+    state_counts = dict(
+        db.query(LiveFlowModel.state, sqlfunc.count(LiveFlowModel.id))
+        .group_by(LiveFlowModel.state)
+        .all()
+    )
+    flow_type_counts = dict(
+        db.query(LiveFlowModel.flow_type, sqlfunc.count(LiveFlowModel.id))
+        .filter(LiveFlowModel.flow_type.isnot(None))
+        .group_by(LiveFlowModel.flow_type)
+        .all()
+    )
+    top_talkers = [
+        {"ip": ip, "flow_count": c, "total_bytes": b}
+        for ip, c, b in (
+            db.query(
+                LiveFlowModel.source_ip,
+                sqlfunc.count(LiveFlowModel.id),
+                sqlfunc.sum(LiveFlowModel.total_bytes_in + LiveFlowModel.total_bytes_out),
+            )
+            .group_by(LiveFlowModel.source_ip)
+            .order_by(sqlfunc.count(LiveFlowModel.id).desc())
+            .limit(10)
+            .all()
+        )
+    ]
+    top_reset = [
+        {"ip": ip, "count": c}
+        for ip, c in (
+            db.query(LiveFlowModel.source_ip, sqlfunc.count(LiveFlowModel.id))
+            .filter(LiveFlowModel.state == "reset")
+            .group_by(LiveFlowModel.source_ip)
+            .order_by(sqlfunc.count(LiveFlowModel.id).desc())
+            .limit(10)
+            .all()
+        )
+    ]
+    top_denied = [
+        {"ip": ip, "count": c}
+        for ip, c in (
+            db.query(LiveFlowModel.source_ip, sqlfunc.count(LiveFlowModel.id))
+            .filter(LiveFlowModel.state == "denied")
+            .group_by(LiveFlowModel.source_ip)
+            .order_by(sqlfunc.count(LiveFlowModel.id).desc())
+            .limit(10)
+            .all()
+        )
+    ]
+
+    return {
+        "total_flows":     total,
+        "active_flows":    state_counts.get("active", 0),
+        "completed_flows": state_counts.get("completed", 0),
+        "denied_flows":    state_counts.get("denied", 0),
+        "reset_flows":     state_counts.get("reset", 0),
+        "dropped_flows":   state_counts.get("dropped", 0),
+        "top_talkers":     top_talkers,
+        "top_reset_sources":  top_reset,
+        "top_denied_sources": top_denied,
+        "flow_type_counts": flow_type_counts,
+    }
+
+
+@app.get("/api/live-flows/timeline")
+def live_flows_timeline(
+    minutes: int = Query(60, ge=1, le=1440),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Per-minute flow state counts for the last *minutes* minutes."""
+    from sqlalchemy import case, literal_column
+    from sqlalchemy import func as sqlfunc
+
+    cutoff = datetime.utcnow() - __import__("datetime").timedelta(minutes=minutes)
+
+    is_sqlite = "sqlite" in str(db.bind.url)
+    if is_sqlite:
+        bucket_expr = sqlfunc.strftime("%Y-%m-%dT%H:%M:00", LiveFlowModel.last_seen)
+    else:
+        bucket_expr = sqlfunc.date_trunc(
+            literal_column("'minute'"), LiveFlowModel.last_seen,
+        )
+
+    rows = (
+        db.query(
+            bucket_expr.label("bucket"),
+            sqlfunc.sum(case((LiveFlowModel.state == "active", 1), else_=0)).label("active"),
+            sqlfunc.sum(case((LiveFlowModel.state == "completed", 1), else_=0)).label("completed"),
+            sqlfunc.sum(case((LiveFlowModel.state == "denied", 1), else_=0)).label("denied"),
+            sqlfunc.sum(case((LiveFlowModel.state == "reset", 1), else_=0)).label("reset"),
+            sqlfunc.sum(case((LiveFlowModel.state == "dropped", 1), else_=0)).label("dropped"),
+        )
+        .filter(LiveFlowModel.last_seen >= cutoff)
+        .group_by(literal_column("bucket"))
+        .order_by(literal_column("bucket"))
+        .all()
+    )
+    return [
+        {
+            "bucket":    str(r.bucket),
+            "active":    int(r.active or 0),
+            "completed": int(r.completed or 0),
+            "denied":    int(r.denied or 0),
+            "reset":     int(r.reset or 0),
+            "dropped":   int(r.dropped or 0),
+        }
+        for r in rows
+    ]
+
+
+# ── Live incidents API ────────────────────────────────────────────────────────
+
+from database import LiveIncidentModel
+
+
+@app.get("/api/live-incidents")
+def list_live_incidents(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    source_ip: Optional[str] = None,
+    behavior_type: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List behavior-derived incidents, newest first."""
+    q = db.query(LiveIncidentModel)
+    if status:
+        q = q.filter(LiveIncidentModel.status == status)
+    if severity:
+        q = q.filter(LiveIncidentModel.severity == severity)
+    if source_ip:
+        q = q.filter(LiveIncidentModel.source_ip == source_ip)
+    if behavior_type:
+        q = q.filter(LiveIncidentModel.behavior_type == behavior_type)
+    total = q.count()
+    rows = (
+        q.order_by(
+            LiveIncidentModel.priority_score.desc().nullslast(),
+            LiveIncidentModel.last_activity_at.desc().nullslast(),
+            LiveIncidentModel.last_seen.desc(),
+        )
+        .offset(offset).limit(limit).all()
+    )
+    return {
+        "total": total,
+        "incidents": [_incident_dict(r) for r in rows],
+    }
+
+
+@app.get("/api/live-incidents/{incident_id}")
+def get_live_incident(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    row = db.query(LiveIncidentModel).filter(
+        LiveIncidentModel.id == incident_id
+    ).first()
+    if not row:
+        raise HTTPException(404, "Incident not found")
+    return _incident_dict(row)
+
+
+class IncidentStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(open|investigating|resolved|dismissed)$")
+
+
+@app.put("/api/live-incidents/{incident_id}/status")
+def update_incident_status(
+    incident_id: int,
+    req: IncidentStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    row = db.query(LiveIncidentModel).filter(
+        LiveIncidentModel.id == incident_id
+    ).first()
+    if not row:
+        raise HTTPException(404, "Incident not found")
+    now = datetime.utcnow()
+    row.status = req.status
+    row.last_activity_at = now
+    row.updated_at = now
+    from collector.incidents import update_priority
+    update_priority(row, now=now)
+    db.commit()
+    return _incident_dict(row)
+
+
+def _incident_dict(r: LiveIncidentModel) -> dict:
+    return {
+        "id":                r.id,
+        "source_ip":         r.source_ip,
+        "behavior_type":     r.behavior_type,
+        "severity":          r.severity,
+        "status":            r.status,
+        "first_seen":        r.first_seen.isoformat() if r.first_seen else None,
+        "last_seen":         r.last_seen.isoformat() if r.last_seen else None,
+        "event_count":       r.event_count,
+        "linked_flow_count": r.linked_flow_count,
+        "latest_confidence": r.latest_confidence,
+        "summary":           r.summary,
+        "top_destination_ips":    json.loads(r.top_destination_ips) if r.top_destination_ips else [],
+        "top_ports":              json.loads(r.top_ports) if r.top_ports else [],
+        "total_distinct_destinations": r.total_distinct_destinations,
+        "total_distinct_ports":        r.total_distinct_ports,
+        "sample_flows":           json.loads(r.sample_flows) if r.sample_flows else [],
+        "last_activity_summary":  r.last_activity_summary,
+        "impacted_assets_count":       r.impacted_assets_count,
+        "highest_target_criticality":  r.highest_target_criticality,
+        "target_summary":              r.target_summary,
+        "priority_score":    r.priority_score,
+        "last_activity_at":  r.last_activity_at.isoformat() if r.last_activity_at else None,
+        "decay_factor":      r.decay_factor,
+        "created_at":        r.created_at.isoformat() if r.created_at else None,
+        "updated_at":        r.updated_at.isoformat() if r.updated_at else None,
+    }
+
+
+@app.get("/api/live-flows/behaviors")
+def live_flow_behaviors(
+    min_confidence: float = Query(0.0, ge=0.0, le=1.0),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return correlated behavior signals per source IP."""
+    from collector.flow_correlation import compute_flow_behaviors
+
+    entries = compute_flow_behaviors(db)
+    if min_confidence > 0:
+        entries = [e for e in entries if e["confidence"] >= min_confidence]
+    return entries
+
+
+# ── Attack sessions API ──────────────────────────────────────────────────────
+
+from database import AttackSessionModel
+from collector.sessions import session_dict
+
+
+@app.get("/api/attack-sessions")
+def list_attack_sessions(
+    status: Optional[str] = None,
+    source_ip: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    q = db.query(AttackSessionModel)
+    if status:
+        q = q.filter(AttackSessionModel.status == status)
+    if source_ip:
+        q = q.filter(AttackSessionModel.source_ip == source_ip)
+    q = q.order_by(
+        AttackSessionModel.priority_score.desc(),
+        AttackSessionModel.last_activity.desc(),
+    )
+    rows = q.offset(offset).limit(limit).all()
+    return [session_dict(r) for r in rows]
+
+
+@app.get("/api/attack-sessions/{session_id}")
+def get_attack_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    row = db.query(AttackSessionModel).filter(AttackSessionModel.id == session_id).first()
+    if not row:
+        raise HTTPException(404, "Attack session not found")
+    return session_dict(row)
+
+
 # ── Live events API ──────────────────────────────────────────────────────────
 
 from database import LiveEventModel
@@ -3602,6 +4125,7 @@ def list_live_events(
     device_type: Optional[str] = None,
     protocol: Optional[str] = None,
     application: Optional[str] = None,
+    suppressed: Optional[bool] = None,
     limit: int = Query(100, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -3627,6 +4151,8 @@ def list_live_events(
         q = q.filter(LiveEventModel.protocol == protocol.upper())
     if application:
         q = q.filter(LiveEventModel.application == application)
+    if suppressed is not None:
+        q = q.filter(LiveEventModel.suppressed.is_(suppressed))
     total = q.count()
     rows = (
         q.order_by(LiveEventModel.event_time.desc(), LiveEventModel.id.desc())
@@ -3729,6 +4255,81 @@ def live_events_stats(
         "top_denied_sources": top_denied,
         "collector": collector,
     }
+
+
+@app.get("/api/live-events/timeline")
+def live_events_timeline(
+    minutes: int = Query(60, ge=1, le=1440),
+    source_ip: Optional[str] = None,
+    destination_ip: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return per-minute action counts for the last *minutes* minutes.
+
+    Each bucket is a 1-minute interval.  The response is a list of dicts
+    sorted oldest → newest so Chart.js can render left-to-right::
+
+        [{"bucket": "2026-04-13T10:15:00", "allow": 42, "deny": 3, "drop": 1}, ...]
+
+    Uses ``strftime`` for SQLite and ``date_trunc`` for PostgreSQL.
+    """
+    from sqlalchemy import case, literal_column, text
+    from sqlalchemy import func as sqlfunc
+
+    cutoff = datetime.utcnow() - __import__("datetime").timedelta(minutes=minutes)
+
+    # Build the 1-minute bucket expression (DB-portable)
+    is_sqlite = "sqlite" in str(db.bind.url)
+    if is_sqlite:
+        bucket_expr = sqlfunc.strftime("%Y-%m-%dT%H:%M:00", LiveEventModel.event_time)
+    else:
+        bucket_expr = sqlfunc.date_trunc(
+            literal_column("'minute'"), LiveEventModel.event_time,
+        )
+
+    q = db.query(
+        bucket_expr.label("bucket"),
+        sqlfunc.sum(case((LiveEventModel.action == "allow", 1), else_=0)).label("allow"),
+        sqlfunc.sum(case((LiveEventModel.action == "deny", 1), else_=0)).label("deny"),
+        sqlfunc.sum(case((LiveEventModel.action == "drop", 1), else_=0)).label("drop"),
+    ).filter(
+        LiveEventModel.event_time >= cutoff,
+    )
+    if source_ip:
+        q = q.filter(LiveEventModel.source_ip == source_ip)
+    if destination_ip:
+        q = q.filter(LiveEventModel.destination_ip == destination_ip)
+
+    rows = (
+        q.group_by(literal_column("bucket"))
+        .order_by(literal_column("bucket"))
+        .all()
+    )
+    return [
+        {
+            "bucket": str(r.bucket),
+            "allow":  int(r.allow or 0),
+            "deny":   int(r.deny or 0),
+            "drop":   int(r.drop or 0),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/live-events/risk-scores")
+def live_risk_scores(
+    min_risk_score: int = Query(0, ge=0, le=100),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Per-source-IP risk scores from the live event stream."""
+    from collector.live_risk import compute_live_risk_scores
+
+    entries = compute_live_risk_scores(db)
+    if min_risk_score > 0:
+        entries = [e for e in entries if e["risk_score"] >= min_risk_score]
+    return entries
 
 
 @app.get("/api/collector/status")
