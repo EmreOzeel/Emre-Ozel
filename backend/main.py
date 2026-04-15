@@ -4037,6 +4037,39 @@ def live_flow_behaviors(
     return entries
 
 
+# ── Baselines API ────────────────────────────────────────────────────────────
+
+from database import IPBaselineModel
+from collector.baseline import baseline_dict
+
+
+@app.get("/api/baselines")
+def list_baselines(
+    source_ip: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    q = db.query(IPBaselineModel)
+    if source_ip:
+        q = q.filter(IPBaselineModel.source_ip == source_ip)
+    q = q.order_by(IPBaselineModel.source_ip)
+    return [baseline_dict(r) for r in q.all()]
+
+
+@app.get("/api/baselines/{source_ip}")
+def get_baseline(
+    source_ip: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    row = db.query(IPBaselineModel).filter(
+        IPBaselineModel.source_ip == source_ip,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Baseline not found")
+    return baseline_dict(row)
+
+
 # ── Attack sessions API ──────────────────────────────────────────────────────
 
 from database import AttackSessionModel

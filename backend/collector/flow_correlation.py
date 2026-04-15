@@ -132,6 +132,10 @@ def compute_flow_behaviors(
 
     result.sort(key=lambda e: (-e["confidence"], -e["flow_count"]))
 
+    # Enrich with deviation scores against IP baselines
+    from collector.baseline import detect_deviations
+    result = detect_deviations(db, result)
+
     if use_cache:
         with _cache_lock:
             _cache["ts"] = time.monotonic()

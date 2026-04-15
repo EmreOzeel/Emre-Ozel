@@ -73,4 +73,16 @@ export function fetchCollectorStatus() {
   return api.get('/collector/status')
 }
 
+export function fetchBehaviors(params = {}) {
+  return api.get('/live-flows/behaviors', { params })
+}
+
+export function fetchBaselines(params = {}) {
+  return api.get('/baselines', { params })
+}
+
+export function fetchBaseline(sourceIp) {
+  return api.get(`/baselines/${sourceIp}`)
+}
+
 export default api

@@ -215,6 +215,32 @@
             </div>
           </div>
 
+          <!-- Baseline Deviation -->
+          <div class="dp-section" v-if="selectedDeviation">
+            <div class="dp-label">Baseline Deviation</div>
+            <template v-if="selectedDeviation.no_baseline">
+              <div class="empty-hint">No baseline yet — needs more historical data</div>
+            </template>
+            <template v-else>
+              <div class="dp-grid">
+                <span>Deviation score</span>
+                <span class="mono dp-bold" :class="deviationColor(selectedDeviation.deviation_score)">
+                  {{ selectedDeviation.deviation_score.toFixed(1) }}
+                </span>
+                <span>Sample count</span>
+                <span class="mono">Based on {{ selectedDeviation.baseline_sample_count }} observations</span>
+              </div>
+              <div class="dp-pills" v-if="selectedDeviation.deviating_metrics?.length">
+                <span class="dp-pill-label">Deviating</span>
+                <span
+                  v-for="m in selectedDeviation.deviating_metrics"
+                  :key="m"
+                  class="dp-pill deviation-pill"
+                >{{ m.replace(/_/g, ' ') }}</span>
+              </div>
+            </template>
+          </div>
+
           <div class="dp-suppressed" v-if="selected.suppressed">
             <el-icon><Warning /></el-icon> This flow is suppressed by an active rule.
           </div>
@@ -248,6 +274,8 @@ const selected = ref(null)
 
 const timelineBuckets = ref([])
 const chartCanvas = ref(null)
+const behaviors = ref([])
+const selectedDeviation = ref(null)
 
 let tableTimer = null
 let statsTimer = null
@@ -304,7 +332,24 @@ async function fetchTimeline() {
 function resetAndFetch() { offset.value = 0; fetchFlows(); fetchStats(); fetchTimeline() }
 function loadMore() { offset.value = flows.value.length; fetchFlows(true) }
 
-function openDetail(row) { selected.value = row }
+async function fetchBehaviors() {
+  try { behaviors.value = (await api.get('/live-flows/behaviors')).data || [] } catch {}
+}
+
+function openDetail(row) {
+  selected.value = row
+  const match = behaviors.value.find(b => b.source_ip === row.source_ip)
+  selectedDeviation.value = match && match.deviation_score != null ? match : null
+  // Refresh behaviors if stale
+  if (!behaviors.value.length) fetchBehaviors()
+}
+
+function deviationColor(score) {
+  if (score >= 5) return 'dev-red'
+  if (score >= 3) return 'dev-orange'
+  return 'dev-green'
+}
+
 function viewRelated() {
   if (!selected.value) return
   router.push(`/live-events?source_ip=${selected.value.source_ip}&destination_ip=${selected.value.destination_ip}`)
@@ -398,7 +443,7 @@ function stopTimers() {
 }
 watch(autoRefresh, (on) => { if (on) startTimers(); else stopTimers() })
 
-onMounted(() => { fetchFlows(); fetchStats(); fetchTimeline(); startTimers() })
+onMounted(() => { fetchFlows(); fetchStats(); fetchTimeline(); fetchBehaviors(); startTimers() })
 onUnmounted(stopTimers)
 </script>
 
@@ -493,4 +538,8 @@ onUnmounted(stopTimers)
 .asym-badge.yes { background:#fde2e2; color:#f56c6c; }
 .asym-badge.no { background:#e1f3d8; color:#67c23a; }
 .dp-suppressed { display:flex; align-items:center; gap:6px; padding:8px 12px; background:#fdf6ec; border:1px solid #e6a23c; border-radius:6px; font-size:12px; color:#e6a23c; margin-top:10px; }
+.dev-red { color:#f56c6c !important; font-weight:700; }
+.dev-orange { color:#e6a23c !important; font-weight:700; }
+.dev-green { color:#67c23a !important; font-weight:700; }
+.deviation-pill { background:#fde2e2; color:#f56c6c; border-color:#f89898; }
 </style>

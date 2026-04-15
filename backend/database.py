@@ -724,6 +724,30 @@ class AttackSessionModel(Base):
     updated_at      = Column(DateTime, server_default=func.now())
 
 
+class IPBaselineModel(Base):
+    """
+    Learned normal behavior per source IP from historical flows.
+    Used to detect deviations from established traffic patterns.
+    """
+    __tablename__ = "ip_baselines"
+    id                      = Column(Integer, primary_key=True, index=True)
+    source_ip               = Column(String, nullable=False, unique=True, index=True)
+    observation_window_days = Column(Integer, nullable=False, default=7)
+    sample_count            = Column(Integer, nullable=False, default=0)
+    avg_flows_per_window    = Column(Float, nullable=False, default=0)
+    avg_distinct_destinations = Column(Float, nullable=False, default=0)
+    avg_distinct_ports      = Column(Float, nullable=False, default=0)
+    avg_deny_ratio          = Column(Float, nullable=False, default=0)
+    avg_reset_ratio         = Column(Float, nullable=False, default=0)
+    avg_bytes_per_flow      = Column(Float, nullable=False, default=0)
+    stddev_flows            = Column(Float, nullable=False, default=0)
+    stddev_deny_ratio       = Column(Float, nullable=False, default=0)
+    stddev_reset_ratio      = Column(Float, nullable=False, default=0)
+    last_computed_at        = Column(DateTime, nullable=True)
+    created_at              = Column(DateTime, server_default=func.now())
+    updated_at              = Column(DateTime, server_default=func.now())
+
+
 class AssetModel(Base):
     """
     Known network asset for criticality scoring.

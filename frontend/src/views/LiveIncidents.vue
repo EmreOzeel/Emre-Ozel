@@ -88,6 +88,16 @@
             <span class="mono ts">{{ fmtTime(row.last_seen) }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="Deviation" width="90" align="center">
+          <template #default="{ row }">
+            <span
+              v-if="getDeviation(row.source_ip) != null"
+              class="mono"
+              :class="deviationColor(getDeviation(row.source_ip))"
+            >{{ getDeviation(row.source_ip).toFixed(1) }}</span>
+            <span v-else class="mono dev-none">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="Status" width="110" align="center">
           <template #default="{ row }">
             <span class="status-badge" :class="`st-${row.status}`">{{ row.status }}</span>
@@ -184,7 +194,33 @@
             <div v-else class="empty-hint">No flow samples available</div>
           </div>
 
-          <!-- 6. Actions -->
+          <!-- 6. Baseline Deviation -->
+          <div class="dp-section" v-if="selectedDeviationData">
+            <div class="dp-label">Baseline Deviation</div>
+            <template v-if="selectedDeviationData.no_baseline">
+              <div class="empty-hint">No baseline yet — needs more historical data</div>
+            </template>
+            <template v-else>
+              <div class="dp-grid">
+                <span>Deviation score</span>
+                <span class="mono dp-bold" :class="deviationColor(selectedDeviationData.deviation_score)">
+                  {{ selectedDeviationData.deviation_score.toFixed(1) }}
+                </span>
+                <span>Sample count</span>
+                <span class="mono">Based on {{ selectedDeviationData.baseline_sample_count }} observations</span>
+              </div>
+              <div class="dp-pills" v-if="selectedDeviationData.deviating_metrics?.length">
+                <span class="dp-pill-label">Deviating</span>
+                <span
+                  v-for="m in selectedDeviationData.deviating_metrics"
+                  :key="m"
+                  class="dp-pill deviation-pill"
+                >{{ m.replace(/_/g, ' ') }}</span>
+              </div>
+            </template>
+          </div>
+
+          <!-- 7. Actions -->
           <div class="dp-actions">
             <el-button size="small" type="primary" @click="$router.push(`/live-flows?source_ip=${selected.source_ip}`); selected = null">
               View source IP flows
@@ -216,6 +252,8 @@ const loadingMore = ref(false)
 const autoRefresh = ref(true)
 const statsLoaded = ref(false)
 const selected = ref(null)
+const behaviors = ref([])
+const selectedDeviationData = ref(null)
 let timer = null
 
 const filters = reactive({
@@ -265,7 +303,26 @@ async function fetchStats() {
 function resetAndFetch() { offset.value = 0; fetchIncidents(); fetchStats() }
 function loadMore() { offset.value = incidents.value.length; fetchIncidents(true) }
 
-function onRowClick(row) { selected.value = { ...row } }
+function onRowClick(row) {
+  selected.value = { ...row }
+  const match = behaviors.value.find(b => b.source_ip === row.source_ip)
+  selectedDeviationData.value = match && match.deviation_score != null ? match : null
+}
+
+function getDeviation(sourceIp) {
+  const match = behaviors.value.find(b => b.source_ip === sourceIp)
+  return match && !match.no_baseline ? match.deviation_score : null
+}
+
+function deviationColor(score) {
+  if (score >= 5) return 'dev-red'
+  if (score >= 3) return 'dev-orange'
+  return 'dev-green'
+}
+
+async function fetchBehaviors() {
+  try { behaviors.value = (await api.get('/live-flows/behaviors')).data || [] } catch {}
+}
 
 async function updateStatus(newStatus) {
   if (!selected.value) return
@@ -322,7 +379,7 @@ function startTimer() {
 function stopTimer() { if (timer) { clearInterval(timer); timer = null } }
 watch(autoRefresh, (on) => { if (on) startTimer(); else stopTimer() })
 
-onMounted(() => { fetchIncidents(); fetchStats(); startTimer() })
+onMounted(() => { fetchIncidents(); fetchStats(); fetchBehaviors(); startTimer() })
 onUnmounted(stopTimer)
 </script>
 
@@ -408,4 +465,9 @@ onUnmounted(stopTimer)
 .empty-hint { font-size: 12px; color: #909399; text-align: center; padding: 8px 0; }
 
 .dp-actions { display: flex; gap: 8px; margin-top: 16px; padding-top: 12px; border-top: 1px solid #ebeef5; }
+.dev-red { color:#f56c6c !important; font-weight:700; }
+.dev-orange { color:#e6a23c !important; font-weight:700; }
+.dev-green { color:#67c23a !important; font-weight:700; }
+.dev-none { color:#c0c4cc; }
+.deviation-pill { background:#fde2e2; color:#f56c6c; border-color:#f89898; }
 </style>

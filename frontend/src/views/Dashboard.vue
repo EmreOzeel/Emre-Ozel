@@ -319,6 +319,10 @@
                 <span class="coll-label">NetFlow packets</span>
                 <span class="mono">{{ summary.collector.netflow_packets_received }}</span>
               </div>
+              <div class="coll-row" v-if="baselineCount != null">
+                <span class="coll-label">Baselines</span>
+                <span class="mono">{{ baselineCount }} IP(s) profiled</span>
+              </div>
             </template>
             <div v-else class="empty-hint">Loading…</div>
           </div>
@@ -355,6 +359,7 @@ const lastUpdatedAt = ref(null)     // Date object
 const secondsAgo = ref(0)
 const incidents = ref([])
 const collectorExpanded = ref(false)
+const baselineCount = ref(null)
 
 const incidentCounts = computed(() => {
   const c = { critical: 0, high: 0, medium: 0, low: 0 }
@@ -450,12 +455,20 @@ async function fetchIncidents() {
   } catch {}
 }
 
+async function fetchBaselineCount() {
+  try {
+    const res = await api.get('/baselines')
+    baselineCount.value = (res.data || []).length
+  } catch {}
+}
+
 // ── Timer management ────────────────────────────────────────────────────────
 function startTimers() {
   refreshTimer = setInterval(() => {
     fetchDashboardSummary()
     fetchRecent()
     fetchIncidents()
+    fetchBaselineCount()
   }, REFRESH_MS)
   tickTimer = setInterval(() => {
     if (lastUpdatedAt.value) {
@@ -481,6 +494,7 @@ onMounted(() => {
   fetchDashboardSummary()
   fetchRecent()
   fetchIncidents()
+  fetchBaselineCount()
   startTimers()
   window.addEventListener('analysis-created', onAnalysisCreated)
 })

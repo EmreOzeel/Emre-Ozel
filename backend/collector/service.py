@@ -204,6 +204,13 @@ def _retention_loop() -> None:
             except Exception:
                 logger.exception("Auto-create paths failed")
 
+        # Baseline computation — every 6 hours (every 360th tick)
+        if ticks % 360 == 0:
+            try:
+                _run_baseline_computation()
+            except Exception:
+                logger.exception("Baseline computation failed")
+
         # Retention sweep — every hour (every 60th tick)
         if ticks % 60 == 0:
             try:
@@ -315,6 +322,23 @@ def _run_retention() -> int:
         db.commit()
         if n:
             logger.info("Retention: purged %d events older than %s", n, cutoff.isoformat())
+        return n
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _run_baseline_computation() -> int:
+    """Recompute IP baselines from historical flow data."""
+    from collector.baseline import compute_baselines
+
+    db = SessionLocal()
+    try:
+        n = compute_baselines(db)
+        if n:
+            logger.info("Baselines: updated %d IP baselines", n)
         return n
     except Exception:
         db.rollback()

@@ -140,6 +140,8 @@ def upsert_incidents_from_behaviors(
             new_sev = _derive_severity(btype, b.get("confidence", 0), existing.event_count)
             if _SEV_RANK.get(new_sev, 0) > _SEV_RANK.get(existing.severity, 0):
                 existing.severity = new_sev
+            # Deviation-based severity boost
+            _apply_deviation_severity_boost(existing, b)
             # Asset-based severity boost (additive, after base escalation)
             _apply_asset_severity_boost(existing)
             # Notify if severity increased at all (base or asset)
@@ -170,6 +172,7 @@ def upsert_incidents_from_behaviors(
             db.flush()
             _enrich_incident(db, incident, now=now)
             _enrich_asset_impact(db, incident)
+            _apply_deviation_severity_boost(incident, b)
             _apply_asset_severity_boost(incident)
             incident.last_activity_at = now
             update_priority(incident, now=now)
@@ -361,6 +364,27 @@ def _enrich_asset_impact(
             f"{incident.total_distinct_destinations or 0} host(s) "
             f"including {host_hint}"
         )
+
+
+def _apply_deviation_severity_boost(
+    incident: LiveIncidentModel,
+    behavior: Dict[str, Any],
+) -> None:
+    """Boost severity by one tier if deviation_score > 3.0.
+
+    Also adds "high_deviation" to the summary drivers.
+    """
+    dev_score = behavior.get("deviation_score", 0)
+    if dev_score > 3.0:
+        rank = _SEV_RANK.get(incident.severity, 0)
+        if rank < _SEV_RANK["critical"]:
+            incident.severity = _RANK_SEV[rank + 1]
+        drivers = behavior.get("drivers", [])
+        if "high_deviation" not in drivers:
+            drivers.append("high_deviation")
+            behavior["drivers"] = drivers
+            # Rebuild summary to include new driver
+            incident.summary = _build_summary(behavior, incident.event_count)
 
 
 def _apply_asset_severity_boost(incident: LiveIncidentModel) -> None:
