@@ -40,6 +40,23 @@ class Settings(BaseSettings):
     NETFLOW_PORT: int = 2055
     RETENTION_DAYS: int = 7
 
+    # ── GeoIP ─────────────────────────────────────────────────────────────────
+    GEOIP_CITY_DB: str = ""          # path to GeoLite2-City.mmdb
+    GEOIP_ASN_DB: str = ""           # path to GeoLite2-ASN.mmdb
+    GEOIP_ENABLED: bool = True
+    GEOIP_USE_IPAPI_FALLBACK: bool = True
+
+    # ── PCAP Trigger ─────────────────────────────────────────────────────────
+    PCAP_TRIGGER_ENABLED: bool = False
+    PCAP_TRIGGER_INTERFACE: str = ""     # e.g. eth0, span0
+    PCAP_TRIGGER_DURATION: int = 30      # seconds per capture
+    PCAP_TRIGGER_MAX_CONCURRENT: int = 5
+    PCAP_TRIGGER_DIR: str = "/data/triggered"
+
+    # ── Packet Engine ────────────────────────────────────────────────────────
+    PACKET_ENGINE_TOKEN: str = ""
+    PACKET_ENGINE_URL: str = "http://packet-engine:8080"
+
     # ── CORS ──────────────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: List[str] = ["*"]
 

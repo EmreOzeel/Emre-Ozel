@@ -46,6 +46,18 @@
           </span>
           <span>top risk</span>
         </div>
+        <div class="ls-item ls-ti" v-if="tiMatchCount > 0" @click="$router.push('/threat-intel')">
+          <strong>{{ tiMatchCount }}</strong>
+          <span>TI matches</span>
+        </div>
+        <div class="ls-item" v-if="topSourceCountry">
+          <span>{{ topSourceCountry.flag }} {{ topSourceCountry.code }}</span>
+          <span>top source</span>
+        </div>
+        <div class="ls-item ls-capture" v-if="activeCaptures > 0">
+          <strong>{{ activeCaptures }}</strong>
+          <span>active captures</span>
+        </div>
         <div class="ls-spacer"></div>
         <el-button size="small" type="primary" link @click="$router.push('/live-events')">
           View all <el-icon class="el-icon--right"><ArrowRight /></el-icon>
@@ -338,6 +350,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowDown, Warning } from '@element-plus/icons-vue'
 import api from '../api'
+import { lookupThreatIP, fetchGeoBatchLookup, fetchPcapTriggerStatus } from '../api'
 import { classifyAnalysisError } from '../utils/analysisErrors'
 
 const router = useRouter()
@@ -360,6 +373,14 @@ const secondsAgo = ref(0)
 const incidents = ref([])
 const collectorExpanded = ref(false)
 const baselineCount = ref(null)
+const tiMatchCount = ref(0)
+const topSourceCountry = ref(null)
+const activeCaptures = ref(0)
+
+function _countryFlag(code) {
+  if (!code) return ''
+  return code.toUpperCase().replace(/./g, c => String.fromCodePoint(0x1F1E0 - 65 + c.charCodeAt(0)))
+}
 
 const incidentCounts = computed(() => {
   const c = { critical: 0, high: 0, medium: 0, low: 0 }
@@ -391,6 +412,41 @@ const topRiskLevel = computed(() => {
   if (s >= 30) return 'medium'
   return 'low'
 })
+
+async function _countTiMatches(riskScores) {
+  let count = 0
+  const checks = riskScores.slice(0, 20).map(async (r) => {
+    try {
+      const res = await lookupThreatIP(r.source_ip)
+      if (res.data.is_threat) count++
+    } catch {}
+  })
+  await Promise.all(checks)
+  tiMatchCount.value = count
+
+  // Fetch PCAP trigger active captures
+  try {
+    const trigRes = await fetchPcapTriggerStatus()
+    activeCaptures.value = trigRes.data.active_captures || 0
+  } catch { activeCaptures.value = 0 }
+
+  // Compute top source country from risk scores
+  const ips = riskScores.slice(0, 20).map(r => r.source_ip)
+  if (ips.length) {
+    try {
+      const res = await fetchGeoBatchLookup(ips)
+      const countryCounts = {}
+      for (const geo of Object.values(res.data)) {
+        const cc = geo?.country_code
+        if (cc && !geo.is_private) countryCounts[cc] = (countryCounts[cc] || 0) + 1
+      }
+      const top = Object.entries(countryCounts).sort((a, b) => b[1] - a[1])[0]
+      topSourceCountry.value = top ? { code: top[0], flag: _countryFlag(top[0]), count: top[1] } : null
+    } catch {
+      topSourceCountry.value = null
+    }
+  }
+}
 
 // ── Unified fetch ───────────────────────────────────────────────────────────
 async function fetchDashboardSummary() {
@@ -424,6 +480,9 @@ async function fetchDashboardSummary() {
     staleDismissed.value = false
     lastUpdatedAt.value = new Date()
     secondsAgo.value = 0
+
+    // Count TI matches from risk score IPs
+    _countTiMatches(data.risk_scores || [])
 
     // Clear retry timer on success
     if (retryTimer) { clearInterval(retryTimer); retryTimer = null }
@@ -694,6 +753,11 @@ function timeAgo(iso) {
 }
 .ls-item strong { color: #303133; font-size: 16px; }
 .ls-threats strong { color: #f56c6c; }
+.ls-ti { cursor: pointer; border-radius: 6px; padding: 6px 12px; background: #fef0f0; }
+.ls-ti:hover { background: #fde2e2; }
+.ls-ti strong { color: #f56c6c; }
+.ls-capture { background: #fdf6ec; border-radius: 6px; padding: 6px 12px; }
+.ls-capture strong { color: #e6a23c; }
 .ls-spacer { flex: 1; }
 
 .collector-dot {

@@ -85,4 +85,76 @@ export function fetchBaseline(sourceIp) {
   return api.get(`/baselines/${sourceIp}`)
 }
 
+// ── Correlation Rules ────────────────────────────────────────────────────────
+
+export function fetchCorrelationRules() {
+  return api.get('/correlation-rules')
+}
+
+export function createCorrelationRule(data) {
+  return api.post('/correlation-rules', data)
+}
+
+export function updateCorrelationRule(id, data) {
+  return api.put(`/correlation-rules/${id}`, data)
+}
+
+export function deleteCorrelationRule(id) {
+  return api.delete(`/correlation-rules/${id}`)
+}
+
+export function toggleCorrelationRule(id) {
+  return api.patch(`/correlation-rules/${id}/toggle`)
+}
+
+// ── Threat Intelligence ──────────────────────────────────────────────────────
+
+export function fetchThreatFeeds() {
+  return api.get('/threat-feeds')
+}
+
+export function fetchThreatIndicators(params = {}) {
+  return api.get('/threat-indicators', { params })
+}
+
+export function lookupThreatIP(ip) {
+  return api.get('/threat-indicators/lookup', { params: { ip } })
+}
+
+export function fetchThreatFeed(id) {
+  return api.post(`/threat-feeds/${id}/fetch`)
+}
+
+export function refreshAllThreatFeeds() {
+  return api.post('/threat-feeds/refresh-all')
+}
+
+// ── PCAP Trigger ─────────────────────────────────────────────────────────────
+
+export function fetchPcapTriggerStatus() {
+  return api.get('/pcap-trigger/status')
+}
+
+export function triggerManualPcap(data) {
+  return api.post('/pcap-trigger/manual', data)
+}
+
+export function fetchIncidentPcaps(incidentId) {
+  return api.get(`/live-incidents/${incidentId}/pcaps`)
+}
+
+// ── GeoIP ────────────────────────────────────────────────────────────────────
+
+export function fetchGeoLookup(ip) {
+  return api.get('/geo/lookup', { params: { ip } })
+}
+
+export function fetchGeoBatchLookup(ips) {
+  return api.post('/geo/batch-lookup', { ips })
+}
+
+export function fetchGeoCacheStats() {
+  return api.get('/geo/cache-stats')
+}
+
 export default api

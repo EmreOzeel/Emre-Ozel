@@ -67,6 +67,21 @@ const routes = [
         name: 'LiveIncidents',
         component: () => import('../views/LiveIncidents.vue'),
       },
+      {
+        path: 'correlation-rules',
+        name: 'CorrelationRules',
+        component: () => import('../views/CorrelationRules.vue'),
+      },
+      {
+        path: 'threat-intel',
+        name: 'ThreatIntel',
+        component: () => import('../views/ThreatIntel.vue'),
+      },
+      {
+        path: 'geo-map',
+        name: 'GeoMap',
+        component: () => import('../views/GeoMap.vue'),
+      },
     ]
   },
   {

@@ -88,9 +88,10 @@
       <el-table :data="flows" stripe size="small" v-loading="loading && !flows.length" empty-text="No flows found" style="width:100%" @row-click="openDetail" highlight-current-row>
         <el-table-column label="First Seen" width="150"><template #default="{row}"><span class="mono ts">{{ fmtTime(row.first_seen) }}</span></template></el-table-column>
         <el-table-column label="Last Seen" width="150"><template #default="{row}"><span class="mono ts">{{ fmtTime(row.last_seen) }}</span></template></el-table-column>
-        <el-table-column label="Source" min-width="140"><template #default="{row}"><span class="mono">{{ row.source_ip }}<span class="port-hint" v-if="row.source_port">:{{ row.source_port }}</span></span></template></el-table-column>
+        <el-table-column label="Source" min-width="140"><template #default="{row}"><span class="mono">{{ row.source_ip }}<span class="port-hint" v-if="row.source_port">:{{ row.source_port }}</span></span><span v-if="tiCache[row.source_ip]" class="ti-flame" title="Threat Intel match">&#x1F525;</span></template></el-table-column>
+        <el-table-column label="Src" width="50" align="center"><template #default="{row}"><span class="geo-flag" :title="row.source_geo?.country_name || ''">{{ geoFlag(row.source_geo) }}</span></template></el-table-column>
         <el-table-column label="" width="30" align="center"><template #default>→</template></el-table-column>
-        <el-table-column label="Destination" min-width="140"><template #default="{row}"><span class="mono">{{ row.destination_ip }}<span class="port-hint" v-if="row.destination_port">:{{ row.destination_port }}</span></span></template></el-table-column>
+        <el-table-column label="Destination" min-width="140"><template #default="{row}"><span class="mono">{{ row.destination_ip }}<span class="port-hint" v-if="row.destination_port">:{{ row.destination_port }}</span></span><span v-if="tiCache[row.destination_ip]" class="ti-flame" title="Threat Intel match">&#x1F525;</span></template></el-table-column>
         <el-table-column label="Proto" width="60" align="center" prop="protocol" />
         <el-table-column label="State" width="90" align="center"><template #default="{row}"><span class="state-badge" :class="`st-${row.state}`">{{ row.state }}</span></template></el-table-column>
         <el-table-column label="Type" width="95" align="center"><template #default="{row}"><span v-if="row.flow_type && row.flow_type !== 'normal'" class="ft-badge" :class="`ft-${row.flow_type}`">{{ row.flow_type }}</span><span v-else class="ft-normal">normal</span></template></el-table-column>
@@ -117,12 +118,35 @@
             <button class="dp-close" @click="selected = null">&times;</button>
           </div>
 
+          <div v-if="selectedTiMatches.length" class="ti-banner">
+            <strong>Warning:</strong> This IP matches threat intelligence:
+            <span v-for="(m, i) in selectedTiMatches" :key="i" class="ti-match-item">
+              {{ m.threat_type }} ({{ m.source_feed }}, {{ (m.confidence * 100).toFixed(0) }}%)
+            </span>
+          </div>
+
           <div class="dp-section">
             <div class="dp-label">5-Tuple</div>
             <div class="dp-tuple mono">
               {{ selected.source_ip }}:{{ selected.source_port || '*' }}
               → {{ selected.destination_ip }}:{{ selected.destination_port || '*' }}
               ({{ selected.protocol || '?' }})
+            </div>
+          </div>
+
+          <div class="dp-section" v-if="selected.source_geo?.country_code || selected.destination_geo?.country_code">
+            <div class="dp-label">Location</div>
+            <div class="dp-grid" v-if="selected.source_geo?.country_code">
+              <span>Source</span>
+              <span>{{ geoFlag(selected.source_geo) }} {{ selected.source_geo.country_name || '' }} {{ selected.source_geo.city ? '/ ' + selected.source_geo.city : '' }}</span>
+              <span v-if="selected.source_geo.asn_org">ASN</span>
+              <span v-if="selected.source_geo.asn_org">{{ selected.source_geo.asn ? 'AS' + selected.source_geo.asn + ' ' : '' }}{{ selected.source_geo.asn_org }}</span>
+            </div>
+            <div class="dp-grid" v-if="selected.destination_geo?.country_code" style="margin-top:6px">
+              <span>Destination</span>
+              <span>{{ geoFlag(selected.destination_geo) }} {{ selected.destination_geo.country_name || '' }} {{ selected.destination_geo.city ? '/ ' + selected.destination_geo.city : '' }}</span>
+              <span v-if="selected.destination_geo.asn_org">ASN</span>
+              <span v-if="selected.destination_geo.asn_org">{{ selected.destination_geo.asn ? 'AS' + selected.destination_geo.asn + ' ' : '' }}{{ selected.destination_geo.asn_org }}</span>
             </div>
           </div>
 
@@ -259,6 +283,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { useRouter } from 'vue-router'
 import { Warning } from '@element-plus/icons-vue'
 import api from '@/api'
+import { lookupThreatIP } from '@/api'
 
 const router = useRouter()
 const PAGE_SIZE = 100
@@ -276,6 +301,48 @@ const timelineBuckets = ref([])
 const chartCanvas = ref(null)
 const behaviors = ref([])
 const selectedDeviation = ref(null)
+
+// Threat intel cache
+const tiCache = reactive({})
+const tiCacheTs = {}
+const tiFullCache = {} // ip -> matches array
+const TI_CACHE_TTL = 300000
+const selectedTiMatches = ref([])
+
+async function checkThreatIP(ip) {
+  if (!ip) return
+  const now = Date.now()
+  if (tiCacheTs[ip] && now - tiCacheTs[ip] < TI_CACHE_TTL) return
+  tiCacheTs[ip] = now
+  try {
+    const res = await lookupThreatIP(ip)
+    tiCache[ip] = res.data.is_threat
+    tiFullCache[ip] = res.data.matches || []
+  } catch {
+    tiCache[ip] = false
+    tiFullCache[ip] = []
+  }
+}
+
+function checkThreatIPs(rows) {
+  const ips = new Set()
+  for (const r of rows) {
+    if (r.source_ip) ips.add(r.source_ip)
+    if (r.destination_ip) ips.add(r.destination_ip)
+  }
+  for (const ip of ips) checkThreatIP(ip)
+}
+
+function countryFlag(code) {
+  if (!code) return ''
+  return code.toUpperCase().replace(/./g, c => String.fromCodePoint(0x1F1E0 - 65 + c.charCodeAt(0)))
+}
+function geoFlag(geo) {
+  if (!geo) return '?'
+  if (geo.is_private) return '\u{1F3E0}'
+  if (!geo.country_code) return '?'
+  return countryFlag(geo.country_code)
+}
 
 let tableTimer = null
 let statsTimer = null
@@ -320,6 +387,7 @@ async function fetchFlows(append = false) {
     if (append) flows.value = [...flows.value, ...res.data.flows]
     else flows.value = res.data.flows
     total.value = res.data.total
+    checkThreatIPs(res.data.flows)
   } catch {} finally { loading.value = false; loadingMore.value = false }
 }
 async function fetchStats() { try { stats.value = (await api.get('/live-flows/stats')).data } catch {} }
@@ -342,6 +410,13 @@ function openDetail(row) {
   selectedDeviation.value = match && match.deviation_score != null ? match : null
   // Refresh behaviors if stale
   if (!behaviors.value.length) fetchBehaviors()
+  // Load TI matches for source IP
+  selectedTiMatches.value = tiFullCache[row.source_ip] || []
+  if (!tiCacheTs[row.source_ip]) {
+    checkThreatIP(row.source_ip).then(() => {
+      selectedTiMatches.value = tiFullCache[row.source_ip] || []
+    })
+  }
 }
 
 function deviationColor(score) {
@@ -542,4 +617,13 @@ onUnmounted(stopTimers)
 .dev-orange { color:#e6a23c !important; font-weight:700; }
 .dev-green { color:#67c23a !important; font-weight:700; }
 .deviation-pill { background:#fde2e2; color:#f56c6c; border-color:#f89898; }
+
+/* Geo */
+.geo-flag { font-size:14px; cursor:default; }
+
+/* Threat Intel */
+.ti-flame { margin-left:4px; font-size:12px; cursor:help; }
+.ti-banner { background:#fef0f0; border:1px solid #fde2e2; border-radius:6px; padding:10px 14px; margin-bottom:14px; font-size:12px; color:#f56c6c; line-height:1.6; }
+.ti-banner strong { display:block; margin-bottom:2px; }
+.ti-match-item { display:inline-block; background:#fde2e2; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; margin:2px 4px 2px 0; }
 </style>

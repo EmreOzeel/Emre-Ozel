@@ -77,6 +77,8 @@ def run_intelligence_scan(db: Session, *, now: Optional[datetime] = None) -> Dic
             triggered = _trigger_analysis(db, src_ip, dst_ip, pattern, now)
             if triggered:
                 triggers += 1
+                # Trigger targeted PCAP capture if enabled
+                _try_pcap_trigger(src_ip, dst_ip, reason=pattern)
             else:
                 skipped += 1
         except Exception:
@@ -376,3 +378,14 @@ def _create_notification(db, analysis, message):
         analysis_id=analysis.id,
         message=message,
     ))
+
+
+def _try_pcap_trigger(src_ip: str, dst_ip: str, reason: str = "") -> None:
+    """Trigger a targeted PCAP capture if the trigger is enabled."""
+    try:
+        from collector.service import get_pcap_trigger
+        trigger = get_pcap_trigger()
+        if trigger is not None:
+            trigger.trigger(src_ip=src_ip, dst_ip=dst_ip, reason=reason)
+    except Exception:
+        pass

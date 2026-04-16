@@ -125,10 +125,10 @@ class PaloAltoParser(BaseParser):
             "application":      _safe(fields, _F_APPLICATION) or None,
         }
 
-        # Duration (seconds → ms)
+        # Duration (seconds → ms), capped at PostgreSQL integer max
         dur = _safe_int(fields, _F_SESSION_DURATION)
         if dur is not None:
-            result["duration_ms"] = dur * 1000
+            result["duration_ms"] = min(dur * 1000, 2_147_483_647)
 
         # NAT fields
         self._extract_nat(fields, result)

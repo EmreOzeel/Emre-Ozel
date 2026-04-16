@@ -55,6 +55,18 @@
           <el-icon><Warning /></el-icon>
           <span>Incidents</span>
         </el-menu-item>
+        <el-menu-item index="/correlation-rules">
+          <el-icon><SetUp /></el-icon>
+          <span>Correlation Rules</span>
+        </el-menu-item>
+        <el-menu-item index="/threat-intel">
+          <el-icon><Aim /></el-icon>
+          <span>Threat Intel</span>
+        </el-menu-item>
+        <el-menu-item index="/geo-map">
+          <el-icon><MapLocation /></el-icon>
+          <span>Geo Map</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">

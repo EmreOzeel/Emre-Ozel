@@ -30,7 +30,11 @@ from database import (
     PathAnalysisFeedbackModel,
     PathAnalysisRolePresetModel,
     PathAnalysisSavedQueryModel,
+    CorrelationRuleModel,
+    GeoIPCacheModel,
     SuppressionRuleModel,
+    ThreatFeedModel,
+    ThreatIndicatorModel,
     TeamModel,
     TelemetryEventModel,
     UserModel,
@@ -96,6 +100,16 @@ def startup():
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     init_db()
     seed_admin()
+    # Seed default correlation rules and threat feeds
+    from collector.rule_engine import seed_default_rules
+    from collector.threat_feeds import seed_default_feeds
+    from database import SessionLocal
+    _seed_db = SessionLocal()
+    try:
+        seed_default_rules(_seed_db)
+        seed_default_feeds(_seed_db)
+    finally:
+        _seed_db.close()
     start_worker()
     if settings.COLLECTOR_ENABLED:
         from collector.service import start_collector
@@ -1229,6 +1243,516 @@ def delete_suppression(
         raise HTTPException(403, "Not authorized to delete this rule")
     db.delete(rule)
     db.commit()
+
+
+# ── Correlation Rules ─────────────────────────────────────────────────────────
+
+class CorrelationRuleCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    scope: str = Field(default="user", pattern="^(global|user)$")
+    condition_field: str
+    condition_operator: str
+    condition_value: str
+    aggregation_type: str
+    aggregation_field: Optional[str] = None
+    threshold: float
+    time_window_minutes: int = 10
+    target_entity: str
+    severity: str = Field(default="medium", pattern="^(low|medium|high|critical)$")
+    incident_behavior_type: str
+    cooldown_minutes: int = 30
+
+
+class CorrelationRuleUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    scope: Optional[str] = None
+    condition_field: Optional[str] = None
+    condition_operator: Optional[str] = None
+    condition_value: Optional[str] = None
+    aggregation_type: Optional[str] = None
+    aggregation_field: Optional[str] = None
+    threshold: Optional[float] = None
+    time_window_minutes: Optional[int] = None
+    target_entity: Optional[str] = None
+    severity: Optional[str] = None
+    incident_behavior_type: Optional[str] = None
+    cooldown_minutes: Optional[int] = None
+
+
+class CorrelationRuleResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    enabled: bool
+    created_by: Optional[int]
+    scope: str
+    condition_field: str
+    condition_operator: str
+    condition_value: str
+    aggregation_type: str
+    aggregation_field: Optional[str]
+    threshold: float
+    time_window_minutes: int
+    target_entity: str
+    severity: str
+    incident_behavior_type: str
+    cooldown_minutes: int
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+def _correlation_rule_dict(r: CorrelationRuleModel) -> dict:
+    return {
+        "id": r.id,
+        "name": r.name,
+        "description": r.description,
+        "enabled": r.enabled,
+        "created_by": r.created_by,
+        "scope": r.scope,
+        "condition_field": r.condition_field,
+        "condition_operator": r.condition_operator,
+        "condition_value": r.condition_value,
+        "aggregation_type": r.aggregation_type,
+        "aggregation_field": r.aggregation_field,
+        "threshold": r.threshold,
+        "time_window_minutes": r.time_window_minutes,
+        "target_entity": r.target_entity,
+        "severity": r.severity,
+        "incident_behavior_type": r.incident_behavior_type,
+        "cooldown_minutes": r.cooldown_minutes,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    }
+
+
+_VALID_COND_FIELDS = {
+    "source_ip", "destination_ip", "destination_port",
+    "protocol", "application", "flow_type", "behavior_type",
+    "action", "deny_ratio", "reset_ratio", "deviation_score",
+}
+_VALID_COND_OPS = {"eq", "neq", "gt", "lt", "gte", "lte", "in", "contains"}
+_VALID_AGG_TYPES = {"count", "distinct_count", "sum", "avg", "any"}
+
+
+def _validate_rule_fields(
+    condition_field: str,
+    condition_operator: str,
+    aggregation_type: str,
+) -> None:
+    if condition_field not in _VALID_COND_FIELDS:
+        raise HTTPException(400, f"Invalid condition_field: {condition_field}")
+    if condition_operator not in _VALID_COND_OPS:
+        raise HTTPException(400, f"Invalid condition_operator: {condition_operator}")
+    if aggregation_type not in _VALID_AGG_TYPES:
+        raise HTTPException(400, f"Invalid aggregation_type: {aggregation_type}")
+
+
+@app.get("/api/correlation-rules", response_model=List[CorrelationRuleResponse])
+def list_correlation_rules(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List all rules visible to the current user (global + own rules)."""
+    q = db.query(CorrelationRuleModel)
+    if not current_user.is_admin:
+        q = q.filter(
+            (CorrelationRuleModel.scope == "global") |
+            (CorrelationRuleModel.created_by == current_user.id)
+        )
+    rows = q.order_by(CorrelationRuleModel.created_at.desc()).all()
+    return [_correlation_rule_dict(r) for r in rows]
+
+
+@app.post("/api/correlation-rules", status_code=201, response_model=CorrelationRuleResponse)
+def create_correlation_rule(
+    req: CorrelationRuleCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Create a new correlation rule."""
+    _validate_rule_fields(req.condition_field, req.condition_operator, req.aggregation_type)
+    if req.scope == "global" and not current_user.is_admin:
+        raise HTTPException(403, "Only admins may create global correlation rules")
+
+    rule = CorrelationRuleModel(
+        name=req.name,
+        description=req.description,
+        enabled=True,
+        created_by=current_user.id,
+        scope=req.scope,
+        condition_field=req.condition_field,
+        condition_operator=req.condition_operator,
+        condition_value=req.condition_value,
+        aggregation_type=req.aggregation_type,
+        aggregation_field=req.aggregation_field,
+        threshold=req.threshold,
+        time_window_minutes=req.time_window_minutes,
+        target_entity=req.target_entity,
+        severity=req.severity,
+        incident_behavior_type=req.incident_behavior_type,
+        cooldown_minutes=req.cooldown_minutes,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return _correlation_rule_dict(rule)
+
+
+@app.get("/api/correlation-rules/{rule_id}", response_model=CorrelationRuleResponse)
+def get_correlation_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Get a single correlation rule by ID."""
+    rule = db.query(CorrelationRuleModel).filter(CorrelationRuleModel.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Correlation rule not found")
+    if rule.scope != "global" and rule.created_by != current_user.id and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized to view this rule")
+    return _correlation_rule_dict(rule)
+
+
+@app.put("/api/correlation-rules/{rule_id}", response_model=CorrelationRuleResponse)
+def update_correlation_rule(
+    rule_id: int,
+    req: CorrelationRuleUpdate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Update a correlation rule (owner or admin only)."""
+    rule = db.query(CorrelationRuleModel).filter(CorrelationRuleModel.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Correlation rule not found")
+    if rule.created_by != current_user.id and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized to modify this rule")
+
+    updates = req.model_dump(exclude_unset=True)
+    if "condition_field" in updates or "condition_operator" in updates or "aggregation_type" in updates:
+        _validate_rule_fields(
+            updates.get("condition_field", rule.condition_field),
+            updates.get("condition_operator", rule.condition_operator),
+            updates.get("aggregation_type", rule.aggregation_type),
+        )
+    if updates.get("scope") == "global" and not current_user.is_admin:
+        raise HTTPException(403, "Only admins may set scope to global")
+
+    for key, val in updates.items():
+        setattr(rule, key, val)
+    rule.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule)
+    return _correlation_rule_dict(rule)
+
+
+@app.delete("/api/correlation-rules/{rule_id}", status_code=204)
+def delete_correlation_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Delete a correlation rule (owner or admin only)."""
+    rule = db.query(CorrelationRuleModel).filter(CorrelationRuleModel.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Correlation rule not found")
+    if rule.created_by != current_user.id and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized to delete this rule")
+    db.delete(rule)
+    db.commit()
+
+
+@app.patch("/api/correlation-rules/{rule_id}/toggle", response_model=CorrelationRuleResponse)
+def toggle_correlation_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Toggle enabled/disabled state of a correlation rule."""
+    rule = db.query(CorrelationRuleModel).filter(CorrelationRuleModel.id == rule_id).first()
+    if not rule:
+        raise HTTPException(404, "Correlation rule not found")
+    if rule.created_by != current_user.id and not current_user.is_admin:
+        raise HTTPException(403, "Not authorized to modify this rule")
+    rule.enabled = not rule.enabled
+    rule.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule)
+    return _correlation_rule_dict(rule)
+
+
+# ── Threat Intelligence ───────────────────────────────────────────────────────
+
+class ThreatFeedResponse(BaseModel):
+    id: int
+    name: str
+    feed_type: str
+    url: Optional[str]
+    enabled: bool
+    last_fetched_at: Optional[str]
+    last_indicator_count: int
+    fetch_interval_hours: int
+    format: str
+    default_threat_type: str
+    default_confidence: float
+    created_at: Optional[str]
+    updated_at: Optional[str]
+
+
+class ThreatIndicatorResponse(BaseModel):
+    id: int
+    indicator_type: str
+    indicator_value: str
+    threat_type: str
+    confidence: float
+    source_feed: str
+    first_seen: Optional[str]
+    last_seen: Optional[str]
+    expiry: Optional[str]
+    tags: Optional[List[str]]
+
+
+def _feed_dict(f: ThreatFeedModel) -> dict:
+    return {
+        "id": f.id,
+        "name": f.name,
+        "feed_type": f.feed_type,
+        "url": f.url,
+        "enabled": f.enabled,
+        "last_fetched_at": f.last_fetched_at.isoformat() if f.last_fetched_at else None,
+        "last_indicator_count": f.last_indicator_count,
+        "fetch_interval_hours": f.fetch_interval_hours,
+        "format": f.format,
+        "default_threat_type": f.default_threat_type,
+        "default_confidence": f.default_confidence,
+        "created_at": f.created_at.isoformat() if f.created_at else None,
+        "updated_at": f.updated_at.isoformat() if f.updated_at else None,
+    }
+
+
+def _indicator_response(ind: ThreatIndicatorModel) -> dict:
+    import json as _json
+    return {
+        "id": ind.id,
+        "indicator_type": ind.indicator_type,
+        "indicator_value": ind.indicator_value,
+        "threat_type": ind.threat_type,
+        "confidence": ind.confidence,
+        "source_feed": ind.source_feed,
+        "first_seen": ind.first_seen.isoformat() if ind.first_seen else None,
+        "last_seen": ind.last_seen.isoformat() if ind.last_seen else None,
+        "expiry": ind.expiry.isoformat() if ind.expiry else None,
+        "tags": _json.loads(ind.tags) if ind.tags else [],
+    }
+
+
+@app.get("/api/threat-feeds", response_model=List[ThreatFeedResponse])
+def list_threat_feeds(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List all threat intelligence feeds with status."""
+    rows = db.query(ThreatFeedModel).order_by(ThreatFeedModel.name).all()
+    return [_feed_dict(f) for f in rows]
+
+
+@app.post("/api/threat-feeds/{feed_id}/fetch")
+def fetch_single_feed(
+    feed_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Manually trigger fetch for one feed (admin only)."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    feed = db.query(ThreatFeedModel).filter(ThreatFeedModel.id == feed_id).first()
+    if not feed:
+        raise HTTPException(404, "Feed not found")
+    from collector.threat_feeds import fetch_feed
+    n = fetch_feed(db, feed)
+    return {"fetched": n}
+
+
+@app.post("/api/threat-feeds/refresh-all")
+def refresh_all_threat_feeds(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Manually trigger refresh for all due feeds (admin only)."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    from collector.threat_feeds import refresh_all_feeds
+    result = refresh_all_feeds(db)
+    return result
+
+
+@app.get("/api/threat-indicators")
+def list_threat_indicators(
+    indicator_type: Optional[str] = Query(None),
+    threat_type: Optional[str] = Query(None),
+    source_feed: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """List threat indicators with optional filters and pagination."""
+    q = db.query(ThreatIndicatorModel)
+    if indicator_type:
+        q = q.filter(ThreatIndicatorModel.indicator_type == indicator_type)
+    if threat_type:
+        q = q.filter(ThreatIndicatorModel.threat_type == threat_type)
+    if source_feed:
+        q = q.filter(ThreatIndicatorModel.source_feed == source_feed)
+    total = q.count()
+    rows = q.order_by(ThreatIndicatorModel.last_seen.desc()).offset(offset).limit(limit).all()
+    return {
+        "total": total,
+        "items": [_indicator_response(r) for r in rows],
+    }
+
+
+@app.get("/api/threat-indicators/lookup")
+def lookup_threat_indicator(
+    ip: str = Query(..., description="IP address to look up"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Look up a single IP against all active threat indicators."""
+    from collector.threat_feeds import lookup_ip
+    matches = lookup_ip(db, ip)
+    return {"ip": ip, "matches": matches, "is_threat": len(matches) > 0}
+
+
+@app.delete("/api/threat-indicators/{indicator_id}", status_code=204)
+def delete_threat_indicator(
+    indicator_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Delete a threat indicator (admin only)."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    ind = db.query(ThreatIndicatorModel).filter(ThreatIndicatorModel.id == indicator_id).first()
+    if not ind:
+        raise HTTPException(404, "Indicator not found")
+    db.delete(ind)
+    db.commit()
+
+
+# ── GeoIP ─────────────────────────────────────────────────────────────────────
+
+class BatchLookupRequest(BaseModel):
+    ips: List[str] = Field(..., max_length=50)
+
+
+@app.get("/api/geo/lookup")
+def geo_lookup(
+    ip: str = Query(..., description="IP address to look up"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Look up GeoIP data for a single IP. Triggers lookup if not cached."""
+    from collector.geoip import lookup_ip_geo
+    return lookup_ip_geo(ip, db)
+
+
+@app.post("/api/geo/batch-lookup")
+def geo_batch_lookup(
+    req: BatchLookupRequest,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Look up GeoIP data for multiple IPs. Max 50 per request."""
+    if len(req.ips) > 50:
+        raise HTTPException(400, "Maximum 50 IPs per request")
+    from collector.geoip import batch_lookup
+    return batch_lookup(req.ips, db)
+
+
+@app.get("/api/geo/cache-stats")
+def geo_cache_stats(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return cache statistics: total cached, private count, top countries."""
+    from sqlalchemy import func as sqlfunc
+    total = db.query(GeoIPCacheModel).count()
+    private_count = db.query(GeoIPCacheModel).filter(
+        GeoIPCacheModel.is_private.is_(True)
+    ).count()
+    country_rows = (
+        db.query(
+            GeoIPCacheModel.country_code,
+            sqlfunc.count(GeoIPCacheModel.id).label("cnt"),
+        )
+        .filter(
+            GeoIPCacheModel.country_code.isnot(None),
+            GeoIPCacheModel.is_private.isnot(True),
+        )
+        .group_by(GeoIPCacheModel.country_code)
+        .order_by(sqlfunc.count(GeoIPCacheModel.id).desc())
+        .limit(10)
+        .all()
+    )
+    return {
+        "total_cached": total,
+        "private_count": private_count,
+        "by_country": [{"country": r[0], "count": r[1]} for r in country_rows],
+    }
+
+
+# ── PCAP Trigger ──────────────────────────────────────────────────────────────
+
+class PcapTriggerRequest(BaseModel):
+    src_ip: str
+    dst_ip: str
+    dst_port: Optional[int] = None
+    reason: str = "manual"
+
+
+@app.get("/api/pcap-trigger/status")
+def pcap_trigger_status(
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return PCAP trigger status and configuration."""
+    from collector.service import get_pcap_trigger
+    trigger = get_pcap_trigger()
+    if trigger is None:
+        return {
+            "enabled": settings.PCAP_TRIGGER_ENABLED,
+            "configured": False,
+            "active_captures": 0,
+            "max_concurrent": settings.PCAP_TRIGGER_MAX_CONCURRENT,
+            "interface": settings.PCAP_TRIGGER_INTERFACE or None,
+            "duration_seconds": settings.PCAP_TRIGGER_DURATION,
+        }
+    stats = trigger.stats()
+    stats["enabled"] = True
+    stats["configured"] = True
+    return stats
+
+
+@app.post("/api/pcap-trigger/manual")
+def pcap_trigger_manual(
+    req: PcapTriggerRequest,
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Manually trigger a PCAP capture for a specific IP pair (admin only)."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    from collector.service import get_pcap_trigger
+    trigger = get_pcap_trigger()
+    if trigger is None:
+        raise HTTPException(400, "PCAP trigger is not enabled or not configured")
+    filepath = trigger.trigger(
+        src_ip=req.src_ip,
+        dst_ip=req.dst_ip,
+        dst_port=req.dst_port,
+        reason=req.reason,
+    )
+    return {"triggered": filepath is not None, "filepath": filepath}
 
 
 # ── Path Analysis ─────────────────────────────────────────────────────────────
@@ -3702,8 +4226,8 @@ def dashboard_summary(
 from database import LiveFlowModel
 
 
-def _live_flow_dict(r: LiveFlowModel) -> dict:
-    return {
+def _live_flow_dict(r: LiveFlowModel, db: Session = None) -> dict:
+    d = {
         "id":                    r.id,
         "source_id":             r.source_id,
         "device_type":           r.device_type,
@@ -3742,7 +4266,14 @@ def _live_flow_dict(r: LiveFlowModel) -> dict:
         "asymmetric_behavior":   r.asymmetric_behavior,
         "suspicious_reasons":    json.loads(r.suspicious_reasons) if r.suspicious_reasons else [],
         "suppressed":            r.suppressed,
+        "source_geo":            None,
+        "destination_geo":       None,
     }
+    if db:
+        from collector.geoip import get_cached_geo
+        d["source_geo"] = get_cached_geo(r.source_ip, db)
+        d["destination_geo"] = get_cached_geo(r.destination_ip, db)
+    return d
 
 
 @app.get("/api/live-flows")
@@ -3789,7 +4320,7 @@ def list_live_flows(
         "total": total,
         "offset": offset,
         "limit": limit,
-        "flows": [_live_flow_dict(r) for r in rows],
+        "flows": [_live_flow_dict(r, db) for r in rows],
     }
 
 
@@ -3948,7 +4479,7 @@ def list_live_incidents(
     )
     return {
         "total": total,
-        "incidents": [_incident_dict(r) for r in rows],
+        "incidents": [_incident_dict(r, db) for r in rows],
     }
 
 
@@ -3963,7 +4494,7 @@ def get_live_incident(
     ).first()
     if not row:
         raise HTTPException(404, "Incident not found")
-    return _incident_dict(row)
+    return _incident_dict(row, db)
 
 
 class IncidentStatusUpdate(BaseModel):
@@ -3989,11 +4520,47 @@ def update_incident_status(
     from collector.incidents import update_priority
     update_priority(row, now=now)
     db.commit()
-    return _incident_dict(row)
+    return _incident_dict(row, db)
 
 
-def _incident_dict(r: LiveIncidentModel) -> dict:
-    return {
+@app.get("/api/live-incidents/{incident_id}/pcaps")
+def get_incident_pcaps(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Return list of PCAP analyses linked to this incident."""
+    incident = db.query(LiveIncidentModel).filter(
+        LiveIncidentModel.id == incident_id
+    ).first()
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+
+    linked_ids = json.loads(incident.linked_pcap_analysis_ids or "[]")
+    if not linked_ids:
+        return []
+
+    analyses = (
+        db.query(AnalysisModel)
+        .filter(AnalysisModel.id.in_(linked_ids))
+        .order_by(AnalysisModel.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "analysis_id": a.id,
+            "filename": a.filename,
+            "status": a.status,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "packet_count": a.packet_count,
+            "issue_count": a.issue_count,
+        }
+        for a in analyses
+    ]
+
+
+def _incident_dict(r: LiveIncidentModel, db: Session = None) -> dict:
+    d = {
         "id":                r.id,
         "source_ip":         r.source_ip,
         "behavior_type":     r.behavior_type,
@@ -4019,7 +4586,14 @@ def _incident_dict(r: LiveIncidentModel) -> dict:
         "decay_factor":      r.decay_factor,
         "created_at":        r.created_at.isoformat() if r.created_at else None,
         "updated_at":        r.updated_at.isoformat() if r.updated_at else None,
+        "linked_pcap_analysis_ids": json.loads(r.linked_pcap_analysis_ids) if r.linked_pcap_analysis_ids else [],
+        "pcap_trigger_count":       r.pcap_trigger_count or 0,
+        "source_geo":        None,
     }
+    if db:
+        from collector.geoip import get_cached_geo
+        d["source_geo"] = get_cached_geo(r.source_ip, db)
+    return d
 
 
 @app.get("/api/live-flows/behaviors")
@@ -4372,6 +4946,184 @@ def get_collector_status(
     """Return the current collector service status."""
     from collector.service import collector_stats
     return collector_stats()
+
+
+# ── Packet Engine Ingest ─────────────────────────────────────────────────────
+
+from fastapi import Header
+
+
+class PacketEventsPayload(BaseModel):
+    events: List[Dict]
+
+
+def _verify_packet_engine_token(authorization: Optional[str] = Header(None)):
+    """Validate Bearer token against PACKET_ENGINE_TOKEN config."""
+    if not settings.PACKET_ENGINE_TOKEN:
+        raise HTTPException(503, "Packet engine ingest not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header")
+    token = authorization[7:]
+    if token != settings.PACKET_ENGINE_TOKEN:
+        raise HTTPException(401, "Invalid packet engine token")
+
+
+@app.post("/api/ingest/packet-events")
+def ingest_packet_events(
+    payload: PacketEventsPayload,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(_verify_packet_engine_token),
+):
+    """Receive normalized packet events from the Go packet engine."""
+    from datetime import datetime as _dt
+
+    accepted = 0
+    for ev in payload.events:
+        try:
+            row = LiveEventModel(
+                source_id=ev.get("source_id", "packet_engine"),
+                device_type=ev.get("device_type", "packet_engine"),
+                device_role="span",
+                parser_id=ev.get("parser_id", "gopacket"),
+                event_time=_dt.fromisoformat(ev["first_seen"]) if ev.get("first_seen") else _dt.utcnow(),
+                source_ip=ev.get("source_ip", "0.0.0.0"),
+                destination_ip=ev.get("destination_ip", "0.0.0.0"),
+                source_port=ev.get("source_port"),
+                destination_port=ev.get("destination_port"),
+                protocol=ev.get("protocol"),
+                action=ev.get("action", "allow"),
+                bytes_in=ev.get("bytes_in"),
+                bytes_out=ev.get("bytes_out"),
+                packets_in=ev.get("packet_count"),
+                duration_ms=ev.get("duration_ms"),
+            )
+            db.add(row)
+            accepted += 1
+        except Exception:
+            continue
+
+    if accepted > 0:
+        db.commit()
+
+    return {"accepted": accepted}
+
+
+class PacketAlertPayload(BaseModel):
+    timestamp: str
+    src_ip: str
+    dst_ip: str = ""
+    dst_port: int = 0
+    protocol: str = ""
+    alert_type: str
+    message: str
+    value: float = 0
+    threshold: float = 0
+
+
+@app.post("/api/ingest/packet-alerts")
+def ingest_packet_alert(
+    payload: PacketAlertPayload,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(_verify_packet_engine_token),
+):
+    """Receive a streaming analysis alert from the Go packet engine."""
+    from database import NotificationModel, LiveIncidentModel
+
+    # 1. Create notification for admin (user_id=1)
+    notif = NotificationModel(
+        user_id=1,
+        type="drift_detected",
+        message=f"[STREAM ALERT] {payload.alert_type}: {payload.message}",
+    )
+    db.add(notif)
+
+    # 2. Update matching open incident if one exists for this src_ip
+    incident = (
+        db.query(LiveIncidentModel)
+        .filter(
+            LiveIncidentModel.source_ip == payload.src_ip,
+            LiveIncidentModel.status.in_(["open", "investigating"]),
+        )
+        .first()
+    )
+    if incident:
+        incident.last_activity_summary = (
+            f"[{payload.alert_type}] {payload.message} "
+            f"(value={payload.value}, threshold={payload.threshold})"
+        )
+
+    db.commit()
+    return {"accepted": True}
+
+
+# ── Packet Engine Watch Proxy ────────────────────────────────────────────────
+
+import httpx
+
+
+@app.get("/api/packet-engine/watches")
+def list_packet_watches(
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Proxy GET to Go packet engine's watch list."""
+    try:
+        resp = httpx.get(
+            f"{settings.PACKET_ENGINE_URL}/watches",
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        raise HTTPException(502, f"Packet engine unreachable: {exc}")
+
+
+class WatchRuleCreate(BaseModel):
+    target_ip: str
+    target_port: int = 0
+    protocol: str = ""
+    max_pps: float = 0
+    max_bps: float = 0
+    max_conns: int = 0
+
+
+@app.post("/api/packet-engine/watches")
+def create_packet_watch(
+    body: WatchRuleCreate,
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Proxy POST to Go packet engine to add a watch rule (admin only)."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    try:
+        resp = httpx.post(
+            f"{settings.PACKET_ENGINE_URL}/watches",
+            json=body.dict(),
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        raise HTTPException(502, f"Packet engine unreachable: {exc}")
+
+
+@app.delete("/api/packet-engine/watches/{ip}/{port}")
+def delete_packet_watch(
+    ip: str,
+    port: int,
+    current_user: UserModel = Depends(get_current_user),
+):
+    """Proxy DELETE to Go packet engine to remove a watch rule (admin only)."""
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin only")
+    try:
+        resp = httpx.delete(
+            f"{settings.PACKET_ENGINE_URL}/watches/{ip}/{port}",
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        raise HTTPException(502, f"Packet engine unreachable: {exc}")
 
 
 # ── Path Analysis Role Presets ────────────────────────────────────────────────

@@ -144,6 +144,8 @@ def upsert_incidents_from_behaviors(
             _apply_deviation_severity_boost(existing, b)
             # Asset-based severity boost (additive, after base escalation)
             _apply_asset_severity_boost(existing)
+            # Threat intelligence boost
+            _apply_threat_intel_boost(db, existing, b)
             # Notify if severity increased at all (base or asset)
             if _SEV_RANK.get(existing.severity, 0) > _SEV_RANK.get(old_sev, 0):
                 if _notify_escalation(db, existing, old_sev, existing.severity):
@@ -174,6 +176,7 @@ def upsert_incidents_from_behaviors(
             _enrich_asset_impact(db, incident)
             _apply_deviation_severity_boost(incident, b)
             _apply_asset_severity_boost(incident)
+            _apply_threat_intel_boost(db, incident, b)
             incident.last_activity_at = now
             update_priority(incident, now=now)
             sev = incident.severity  # may have been boosted
@@ -183,6 +186,10 @@ def upsert_incidents_from_behaviors(
             if _SEV_RANK.get(sev, 0) >= _SEV_RANK["medium"]:
                 if _notify_new(db, incident):
                     notified += 1
+
+            # Trigger targeted PCAP capture for high/critical incidents
+            if _SEV_RANK.get(sev, 0) >= _SEV_RANK["high"]:
+                _try_pcap_trigger(incident, db)
 
     if created or updated:
         db.commit()
@@ -278,10 +285,11 @@ def _enrich_incident(
     incident.total_distinct_ports = total_ports
     incident.sample_flows = json.dumps(samples)
 
-    # Improved summary
+    # Improved summary with geo enrichment
     port_hint = ", ".join(str(p) for p in top_ports[:3]) if top_ports else "various"
+    geo_hint = _get_geo_hint(db, incident.source_ip)
     incident.summary = (
-        f"{incident.source_ip} {incident.behavior_type} "
+        f"{incident.source_ip}{geo_hint} {incident.behavior_type} "
         f"{total_dsts} host(s) across {total_ports} port(s) "
         f"(top: {port_hint})"
     )
@@ -401,6 +409,67 @@ def _apply_asset_severity_boost(incident: LiveIncidentModel) -> None:
     elif crit == "high":
         rank = min(rank + 1, _SEV_RANK["critical"])
     incident.severity = _RANK_SEV[rank]
+
+
+def _try_pcap_trigger(incident: LiveIncidentModel, db: Session) -> None:
+    """Trigger a PCAP capture for a high/critical incident's top destination."""
+    try:
+        from collector.service import get_pcap_trigger
+        trigger = get_pcap_trigger()
+        if trigger is None:
+            return
+
+        # Find the top destination IP from enrichment
+        dst_ip = None
+        if incident.top_destination_ips:
+            import json as _json
+            dsts = _json.loads(incident.top_destination_ips)
+            if dsts:
+                dst_ip = dsts[0]
+        if not dst_ip:
+            return
+
+        trigger.trigger(
+            src_ip=incident.source_ip,
+            dst_ip=dst_ip,
+            reason=f"incident:{incident.behavior_type}:{incident.severity}",
+        )
+    except Exception:
+        pass
+
+
+def _get_geo_hint(db: Session, ip: str) -> str:
+    """Return a short geo string like ' (CN, AS4134 CHINANET)' or ''."""
+    try:
+        from collector.geoip import get_geo_summary
+        return get_geo_summary(ip, db)
+    except Exception:
+        return ""
+
+
+def _apply_threat_intel_boost(
+    db: Session,
+    incident: LiveIncidentModel,
+    behavior: Dict[str, Any],
+) -> None:
+    """Set severity to critical if the source IP is a known threat.
+
+    Also adds "threat_intel_match" to the summary drivers.
+    """
+    from collector.threat_feeds import is_threat_ip
+
+    try:
+        if not is_threat_ip(db, incident.source_ip):
+            return
+    except Exception:
+        return
+
+    incident.severity = "critical"
+    drivers = behavior.get("drivers", [])
+    if "threat_intel_match" not in drivers:
+        drivers.append("threat_intel_match")
+        behavior["drivers"] = drivers
+        incident.summary = _build_summary(behavior, incident.event_count)
 
 
 def compute_priority(

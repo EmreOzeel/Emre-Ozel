@@ -681,6 +681,9 @@ class LiveIncidentModel(Base):
     priority_score    = Column(Float, nullable=True)
     last_activity_at  = Column(DateTime, nullable=True)
     decay_factor      = Column(Float, nullable=True)
+    # ── PCAP links ────────────────────────────────────────────────────────────
+    linked_pcap_analysis_ids = Column(Text, nullable=True, default="[]")   # JSON list of analysis IDs
+    pcap_trigger_count       = Column(Integer, nullable=True, default=0)
     created_at        = Column(DateTime, server_default=func.now())
     updated_at        = Column(DateTime, server_default=func.now())
 
@@ -765,6 +768,121 @@ class AssetModel(Base):
     tags          = Column(Text, nullable=True)                            # JSON array
     created_at    = Column(DateTime, server_default=func.now())
     updated_at    = Column(DateTime, server_default=func.now())
+
+
+class ThreatIndicatorModel(Base):
+    """
+    Individual Indicator of Compromise (IOC) from a threat intelligence feed.
+
+    indicator_type: ip | cidr | domain | asn
+    threat_type:    malware | c2 | scanner | tor_exit | botnet | phishing | unknown
+    """
+    __tablename__ = "threat_indicators"
+    id               = Column(Integer, primary_key=True, index=True)
+    indicator_type   = Column(String, nullable=False)                 # ip|cidr|domain|asn
+    indicator_value  = Column(String, nullable=False, index=True)
+    threat_type      = Column(String, nullable=False, default="unknown")
+    confidence       = Column(Float, nullable=False, default=0.5)     # 0.0–1.0
+    source_feed      = Column(String, nullable=False)
+    first_seen       = Column(DateTime, nullable=False)
+    last_seen        = Column(DateTime, nullable=False)
+    expiry           = Column(DateTime, nullable=True)                # None = never expires
+    tags             = Column(Text, nullable=True)                    # JSON list
+    raw_data         = Column(Text, nullable=True)
+    created_at       = Column(DateTime, server_default=func.now())
+    updated_at       = Column(DateTime, server_default=func.now())
+
+
+class ThreatFeedModel(Base):
+    """
+    Threat intelligence feed source registry.
+
+    feed_type: ip_list | cidr_list | domain_list
+    format:    plain | csv | json
+    """
+    __tablename__ = "threat_feeds"
+    id                    = Column(Integer, primary_key=True, index=True)
+    name                  = Column(String, unique=True, nullable=False)
+    feed_type             = Column(String, nullable=False)             # ip_list|cidr_list|domain_list
+    url                   = Column(String, nullable=True)
+    enabled               = Column(Boolean, nullable=False, default=True)
+    last_fetched_at       = Column(DateTime, nullable=True)
+    last_indicator_count  = Column(Integer, nullable=False, default=0)
+    fetch_interval_hours  = Column(Integer, nullable=False, default=24)
+    format                = Column(String, nullable=False, default="plain")  # plain|csv|json
+    comment_char          = Column(String, nullable=False, default="#")
+    ip_column             = Column(Integer, nullable=False, default=0)       # for CSV feeds
+    # Default threat metadata applied to indicators from this feed
+    default_threat_type   = Column(String, nullable=False, default="unknown")
+    default_confidence    = Column(Float, nullable=False, default=0.5)
+    created_at            = Column(DateTime, server_default=func.now())
+    updated_at            = Column(DateTime, server_default=func.now())
+
+
+class CorrelationRuleModel(Base):
+    """
+    User-defined correlation rule.
+
+    Evaluated periodically against recent LiveFlowModel data to
+    automatically create incidents when thresholds are exceeded.
+
+    scope:
+      - "global" — visible to all users; only admins may create
+      - "user"   — visible only to creator (default)
+    """
+    __tablename__ = "correlation_rules"
+    id                   = Column(Integer, primary_key=True, index=True)
+    name                 = Column(String, nullable=False)
+    description          = Column(Text, nullable=True)
+    enabled              = Column(Boolean, nullable=False, default=True)
+    created_by           = Column(Integer, ForeignKey("users.id"), nullable=True)
+    scope                = Column(String, nullable=False, default="user")  # global|user
+
+    # ── Condition ─────────────────────────────────────────────────────────────
+    condition_field      = Column(String, nullable=False)
+    condition_operator   = Column(String, nullable=False)       # eq|neq|gt|lt|gte|lte|in|contains
+    condition_value      = Column(String, nullable=False)       # JSON-encoded for lists
+
+    # ── Aggregation ───────────────────────────────────────────────────────────
+    aggregation_type     = Column(String, nullable=False)       # count|distinct_count|sum|avg|any
+    aggregation_field    = Column(String, nullable=True)        # field to aggregate on
+    threshold            = Column(Float, nullable=False)
+
+    # ── Window & grouping ─────────────────────────────────────────────────────
+    time_window_minutes  = Column(Integer, nullable=False, default=10)
+    target_entity        = Column(String, nullable=False)       # source_ip|destination_ip|src_dst_pair
+
+    # ── Incident creation ─────────────────────────────────────────────────────
+    severity             = Column(String, nullable=False, default="medium")
+    incident_behavior_type = Column(String, nullable=False)
+    cooldown_minutes     = Column(Integer, nullable=False, default=30)
+
+    # ── Timestamps ────────────────────────────────────────────────────────────
+    created_at           = Column(DateTime, server_default=func.now())
+    updated_at           = Column(DateTime, server_default=func.now())
+
+
+class GeoIPCacheModel(Base):
+    """
+    Cached GeoIP lookup results.
+
+    source: maxmind | ip-api | private
+    """
+    __tablename__ = "geoip_cache"
+    id            = Column(Integer, primary_key=True, index=True)
+    ip            = Column(String, nullable=False, unique=True, index=True)
+    country_code  = Column(String, nullable=True)
+    country_name  = Column(String, nullable=True)
+    city          = Column(String, nullable=True)
+    latitude      = Column(Float, nullable=True)
+    longitude     = Column(Float, nullable=True)
+    asn           = Column(Integer, nullable=True)
+    asn_org       = Column(String, nullable=True)
+    is_private    = Column(Boolean, nullable=False, default=False)
+    is_bogon      = Column(Boolean, nullable=False, default=False)
+    source        = Column(String, nullable=False)
+    looked_up_at  = Column(DateTime, nullable=False)
+    created_at    = Column(DateTime, server_default=func.now())
 
 
 # ── Session / init helpers ─────────────────────────────────────────────────────

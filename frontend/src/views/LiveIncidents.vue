@@ -56,9 +56,10 @@
         @row-click="onRowClick"
         highlight-current-row
       >
-        <el-table-column label="Severity" width="90" align="center">
+        <el-table-column label="Severity" width="110" align="center">
           <template #default="{ row }">
             <span class="sev-badge" :class="`sev-${row.severity}`">{{ row.severity }}</span>
+            <span v-if="hasTiMatch(row)" class="ti-tag">TI</span>
           </template>
         </el-table-column>
         <el-table-column label="Behavior" width="140">
@@ -66,8 +67,9 @@
             <span class="btype">{{ row.behavior_type.replace(/_/g, ' ') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="Source IP" min-width="130">
+        <el-table-column label="Source IP" min-width="160">
           <template #default="{ row }">
+            <span class="geo-flag">{{ geoFlag(row.source_geo) }}</span>
             <span class="mono">{{ row.source_ip }}</span>
           </template>
         </el-table-column>
@@ -145,6 +147,17 @@
             <div class="dp-summary">{{ selected.summary }}</div>
           </div>
 
+          <!-- 2b. Location -->
+          <div class="dp-section" v-if="selected.source_geo?.country_code">
+            <div class="dp-label">Source Location</div>
+            <div class="dp-grid">
+              <span>Country</span>
+              <span>{{ geoFlag(selected.source_geo) }} {{ selected.source_geo.country_name || '' }} {{ selected.source_geo.city ? '/ ' + selected.source_geo.city : '' }}</span>
+              <span v-if="selected.source_geo.asn_org">ASN</span>
+              <span v-if="selected.source_geo.asn_org">{{ selected.source_geo.asn ? 'AS' + selected.source_geo.asn + ' ' : '' }}{{ selected.source_geo.asn_org }}</span>
+            </div>
+          </div>
+
           <!-- 3. Scope -->
           <div class="dp-section">
             <div class="dp-label">Scope</div>
@@ -220,7 +233,41 @@
             </template>
           </div>
 
-          <!-- 7. Actions -->
+          <!-- 7. Threat Intel -->
+          <div class="dp-section" v-if="selectedTiMatches.length">
+            <div class="dp-label">Threat Intelligence Match</div>
+            <div class="ti-banner">
+              <div v-for="(m, i) in selectedTiMatches" :key="i" class="ti-match-row">
+                <span class="threat-badge" :class="`tt-${m.threat_type}`">{{ m.threat_type }}</span>
+                <span class="ti-detail">{{ m.indicator_value }} via {{ m.source_feed }} ({{ (m.confidence * 100).toFixed(0) }}%)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 8. Captured PCAPs -->
+          <div class="dp-section" v-if="selected.pcap_trigger_count > 0 || isAdmin">
+            <div class="dp-label">Captured PCAPs ({{ selected.pcap_trigger_count || 0 }})</div>
+            <div v-if="linkedPcaps.length" class="pcap-list">
+              <div v-for="p in linkedPcaps" :key="p.analysis_id" class="pcap-row">
+                <span class="mono pcap-name">{{ p.filename }}</span>
+                <span class="status-badge mini" :class="`st-${p.status === 'completed' ? 'resolved' : p.status === 'failed' ? 'dismissed' : 'open'}`">{{ p.status }}</span>
+                <span class="pcap-meta" v-if="p.packet_count">{{ p.packet_count }} pkts</span>
+                <span class="pcap-meta" v-if="p.issue_count">{{ p.issue_count }} issues</span>
+                <el-button size="small" link type="primary" @click="$router.push(`/analysis/${p.analysis_id}`); selected = null">View</el-button>
+              </div>
+            </div>
+            <div v-else-if="!selected.pcap_trigger_count" class="empty-hint">No PCAPs triggered yet</div>
+            <el-button
+              v-if="isAdmin"
+              size="small"
+              type="warning"
+              :loading="triggeringPcap"
+              @click="triggerPcapNow"
+              style="margin-top:8px"
+            >Trigger PCAP now</el-button>
+          </div>
+
+          <!-- 9. Actions -->
           <div class="dp-actions">
             <el-button size="small" type="primary" @click="$router.push(`/live-flows?source_ip=${selected.source_ip}`); selected = null">
               View source IP flows
@@ -240,7 +287,11 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import { lookupThreatIP, fetchIncidentPcaps, triggerManualPcap } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.user?.is_admin ?? false)
 const router = useRouter()
 const PAGE_SIZE = 50
 
@@ -254,7 +305,22 @@ const statsLoaded = ref(false)
 const selected = ref(null)
 const behaviors = ref([])
 const selectedDeviationData = ref(null)
+const selectedTiMatches = ref([])
+const tiFullCache = {}
+const linkedPcaps = ref([])
+const triggeringPcap = ref(false)
 let timer = null
+
+function countryFlag(code) {
+  if (!code) return ''
+  return code.toUpperCase().replace(/./g, c => String.fromCodePoint(0x1F1E0 - 65 + c.charCodeAt(0)))
+}
+function geoFlag(geo) {
+  if (!geo) return '?'
+  if (geo.is_private) return '\u{1F3E0}'
+  if (!geo.country_code) return '?'
+  return countryFlag(geo.country_code)
+}
 
 const filters = reactive({
   status: '', severity: '', behavior_type: '', source_ip: '',
@@ -303,10 +369,49 @@ async function fetchStats() {
 function resetAndFetch() { offset.value = 0; fetchIncidents(); fetchStats() }
 function loadMore() { offset.value = incidents.value.length; fetchIncidents(true) }
 
+function hasTiMatch(row) {
+  return row.summary && row.summary.includes('threat_intel_match')
+}
+
 function onRowClick(row) {
   selected.value = { ...row }
   const match = behaviors.value.find(b => b.source_ip === row.source_ip)
   selectedDeviationData.value = match && match.deviation_score != null ? match : null
+  // Load TI matches
+  selectedTiMatches.value = tiFullCache[row.source_ip] || []
+  lookupThreatIP(row.source_ip).then(res => {
+    tiFullCache[row.source_ip] = res.data.matches || []
+    selectedTiMatches.value = tiFullCache[row.source_ip]
+  }).catch(() => {})
+  // Load linked PCAPs
+  linkedPcaps.value = []
+  if (row.pcap_trigger_count > 0) {
+    fetchIncidentPcaps(row.id).then(res => { linkedPcaps.value = res.data }).catch(() => {})
+  }
+}
+
+async function triggerPcapNow() {
+  if (!selected.value) return
+  triggeringPcap.value = true
+  try {
+    const dst = selected.value.top_destination_ips?.[0] || selected.value.source_ip
+    await triggerManualPcap({
+      src_ip: selected.value.source_ip,
+      dst_ip: dst,
+      reason: `manual:incident:${selected.value.id}`,
+    })
+    ElMessage.success('PCAP capture triggered')
+    // Refresh after a short delay
+    setTimeout(() => {
+      if (selected.value) {
+        fetchIncidentPcaps(selected.value.id).then(res => { linkedPcaps.value = res.data }).catch(() => {})
+      }
+    }, 2000)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || 'Failed to trigger PCAP')
+  } finally {
+    triggeringPcap.value = false
+  }
 }
 
 function getDeviation(sourceIp) {
@@ -470,4 +575,27 @@ onUnmounted(stopTimer)
 .dev-green { color:#67c23a !important; font-weight:700; }
 .dev-none { color:#c0c4cc; }
 .deviation-pill { background:#fde2e2; color:#f56c6c; border-color:#f89898; }
+
+/* Geo */
+.geo-flag { font-size:14px; margin-right:4px; }
+
+/* Threat Intel */
+.ti-tag { display:inline-block; background:#f56c6c; color:white; font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px; margin-left:4px; vertical-align:middle; }
+.ti-banner { background:#fef6f6; border:1px solid #fde2e2; border-radius:6px; padding:8px 12px; }
+.ti-match-row { display:flex; align-items:center; gap:8px; font-size:12px; padding:3px 0; }
+.ti-detail { color:#606266; }
+.threat-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:10px; font-weight:600; text-transform:uppercase; }
+.tt-malware  { background:#fde2e2; color:#f56c6c; }
+.tt-c2       { background:#f3e8ff; color:#7c3aed; }
+.tt-scanner  { background:#faecd8; color:#e6a23c; }
+.tt-tor_exit { background:#e8f4fd; color:#409eff; }
+.tt-botnet   { background:#fce4ec; color:#e91e63; }
+.tt-phishing { background:#fff3e0; color:#ff9800; }
+.tt-unknown  { background:#ebeef5; color:#909399; }
+
+/* PCAP links */
+.pcap-list { display:flex; flex-direction:column; gap:6px; }
+.pcap-row { display:flex; align-items:center; gap:8px; font-size:12px; padding:4px 0; border-bottom:1px solid #f4f6fa; }
+.pcap-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:180px; }
+.pcap-meta { color:#909399; font-size:11px; }
 </style>

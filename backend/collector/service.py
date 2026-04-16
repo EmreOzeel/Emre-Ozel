@@ -37,6 +37,7 @@ _flow_engine = None
 _flow_lock = threading.Lock()
 _retention_thread: Optional[threading.Thread] = None
 _running = False
+_pcap_trigger = None
 
 
 def start_collector() -> None:
@@ -96,7 +97,24 @@ def start_collector() -> None:
         )
         _netflow_listener.start()
 
-    # 5. Start retention sweep
+    # 6. Optionally start PCAP trigger
+    global _pcap_trigger
+    if settings.PCAP_TRIGGER_ENABLED and settings.PCAP_TRIGGER_INTERFACE:
+        from collector.pcap_trigger import PcapTrigger
+        _pcap_trigger = PcapTrigger(
+            capture_dir=settings.PCAP_TRIGGER_DIR,
+            interface=settings.PCAP_TRIGGER_INTERFACE,
+            duration_seconds=settings.PCAP_TRIGGER_DURATION,
+            max_concurrent=settings.PCAP_TRIGGER_MAX_CONCURRENT,
+        )
+        logger.info(
+            "PCAP trigger enabled: interface=%s duration=%ds max=%d",
+            settings.PCAP_TRIGGER_INTERFACE,
+            settings.PCAP_TRIGGER_DURATION,
+            settings.PCAP_TRIGGER_MAX_CONCURRENT,
+        )
+
+    # 7. Start retention sweep
     _running = True
     _retention_thread = threading.Thread(
         target=_retention_loop,
@@ -193,6 +211,13 @@ def _retention_loop() -> None:
         except Exception:
             logger.exception("Bridge scan failed")
 
+        # Correlation rules engine — every 2 minutes
+        if ticks % 2 == 0:
+            try:
+                _run_rule_engine()
+            except Exception:
+                logger.exception("Rule engine evaluation failed")
+
         # Intelligence scan + auto-create monitors — every 5 minutes
         if ticks % 5 == 0:
             try:
@@ -210,6 +235,13 @@ def _retention_loop() -> None:
                 _run_baseline_computation()
             except Exception:
                 logger.exception("Baseline computation failed")
+
+        # Threat feed refresh — every 24 hours (every 1440th tick)
+        if ticks % 1440 == 0:
+            try:
+                _run_threat_feed_refresh()
+            except Exception:
+                logger.exception("Threat feed refresh failed")
 
         # Retention sweep — every hour (every 60th tick)
         if ticks % 60 == 0:
@@ -345,6 +377,45 @@ def _run_baseline_computation() -> int:
         raise
     finally:
         db.close()
+
+
+def _run_threat_feed_refresh() -> dict:
+    """Refresh all due threat intelligence feeds."""
+    from collector.threat_feeds import refresh_all_feeds
+
+    db = SessionLocal()
+    try:
+        result = refresh_all_feeds(db)
+        if result:
+            logger.info("Threat feed refresh: %s", result)
+        return result
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _run_rule_engine() -> int:
+    """Evaluate user-defined correlation rules against recent flows."""
+    from collector.rule_engine import evaluate_rules
+
+    db = SessionLocal()
+    try:
+        n = evaluate_rules(db)
+        if n:
+            logger.info("Rule engine: %d incident(s) created/updated", n)
+        return n
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def get_pcap_trigger():
+    """Return the module-level PcapTrigger instance (or None if disabled)."""
+    return _pcap_trigger
 
 
 def _default_source_id() -> str:

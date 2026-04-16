@@ -67,6 +67,17 @@ _NORMALISED_FIELDS = frozenset({
 })
 
 
+# Integer fields that must be capped at PostgreSQL int max (2^31-1)
+# to prevent NumericValueOutOfRange errors on high-volume firewalls.
+_INT_FIELDS_TO_CAP = frozenset({
+    "bytes_in", "bytes_out", "packets_in", "packets_out",
+    "duration_ms", "response_time_ms",
+    "source_port", "destination_port",
+    "nat_source_port", "nat_destination_port",
+    "backend_port",
+})
+
+
 class Pipeline:
     """Stateless line processor + buffered batch writer.
 
@@ -256,6 +267,13 @@ class Pipeline:
         event.setdefault("destination_ip", "0.0.0.0")
         event.setdefault("action", "unknown")
 
+        # Cap integer fields to PostgreSQL integer max (2^31-1)
+        _PG_INT_MAX = 2_147_483_647
+        for key in _INT_FIELDS_TO_CAP:
+            val = event.get(key)
+            if isinstance(val, int) and val > _PG_INT_MAX:
+                event[key] = _PG_INT_MAX
+
         return event
 
 
@@ -269,5 +287,51 @@ def _strip_syslog_priority(line: str) -> str:
     if line.startswith("<"):
         idx = line.find(">", 1, 6)
         if idx != -1 and line[1:idx].isdigit():
-            return line[idx + 1:].lstrip()
+            line = line[idx + 1:].lstrip()
+
+    # Strip RFC 3164 header: "Mon DD HH:MM:SS hostname msg"
+    # Detect by looking for a 3-letter month abbreviation at the start.
+    line = _strip_rfc3164_header(line)
     return line
+
+
+# Month abbreviations used in RFC 3164 timestamps
+_RFC3164_MONTHS = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+}
+
+
+def _strip_rfc3164_header(line: str) -> str:
+    """Strip RFC 3164 timestamp + hostname prefix if present.
+
+    RFC 3164 format: ``Mon DD HH:MM:SS hostname msg``
+    Example: ``Apr 15 11:26:33 FW-01.kdb.local 1,2026/04/15 ...``
+
+    The function looks for the pattern and removes everything up to
+    and including the hostname, returning just the message body.
+    """
+    if len(line) < 16:
+        return line
+
+    # Check for month abbreviation at position 0
+    month_token = line[:3]
+    if month_token not in _RFC3164_MONTHS:
+        return line
+
+    # Find the end of "Mon DD HH:MM:SS " (always 16 chars for single-digit day
+    # or 15 for double-digit day in standard syslog)
+    # Pattern: "Apr 15 11:26:33 " or "Apr  5 11:26:33 "
+    # After the timestamp there is the hostname followed by a space.
+    # Find the hostname boundary: first space after position 15.
+    space_after_ts = line.find(" ", 15)
+    if space_after_ts == -1:
+        return line
+
+    # space_after_ts points to the space before the hostname.
+    # Find the next space after the hostname.
+    space_after_host = line.find(" ", space_after_ts + 1)
+    if space_after_host == -1:
+        return line
+
+    return line[space_after_host + 1:]

@@ -1,0 +1,128 @@
+Palo Alto Syslog Configuration Guide
+=====================================
+
+Configure your Palo Alto firewall to forward logs to the PCAP Analyzer
+syslog collector.
+
+
+1. Create Syslog Server Profile
+   ─────────────────────────────
+   Navigate to: Device > Server Profiles > Syslog
+
+   Click "Add" and configure:
+     Name:        pcap-analyzer
+     Server:      <YOUR_PCAP_ANALYZER_IP>
+     Transport:   UDP (or TCP for reliability)
+     Port:        5514
+     Format:      BSD
+     Facility:    LOG_USER
+
+
+2. Configure Log Forwarding
+   ────────────────────────
+   Navigate to: Objects > Log Forwarding
+
+   Create a new profile (or edit "default"):
+     Name:        pcap-forward
+
+   Add match rules:
+     - Traffic logs   → Forward to: pcap-analyzer
+     - Threat logs    → Forward to: pcap-analyzer
+     - URL logs       → Forward to: pcap-analyzer (optional)
+     - WildFire logs  → Forward to: pcap-analyzer (optional)
+
+
+3. Apply Log Forwarding to Security Policies
+   ──────────────────────────────────────────
+   Navigate to: Policies > Security
+
+   For each rule you want to monitor:
+     - Edit the rule
+     - Actions tab → Log Forwarding: pcap-forward
+     - Enable "Log at Session End" (recommended)
+     - Optionally enable "Log at Session Start"
+
+
+4. Enable System/Config Log Forwarding (optional)
+   ───────────────────────────────────────────────
+   Navigate to: Device > Log Settings
+
+   For each log type:
+     - Check the syslog server: pcap-analyzer
+
+
+5. Commit and Verify
+   ─────────────────
+   Commit the configuration, then verify:
+
+   From PAN-OS CLI:
+     > test log-forwarding syslog vsys1
+
+   Or check the PCAP Analyzer dashboard:
+     - Live Events page should show incoming events
+     - Collector status should show "Collecting"
+
+
+6. Expected Log Format
+   ───────────────────
+   Traffic log example:
+     1,2026/04/13 10:15:00,001234567890,TRAFFIC,end,2305,
+     2026/04/13 10:15:00,10.0.1.100,203.0.113.50,0.0.0.0,0.0.0.0,
+     allow-outbound,,,web-browsing,vsys1,trust,untrust,
+     ethernet1/1,ethernet1/2,pcap-forward,,123456,1,54321,443,
+     0,0,0x400000,tcp,allow,1234,567,667,5,...
+
+   The PCAP Analyzer parser automatically handles:
+     - Palo Alto CSV traffic/threat log format
+     - Extraction of 5-tuple, action, application, bytes, timestamps
+     - Session state tracking (start/end/deny/drop)
+
+
+7. Firewall Rules (on the PCAP Analyzer host)
+   ──────────────────────────────────────────
+   Ensure the following ports are open on the PCAP Analyzer server:
+
+     UDP 5514  — Syslog (default, lowest latency)
+     TCP 5514  — Syslog over TCP (reliable delivery)
+
+   The install script configures UFW rules automatically.
+   If using a cloud provider, also open these ports in the
+   security group / network ACL.
+
+
+8. Recommended Palo Alto Settings
+   ─────────────────────────────
+   - Use TCP transport for critical environments (prevents log loss)
+   - Enable "Log at Session End" for complete flow data
+   - Set syslog payload size to maximum (1024 or 2048 bytes)
+   - Consider a dedicated management interface for syslog traffic
+   - If high volume (>5000 EPS), use multiple collector instances
+
+
+9. FortiGate Alternative
+   ─────────────────────
+   For FortiGate firewalls, the collector also supports FortiGate syslog:
+
+   config log syslogd setting
+     set status enable
+     set server "<YOUR_PCAP_ANALYZER_IP>"
+     set port 5514
+     set format default
+     set facility local7
+   end
+
+   The PCAP Analyzer parser auto-detects FortiGate log format.
+
+
+10. Troubleshooting
+    ───────────────
+    No events appearing:
+      - Check firewall allows UDP/TCP 5514 from Palo Alto IP
+      - Verify: docker compose logs backend | grep "collector"
+      - Check syslog server profile is committed on the Palo Alto
+      - Try TCP transport if UDP packets are being dropped
+
+    Events received but not parsed:
+      - Check: docker compose logs backend | grep "parser"
+      - Ensure log format is BSD (not IETF/RFC5424)
+      - Verify the Palo Alto is sending CSV format traffic logs

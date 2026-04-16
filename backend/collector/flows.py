@@ -370,10 +370,18 @@ class FlowEngine:
         flow.update(event, now)
         return None
 
+    # Maximum number of active flows before forced eviction of the oldest.
+    # Prevents unbounded memory growth on high-volume environments where
+    # Palo Alto sends "end" logs for sessions that are already finished.
+    MAX_ACTIVE_FLOWS = 50_000
+
     def flush_expired(
         self, *, now: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """Emit flows that have been idle longer than ``timeout_seconds``.
+
+        Also force-flushes the oldest flows when the active table exceeds
+        ``MAX_ACTIVE_FLOWS`` to prevent unbounded memory growth.
 
         Removes them from the active table and returns their summary
         dicts ready for DB insertion.
@@ -390,6 +398,17 @@ class FlowEngine:
 
         for key in expired_keys:
             del self._flows[key]
+
+        # Force-evict oldest flows if table is too large
+        if len(self._flows) > self.MAX_ACTIVE_FLOWS:
+            overflow = len(self._flows) - self.MAX_ACTIVE_FLOWS
+            sorted_flows = sorted(
+                self._flows.items(),
+                key=lambda kv: kv[1].last_seen,
+            )
+            for key, flow in sorted_flows[:overflow]:
+                emitted.append(flow.to_dict())
+                del self._flows[key]
 
         self._total_flushed += len(emitted)
         return emitted

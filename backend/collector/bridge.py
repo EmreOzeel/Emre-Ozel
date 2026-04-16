@@ -169,6 +169,26 @@ def apply_suppressions(
 
 # ── Flow-based scanning ──────────────────────────────────────────────────────
 
+def _ti_prefix(db: Session, src_ip: str) -> str:
+    """Return '[TI MATCH] ' prefix if the IP is a known threat, else ''."""
+    from collector.threat_feeds import is_threat_ip
+    try:
+        if is_threat_ip(db, src_ip):
+            return "[TI MATCH] "
+    except Exception:
+        pass
+    return ""
+
+
+def _geo_hint(db: Session, src_ip: str) -> str:
+    """Return geo annotation like ' (CN)' or '' for use in messages."""
+    try:
+        from collector.geoip import get_geo_summary
+        return get_geo_summary(src_ip, db)
+    except Exception:
+        return ""
+
+
 def scan_live_events(db: Session, *, now: datetime | None = None) -> int:
     """Scan recent flows for anomaly patterns and emit notifications.
 
@@ -215,8 +235,10 @@ def _scan_blocked_flow_spike(
     for src_ip, n in rows:
         if src_ip in suppressed_ips:
             continue
+        ti = _ti_prefix(db, src_ip)
+        geo = _geo_hint(db, src_ip)
         msg = (
-            f"[BLOCKED FLOW SPIKE] {src_ip} has {n} blocked flows "
+            f"{ti}[BLOCKED FLOW SPIKE] {src_ip}{geo} has {n} blocked flows "
             f"in the last {WINDOW_MINUTES} minutes"
         )
         if _emit(db, msg):
@@ -290,8 +312,10 @@ def _scan_port_scan(
     for src_ip, detail in flagged.items():
         if src_ip in suppressed_ips:
             continue
+        ti = _ti_prefix(db, src_ip)
+        geo = _geo_hint(db, src_ip)
         msg = (
-            f"[PORT SCAN] {src_ip} targeting {detail} "
+            f"{ti}[PORT SCAN] {src_ip}{geo} targeting {detail} "
             f"in the last {WINDOW_MINUTES} minutes"
         )
         if _emit(db, msg):
@@ -324,8 +348,10 @@ def _scan_repeated_reset(
     for src_ip, dst_ip, n in rows:
         if src_ip in suppressed_ips:
             continue
+        ti = _ti_prefix(db, src_ip)
+        geo = _geo_hint(db, src_ip)
         msg = (
-            f"[REPEATED RESET] {src_ip} → {dst_ip} had {n} reset/unstable flows "
+            f"{ti}[REPEATED RESET] {src_ip}{geo} → {dst_ip} had {n} reset/unstable flows "
             f"in the last {WINDOW_MINUTES} minutes"
         )
         if _emit(db, msg):
@@ -354,8 +380,10 @@ def _scan_scanning_flows(
     for src_ip, n in rows:
         if src_ip in suppressed_ips:
             continue
+        ti = _ti_prefix(db, src_ip)
+        geo = _geo_hint(db, src_ip)
         msg = (
-            f"[SCANNING] {src_ip} has {n} probe-like flows "
+            f"{ti}[SCANNING] {src_ip}{geo} has {n} probe-like flows "
             f"in the last {WINDOW_MINUTES} minutes"
         )
         if _emit(db, msg):
@@ -384,8 +412,10 @@ def _scan_suspicious_flows(
     for src_ip, n in rows:
         if src_ip in suppressed_ips:
             continue
+        ti = _ti_prefix(db, src_ip)
+        geo = _geo_hint(db, src_ip)
         msg = (
-            f"[SUSPICIOUS] {src_ip} has {n} suspicious flows "
+            f"{ti}[SUSPICIOUS] {src_ip}{geo} has {n} suspicious flows "
             f"in the last {WINDOW_MINUTES} minutes"
         )
         if _emit(db, msg):

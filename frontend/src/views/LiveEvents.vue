@@ -176,12 +176,14 @@
           <template #default="{ row }">
             <span class="mono">{{ row.source_ip }}</span>
             <span v-if="row.source_port" class="port-hint">:{{ row.source_port }}</span>
+            <span v-if="tiCache[row.source_ip]" class="ti-flame" title="Threat Intel match">&#x1F525;</span>
           </template>
         </el-table-column>
 
         <el-table-column label="Destination IP" min-width="130">
           <template #default="{ row }">
             <span class="mono">{{ row.destination_ip }}</span>
+            <span v-if="tiCache[row.destination_ip]" class="ti-flame" title="Threat Intel match">&#x1F525;</span>
           </template>
         </el-table-column>
 
@@ -248,6 +250,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import api from '@/api'
+import { lookupThreatIP } from '@/api'
 
 const PAGE_SIZE = 100
 const REFRESH_MS = 5000
@@ -269,6 +272,34 @@ const chartCanvas = ref(null)
 
 // Risk scores
 const riskEntries = ref([])
+
+// Threat intel lookup cache: { ip: true/false }
+// Timestamps stored separately to expire after 5 min
+const tiCache = reactive({})
+const tiCacheTs = {}
+const TI_CACHE_TTL = 300000 // 5 min
+
+async function checkThreatIP(ip) {
+  if (!ip) return
+  const now = Date.now()
+  if (tiCacheTs[ip] && now - tiCacheTs[ip] < TI_CACHE_TTL) return
+  tiCacheTs[ip] = now
+  try {
+    const res = await lookupThreatIP(ip)
+    tiCache[ip] = res.data.is_threat
+  } catch {
+    tiCache[ip] = false
+  }
+}
+
+function checkThreatIPs(rows) {
+  const ips = new Set()
+  for (const r of rows) {
+    if (r.source_ip) ips.add(r.source_ip)
+    if (r.destination_ip) ips.add(r.destination_ip)
+  }
+  for (const ip of ips) checkThreatIP(ip)
+}
 
 const filters = reactive({
   action: '',
@@ -307,6 +338,7 @@ async function fetchEvents(append = false) {
       events.value = res.data.events
     }
     total.value = res.data.total
+    checkThreatIPs(res.data.events)
   } catch {
     // silently fail on auto-refresh
   } finally {
@@ -741,6 +773,7 @@ onUnmounted(() => { stopTimer(); stopChartTimer() })
 .mono { font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; font-size: 12px; }
 .time-cell { color: #606266; white-space: nowrap; }
 .port-hint { color: #c0c4cc; font-size: 11px; margin-left: 2px; }
+.ti-flame { margin-left: 4px; font-size: 12px; cursor: help; }
 
 .action-badge {
   display: inline-block;
