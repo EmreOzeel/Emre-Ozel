@@ -40,7 +40,7 @@ func main() {
 
 	// 4. Start collector (if enabled)
 	var collectorSvc *collector.Service
-	if cfg.FeatureCollector && cfg.CollectorEnabled {
+	if cfg.CollectorEnabled {
 		collectorSvc = collector.NewService(cfg, database.DB)
 		collectorSvc.Start()
 		log.Println("[main] collector enabled and started")

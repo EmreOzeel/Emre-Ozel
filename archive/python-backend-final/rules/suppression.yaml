@@ -1,0 +1,20 @@
+---
+# False-positive suppression rules.
+# Matching findings will be marked suppressed: true rather than deleted.
+
+suppressions:
+
+  # Example: suppress port-scan finding for known security scanner
+  # - rule_id: SCAN-001
+  #   src_ip: 10.0.0.50
+  #   reason: "Authorized Nessus scanner"
+
+  # Example: suppress NXDOMAIN storm for known problematic internal host
+  # - rule_id: DNS-001
+  #   src_ip: 192.168.1.100
+  #   reason: "Known misconfigured DNS client"
+
+  # Example: suppress deprecated TLS on internal legacy system
+  # - rule_id: TLS-001
+  #   dst_ip: 10.0.0.200
+  #   reason: "Legacy system, remediation scheduled Q2"

@@ -1,0 +1,281 @@
+---
+# Detection rule thresholds and configuration.
+# All numeric thresholds can be tuned here without code changes.
+
+rules:
+
+  # ── Port scanning ─────────────────────────────────────────────────────────
+  - id: SCAN-001
+    name: Port Scan Detection
+    category: port_scan
+    severity: warning
+    confidence: high
+    enabled: true
+    thresholds:
+      min_unique_ports: 20         # ports contacted in capture window
+      critical_at: 100             # escalate to critical
+
+  # ── ARP ───────────────────────────────────────────────────────────────────
+  - id: ARP-001
+    name: ARP Cache Poisoning
+    category: arp_spoofing
+    severity: critical
+    confidence: high
+    enabled: true
+    thresholds:
+      min_macs_per_ip: 2           # same IP seen with >1 unique MAC
+
+  # ── SYN Flood ─────────────────────────────────────────────────────────────
+  - id: DOS-001
+    name: SYN Flood
+    category: dos_syn_flood
+    severity: critical
+    confidence: high
+    enabled: true
+    thresholds:
+      min_syns_per_src: 200
+
+  # ── ICMP Flood ────────────────────────────────────────────────────────────
+  - id: DOS-002
+    name: ICMP Echo Flood
+    category: dos_icmp_flood
+    severity: warning
+    confidence: medium
+    enabled: true
+    thresholds:
+      min_echo_requests: 100
+
+  # ── C2 Beaconing ──────────────────────────────────────────────────────────
+  - id: C2-001
+    name: Regular Beaconing
+    category: c2_beaconing
+    severity: critical
+    confidence: medium
+    enabled: true
+    thresholds:
+      min_connections: 8
+      max_jitter: 0.15             # coefficient of variation
+      min_interval_sec: 5
+      max_interval_sec: 3600
+
+  # ── Lateral Movement ──────────────────────────────────────────────────────
+  - id: LAT-001
+    name: Internal Admin Port Access
+    category: lateral_movement
+    severity: critical
+    confidence: medium
+    enabled: true
+    thresholds:
+      min_attempts: 5
+      sensitive_ports: [22, 23, 135, 139, 445, 3389, 5985, 5986,
+                        1433, 3306, 5432, 6379, 27017, 5900]
+
+  # ── DNS ───────────────────────────────────────────────────────────────────
+  - id: DNS-001
+    name: NXDOMAIN Storm
+    category: nxdomain_storm
+    severity: warning
+    confidence: high
+    enabled: true
+    thresholds:
+      min_nxdomain: 20
+      critical_at: 100
+
+  - id: DNS-002
+    name: DNS Tunneling (Long Labels)
+    category: dns_tunneling
+    severity: critical
+    confidence: medium
+    enabled: true
+    thresholds:
+      min_label_length: 40
+
+  - id: DNS-003
+    name: High-Entropy DNS (DGA Suspicion)
+    category: dga_malware
+    severity: warning
+    confidence: low
+    enabled: true
+    thresholds:
+      min_entropy: 3.8
+      min_occurrences: 5
+
+  - id: DNS-004
+    name: High Unique Subdomain Rate
+    category: dga_malware
+    severity: warning
+    confidence: medium
+    enabled: true
+    thresholds:
+      min_unique_subs: 50          # unique subdomains per apex domain
+      unique_ratio: 0.9            # unique/total ratio
+
+  - id: DNS-005
+    name: Slow DNS Responses
+    category: dns_performance
+    severity: info
+    confidence: high
+    enabled: true
+    thresholds:
+      slow_rtt_ms: 500
+      min_slow_count: 5
+
+  # ── TLS ───────────────────────────────────────────────────────────────────
+  - id: TLS-001
+    name: Deprecated TLS Version
+    category: deprecated_tls
+    severity: critical
+    confidence: high
+    enabled: true
+    deprecated_versions: ["SSLv3", "TLSv1.0", "TLSv1.1"]
+    thresholds:
+      min_connections: 1
+
+  - id: TLS-002
+    name: TLS Alert Detected
+    category: tls_alert
+    severity: warning
+    confidence: high
+    enabled: true
+
+  # ── HTTP ──────────────────────────────────────────────────────────────────
+  - id: HTTP-001
+    name: Suspicious User Agent
+    category: suspicious_ua
+    severity: warning
+    confidence: medium
+    enabled: true
+    patterns:
+      - "sqlmap"
+      - "nikto"
+      - "nmap"
+      - "masscan"
+      - "zgrab"
+      - "hydra"
+      - "metasploit"
+      - "burpsuite"
+      - "dirbuster"
+      - "gobuster"
+      - "wfuzz"
+      - "ffuf"
+      - "nuclei"
+
+  - id: HTTP-002
+    name: Web Attack Patterns
+    category: web_attack
+    severity: critical
+    confidence: medium
+    enabled: true
+    patterns:
+      - "select.*from"
+      - "union.*select"
+      - "or\\s+1=1"
+      - "\\.\\./"
+      - "etc/passwd"
+      - "cmd="
+      - "exec\\("
+      - "/wp-admin"
+      - "/.env"
+      - "/shell"
+      - "webshell"
+
+  - id: HTTP-003
+    name: Cleartext Auth Credentials
+    category: cleartext_creds_http
+    severity: critical
+    confidence: medium
+    enabled: true
+    auth_endpoints:
+      - "/login"
+      - "/signin"
+      - "/auth"
+      - "/password"
+      - "/credential"
+      - "/api/token"
+
+  - id: HTTP-004
+    name: High HTTP Error Rate (5xx)
+    category: http_errors
+    severity: warning
+    confidence: high
+    enabled: true
+    thresholds:
+      min_5xx: 10
+      critical_at: 50
+
+  # ── Protocol ──────────────────────────────────────────────────────────────
+  - id: PROTO-001
+    name: FTP Cleartext Credentials
+    category: cleartext_creds_ftp
+    severity: critical
+    confidence: high
+    enabled: true
+
+  - id: PROTO-002
+    name: SSHv1 Protocol
+    category: ssh_v1
+    severity: critical
+    confidence: high
+    enabled: true
+
+  - id: PROTO-003
+    name: SNMP v1/v2c (Cleartext Community)
+    category: snmp_cleartext
+    severity: warning
+    confidence: high
+    enabled: true
+    thresholds:
+      min_count: 5
+
+  - id: PROTO-004
+    name: Kerberos Errors (Possible Brute Force)
+    category: kerberoasting
+    severity: warning
+    confidence: low
+    enabled: true
+    thresholds:
+      min_errors: 10
+
+  # ── TCP ───────────────────────────────────────────────────────────────────
+  - id: TCP-001
+    name: High Retransmission Rate
+    category: tcp_retransmissions
+    severity: warning
+    confidence: high
+    enabled: true
+    thresholds:
+      min_retrans: 50
+      critical_rate: 0.05          # 5% of total TCP packets
+
+  - id: TCP-002
+    name: Zero Window Stalls
+    category: tcp_zero_window
+    severity: warning
+    confidence: high
+    enabled: true
+    thresholds:
+      min_count: 10
+
+  - id: TCP-003
+    name: Asymmetric Routing
+    category: tcp_asymmetric
+    severity: info
+    confidence: low
+    enabled: true
+    thresholds:
+      min_one_sided_flows: 20
+
+# ── Whitelist / suppression tags ──────────────────────────────────────────────
+whitelisted_ips: []
+whitelisted_domains: []
+
+# ── Environment profile ───────────────────────────────────────────────────────
+environment:
+  name: default
+  internal_subnets:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+  trusted_dns_servers: []
+  expected_web_ports: [80, 443, 8080, 8443]
+  expected_internal_ports: [22, 53, 80, 443, 445, 3389]
