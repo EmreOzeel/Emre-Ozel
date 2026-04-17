@@ -142,6 +142,8 @@ services:
       - FEATURE_COLLECTOR=false
       - FEATURE_CAUSAL_PATH=false
       - FEATURE_MONITOR_RUN=false
+    ports:
+      - "8001:8000"    # Host 8001 → Go backend 8000 (for testing/comparison)
     volumes:
       - pcap_data:/data
       - ./geoip:/data/geoip:ro
