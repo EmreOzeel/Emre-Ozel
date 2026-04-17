@@ -182,8 +182,8 @@ func Setup(db *gorm.DB, cfg *config.Config, h *handlers.Handler) *gin.Engine {
 	api.POST("/ingest/packet-events", h.NotImplemented)
 	api.POST("/ingest/packet-alerts", h.NotImplemented)
 
-	// ── Collector (501) ──
-	p.GET("/collector/status", h.NotImplemented)
+	// ── Collector ──
+	p.GET("/collector/status", h.CollectorStatus)
 
 	// ── Telemetry (501) ──
 	p.GET("/telemetry/summary", h.NotImplemented)

@@ -13,6 +13,7 @@ import (
 	"github.com/emreozeel/pcap-analyzer/backend/internal/api/handlers"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/api/router"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/auth"
+	"github.com/emreozeel/pcap-analyzer/backend/internal/collector"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/config"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/database"
 )
@@ -37,13 +38,22 @@ func main() {
 		log.Printf("warning: seed admin failed: %v", err)
 	}
 
-	// 4. Create handler
-	h := handlers.New(database.DB, cfg)
+	// 4. Start collector (if enabled)
+	var collectorSvc *collector.Service
+	if cfg.FeatureCollector && cfg.CollectorEnabled {
+		collectorSvc = collector.NewService(cfg, database.DB)
+		collectorSvc.Start()
+		log.Println("[main] collector enabled and started")
+	}
 
-	// 5. Setup router
+	// 5. Create handler
+	h := handlers.New(database.DB, cfg)
+	h.CollectorSvc = collectorSvc
+
+	// 6. Setup router
 	r := router.Setup(database.DB, cfg, h)
 
-	// 6. Start HTTP server with graceful shutdown
+	// 7. Start HTTP server with graceful shutdown
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	srv := &http.Server{Addr: addr, Handler: r}
 
@@ -54,12 +64,15 @@ func main() {
 		}
 	}()
 
-	// 7. Handle SIGINT/SIGTERM
+	// 8. Handle SIGINT/SIGTERM
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	log.Println("shutting down...")
+	if collectorSvc != nil {
+		collectorSvc.Stop()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {

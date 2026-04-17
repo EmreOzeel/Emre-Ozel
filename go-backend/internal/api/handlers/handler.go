@@ -5,14 +5,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/emreozeel/pcap-analyzer/backend/internal/collector"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/config"
 	"gorm.io/gorm"
 )
 
 // Handler holds shared dependencies for all HTTP handlers.
 type Handler struct {
-	DB  *gorm.DB
-	Cfg *config.Config
+	DB           *gorm.DB
+	Cfg          *config.Config
+	CollectorSvc *collector.Service
 }
 
 // New creates a Handler with database and config references.

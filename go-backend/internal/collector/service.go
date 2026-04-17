@@ -7,6 +7,7 @@ import (
 
 	"github.com/emreozeel/pcap-analyzer/backend/internal/collector/flow"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/collector/intelligence"
+	"github.com/emreozeel/pcap-analyzer/backend/internal/collector/listeners"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/collector/parsers"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/config"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/models"
@@ -20,6 +21,7 @@ type Service struct {
 	db         *gorm.DB
 	pipeline   *Pipeline
 	flowEngine *flow.Engine
+	syslog     *listeners.SyslogListener
 	running    bool
 	mu         sync.Mutex
 	stopCh     chan struct{}
@@ -50,12 +52,19 @@ func (s *Service) Start() {
 	// Create flow engine with 60-second idle timeout
 	s.flowEngine = flow.NewEngine(60)
 
+	// Start syslog listener
+	s.syslog = listeners.NewSyslogListener(s.cfg.SyslogHost, s.cfg.SyslogPort, s.ProcessLine)
+	if err := s.syslog.Start(); err != nil {
+		log.Printf("[collector] syslog listener failed: %v", err)
+		return
+	}
+
 	s.running = true
 
 	// Start retention loop
 	go s.retentionLoop()
 
-	log.Println("[collector] started")
+	log.Printf("[collector] started (syslog=%s:%d)", s.cfg.SyslogHost, s.cfg.SyslogPort)
 }
 
 // Stop shuts down the collector service and its background loops.
@@ -67,6 +76,14 @@ func (s *Service) Stop() {
 	}
 	s.running = false
 	close(s.stopCh)
+	if s.syslog != nil {
+		s.syslog.Stop()
+	}
+	// Final flush
+	if s.pipeline != nil {
+		s.pipeline.Flush(s.db)
+	}
+	s.flushFlows()
 	log.Println("[collector] stopped")
 }
 
@@ -75,6 +92,7 @@ func (s *Service) Stats() map[string]interface{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := map[string]interface{}{
+		"enabled":     s.cfg.CollectorEnabled,
 		"running":     s.running,
 		"syslog_port": s.cfg.SyslogPort,
 		"source_id":   s.cfg.CollectorSourceID,

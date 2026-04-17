@@ -60,16 +60,9 @@ services:
       - ANALYSIS_TIMEOUT_SEC=${ANALYSIS_TIMEOUT_SEC:-300}
       - MAX_ANALYSES_PER_USER=${MAX_ANALYSES_PER_USER:-0}
       - ALLOWED_ORIGINS=["http://${DOMAIN:?Set DOMAIN in .env}"]
-      # Collector
-      - COLLECTOR_ENABLED=${COLLECTOR_ENABLED:-true}
-      - SYSLOG_HOST=0.0.0.0
-      - SYSLOG_PORT=5514
-      - COLLECTOR_FLUSH_INTERVAL=1.0
-      - COLLECTOR_BATCH_SIZE=100
-      - COLLECTOR_DEVICE_ROLE=${COLLECTOR_DEVICE_ROLE:-perimeter}
+      # Collector (disabled — moved to Go backend)
+      - COLLECTOR_ENABLED=false
       - RETENTION_DAYS=${RETENTION_DAYS:-30}
-      - NETFLOW_ENABLED=${NETFLOW_ENABLED:-false}
-      - NETFLOW_PORT=2055
       # GeoIP
       - GEOIP_ENABLED=${GEOIP_ENABLED:-true}
       - GEOIP_USE_IPAPI_FALLBACK=true
@@ -83,15 +76,8 @@ services:
     volumes:
       - pcap_data:/data
       - ./geoip:/data/geoip:ro
-    ports:
-      - "5514:5514/udp"
-      - "5514:5514/tcp"
-      - "2055:2055/udp"
     networks:
       - internal
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/health || exit 1"]
       interval: 30s
@@ -135,20 +121,34 @@ services:
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-500}
       - ANALYSIS_TIMEOUT_SEC=${ANALYSIS_TIMEOUT_SEC:-300}
       - ALLOWED_ORIGINS=http://${DOMAIN}
-      - COLLECTOR_ENABLED=false
+      # Collector
+      - FEATURE_COLLECTOR=true
+      - COLLECTOR_ENABLED=true
+      - SYSLOG_HOST=0.0.0.0
+      - SYSLOG_PORT=5514
+      - COLLECTOR_FLUSH_INTERVAL=1.0
+      - COLLECTOR_BATCH_SIZE=100
+      - COLLECTOR_DEVICE_ROLE=${COLLECTOR_DEVICE_ROLE:-perimeter}
       - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - NETFLOW_ENABLED=${NETFLOW_ENABLED:-false}
+      - NETFLOW_PORT=2055
       - PACKET_ENGINE_TOKEN=${PACKET_ENGINE_TOKEN:-}
       - PACKET_ENGINE_URL=http://packet-engine:8080
-      - FEATURE_COLLECTOR=false
       - FEATURE_CAUSAL_PATH=false
       - FEATURE_MONITOR_RUN=false
     ports:
-      - "8001:8000"    # Host 8001 → Go backend 8000 (for testing/comparison)
+      - "8001:8000"
+      - "5514:5514/udp"
+      - "5514:5514/tcp"
+      - "2055:2055/udp"
     volumes:
       - pcap_data:/data
       - ./geoip:/data/geoip:ro
     networks:
       - internal
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8000/api/health || exit 1"]
       interval: 30s
