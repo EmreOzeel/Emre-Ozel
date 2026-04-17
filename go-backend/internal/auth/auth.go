@@ -19,7 +19,8 @@ import (
 // Claims represents the JWT payload used by the application.
 type Claims struct {
 	jwt.RegisteredClaims
-	UserID uint `json:"sub"`
+	UserID   uint   `json:"-"`
+	Username string `json:"username,omitempty"`
 }
 
 var cfg *config.Config
@@ -57,7 +58,8 @@ func CreateToken(user *models.User, expireHours int) (string, error) {
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(time.Duration(expireHours) * time.Hour)),
 		},
-		UserID: user.ID,
+		UserID:   user.ID,
+		Username: user.Username,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
