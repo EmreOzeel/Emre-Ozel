@@ -41,12 +41,8 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"token": token,
-		"user": gin.H{
-			"id":       user.ID,
-			"username": user.Username,
-			"is_admin": user.IsAdmin,
-		},
+		"access_token": token,
+		"token_type":   "bearer",
 	})
 }
 
