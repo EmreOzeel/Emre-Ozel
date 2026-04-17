@@ -3,7 +3,6 @@ package database
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -12,7 +11,6 @@ import (
 	"github.com/emreozeel/pcap-analyzer/backend/internal/config"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/models"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -21,7 +19,6 @@ import (
 var DB *gorm.DB
 
 // Connect initialises the GORM database connection from the supplied config.
-// It supports both SQLite and PostgreSQL based on the effective database URL.
 func Connect(cfg *config.Config) error {
 	url := cfg.EffectiveDBURL()
 
@@ -30,25 +27,11 @@ func Connect(cfg *config.Config) error {
 	}
 
 	var err error
-
-	if strings.HasPrefix(url, "sqlite") {
-		// sqlite:///path -> extract path
-		dsn := strings.TrimPrefix(url, "sqlite:///")
-		if dsn == "" {
-			dsn = "pcap.db"
-		}
-		DB, err = gorm.Open(sqlite.Open(dsn), gormCfg)
-		if err != nil {
-			return fmt.Errorf("failed to open sqlite database: %w", err)
-		}
-		log.Info().Str("path", dsn).Msg("connected to SQLite database")
-	} else {
-		DB, err = gorm.Open(postgres.Open(url), gormCfg)
-		if err != nil {
-			return fmt.Errorf("failed to open postgres database: %w", err)
-		}
-		log.Info().Msg("connected to PostgreSQL database")
+	DB, err = gorm.Open(postgres.Open(url), gormCfg)
+	if err != nil {
+		return fmt.Errorf("failed to open postgres database: %w", err)
 	}
+	log.Info().Msg("connected to PostgreSQL database")
 
 	// Configure connection pool
 	var sqlDB *sql.DB
@@ -61,6 +44,11 @@ func Connect(cfg *config.Config) error {
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 
 	return nil
+}
+
+// ConnectWithDB allows injecting a pre-configured *gorm.DB (used by tests).
+func ConnectWithDB(db *gorm.DB) {
+	DB = db
 }
 
 // AutoMigrate runs GORM auto-migration for all registered models.

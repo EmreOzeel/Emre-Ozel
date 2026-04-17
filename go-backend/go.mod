@@ -10,7 +10,6 @@ require (
 	github.com/rs/zerolog v1.33.0
 	golang.org/x/crypto v0.23.0
 	gorm.io/driver/postgres v1.5.9
-	gorm.io/driver/sqlite v1.5.5
 	github.com/oschwald/geoip2-golang v1.11.0
 	gorm.io/gorm v1.25.10
 )
