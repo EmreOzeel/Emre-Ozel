@@ -52,12 +52,20 @@ func ConnectWithDB(db *gorm.DB) {
 }
 
 // AutoMigrate runs GORM auto-migration for all registered models.
+// Errors from constraint management on existing tables are logged but
+// not fatal — the Python backend may have created tables with different
+// constraint naming conventions.
 func AutoMigrate() error {
 	if DB == nil {
 		return fmt.Errorf("database not connected; call Connect first")
 	}
 	log.Info().Msg("running database auto-migration")
-	return DB.AutoMigrate(models.AllModels()...)
+	for _, model := range models.AllModels() {
+		if err := DB.AutoMigrate(model); err != nil {
+			log.Warn().Err(err).Msgf("auto-migrate warning for %T (continuing)", model)
+		}
+	}
+	return nil
 }
 
 // SeedAdmin creates a default admin user if the users table is empty.

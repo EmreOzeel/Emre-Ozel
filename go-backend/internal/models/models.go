@@ -8,7 +8,7 @@ import (
 
 type Team struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
-	Name      string    `gorm:"uniqueIndex;not null" json:"name"`
+	Name      string    `gorm:"not null;unique" json:"name"`
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 }
 
@@ -18,7 +18,7 @@ func (Team) TableName() string { return "teams" }
 
 type User struct {
 	ID             uint      `gorm:"primaryKey" json:"id"`
-	Username       string    `gorm:"uniqueIndex;not null" json:"username"`
+	Username       string    `gorm:"not null;unique" json:"username"`
 	HashedPassword string    `gorm:"not null" json:"-"`
 	IsAdmin        bool      `gorm:"not null;default:false" json:"is_admin"`
 	TeamID         *uint     `gorm:"index" json:"team_id"`
@@ -149,7 +149,7 @@ func (PathAnalysisRolePreset) TableName() string { return "path_analysis_role_pr
 
 type PathAnalysisCache struct {
 	ID              uint      `gorm:"primaryKey" json:"id"`
-	CacheKey        string    `gorm:"uniqueIndex;not null" json:"cache_key"`
+	CacheKey        string    `gorm:"not null;unique" json:"cache_key"`
 	AnalysisID      string    `gorm:"not null;index" json:"analysis_id"`
 	SourceIP        string    `gorm:"not null" json:"source_ip"`
 	DestinationIP   string    `gorm:"not null" json:"destination_ip"`
@@ -453,7 +453,7 @@ func (AttackSession) TableName() string { return "attack_sessions" }
 
 type IPBaseline struct {
 	ID                      uint       `gorm:"primaryKey" json:"id"`
-	SourceIP                string     `gorm:"uniqueIndex;not null" json:"source_ip"`
+	SourceIP                string     `gorm:"not null;unique" json:"source_ip"`
 	ObservationWindowDays   int        `gorm:"not null;default:7" json:"observation_window_days"`
 	SampleCount             int        `gorm:"not null;default:0" json:"sample_count"`
 	AvgFlowsPerWindow       float64    `gorm:"not null;default:0" json:"avg_flows_per_window"`
@@ -476,7 +476,7 @@ func (IPBaseline) TableName() string { return "ip_baselines" }
 
 type Asset struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
-	IPAddress   string    `gorm:"uniqueIndex;not null" json:"ip_address"`
+	IPAddress   string    `gorm:"not null;unique" json:"ip_address"`
 	Hostname    *string   `json:"hostname"`
 	AssetType   string    `gorm:"not null;default:workstation" json:"asset_type"`
 	Criticality string    `gorm:"not null;default:low" json:"criticality"`
@@ -512,7 +512,7 @@ func (ThreatIndicator) TableName() string { return "threat_indicators" }
 
 type ThreatFeed struct {
 	ID                   uint       `gorm:"primaryKey" json:"id"`
-	Name                 string     `gorm:"uniqueIndex;not null" json:"name"`
+	Name                 string     `gorm:"not null;unique" json:"name"`
 	FeedType             string     `gorm:"not null" json:"feed_type"`
 	URL                  *string    `json:"url"`
 	Enabled              bool       `gorm:"not null;default:true" json:"enabled"`
@@ -560,7 +560,7 @@ func (CorrelationRule) TableName() string { return "correlation_rules" }
 
 type GeoIPCache struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
-	IP          string    `gorm:"uniqueIndex;not null" json:"ip"`
+	IP          string    `gorm:"not null;unique" json:"ip"`
 	CountryCode *string   `json:"country_code"`
 	CountryName *string   `json:"country_name"`
 	City        *string   `json:"city"`
