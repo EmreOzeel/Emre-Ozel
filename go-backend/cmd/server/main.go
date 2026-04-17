@@ -12,6 +12,7 @@ import (
 
 	"github.com/emreozeel/pcap-analyzer/backend/internal/api/handlers"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/api/router"
+	"github.com/emreozeel/pcap-analyzer/backend/internal/auth"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/config"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/database"
 )
@@ -28,7 +29,10 @@ func main() {
 		log.Fatalf("auto-migrate failed: %v", err)
 	}
 
-	// 3. Seed admin user
+	// 3. Init auth
+	auth.Init(cfg)
+
+	// 4. Seed admin user
 	if err := database.SeedAdmin(cfg); err != nil {
 		log.Printf("warning: seed admin failed: %v", err)
 	}
