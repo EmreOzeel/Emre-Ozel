@@ -82,6 +82,11 @@ const routes = [
         name: 'GeoMap',
         component: () => import('../views/GeoMap.vue'),
       },
+      {
+        path: 'packet-engine',
+        name: 'PacketEngine',
+        component: () => import('../views/PacketEngine.vue'),
+      },
     ]
   },
   {

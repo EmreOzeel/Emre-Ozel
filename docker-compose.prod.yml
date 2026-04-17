@@ -113,6 +113,47 @@ services:
       - backend
     # No ports exposed — nginx proxies internally
 
+  # ── Go Backend (migration target) ─────────────────────────────────────────
+  go-backend:
+    build:
+      context: ./go-backend
+      dockerfile: Dockerfile
+    container_name: pcap-go-backend
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - ENV=production
+      - PORT=8000
+      - DATABASE_URL=postgresql://pcap:${POSTGRES_PASSWORD}@postgres:5432/pcap_analyzer
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
+      - DEFAULT_USER=${DEFAULT_USER:-admin}
+      - DEFAULT_PASS=${DEFAULT_PASS}
+      - UPLOAD_DIR=/data/uploads
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-500}
+      - ANALYSIS_TIMEOUT_SEC=${ANALYSIS_TIMEOUT_SEC:-300}
+      - ALLOWED_ORIGINS=https://${DOMAIN}
+      - COLLECTOR_ENABLED=false
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - PACKET_ENGINE_TOKEN=${PACKET_ENGINE_TOKEN:-}
+      - PACKET_ENGINE_URL=http://packet-engine:8080
+      - FEATURE_COLLECTOR=false
+      - FEATURE_CAUSAL_PATH=false
+      - FEATURE_MONITOR_RUN=false
+    volumes:
+      - pcap_data:/data
+      - ./geoip:/data/geoip:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   # ── Nginx reverse proxy ───────────────────────────────────────────────────
   nginx:
     image: nginx:1.25-alpine
@@ -128,7 +169,10 @@ services:
       - nginx_logs:/var/log/nginx
     depends_on:
       - backend
+      - go-backend
       - frontend
+    environment:
+      - MIGRATION_PHASE=${MIGRATION_PHASE:-0}
     networks:
       - internal
 

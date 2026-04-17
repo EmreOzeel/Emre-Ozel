@@ -157,4 +157,18 @@ export function fetchGeoCacheStats() {
   return api.get('/geo/cache-stats')
 }
 
+// ── Packet Engine ───────────────────────────────────────────────────────────
+
+export function fetchPacketWatches() {
+  return api.get('/packet-engine/watches')
+}
+
+export function createPacketWatch(data) {
+  return api.post('/packet-engine/watches', data)
+}
+
+export function deletePacketWatch(ip, port) {
+  return api.delete(`/packet-engine/watches/${ip}/${port}`)
+}
+
 export default api

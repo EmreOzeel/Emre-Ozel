@@ -58,6 +58,21 @@
           <strong>{{ activeCaptures }}</strong>
           <span>active captures</span>
         </div>
+        <div class="ls-item ls-pkteng" @click="$router.push('/packet-engine')">
+          <span
+            class="collector-dot"
+            :class="pktEngineUp ? 'dot-on' : 'dot-off'"
+          ></span>
+          <span>Pkt Engine</span>
+        </div>
+        <div class="ls-item" v-if="pktEngineFlowsPerSec != null">
+          <strong>{{ pktEngineFlowsPerSec }}</strong>
+          <span>flows/s</span>
+        </div>
+        <div class="ls-item" v-if="pktEngineWatchCount > 0">
+          <strong>{{ pktEngineWatchCount }}</strong>
+          <span>watches</span>
+        </div>
         <div class="ls-spacer"></div>
         <el-button size="small" type="primary" link @click="$router.push('/live-events')">
           View all <el-icon class="el-icon--right"><ArrowRight /></el-icon>
@@ -350,7 +365,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowDown, Warning } from '@element-plus/icons-vue'
 import api from '../api'
-import { lookupThreatIP, fetchGeoBatchLookup, fetchPcapTriggerStatus } from '../api'
+import { lookupThreatIP, fetchGeoBatchLookup, fetchPcapTriggerStatus, fetchPacketWatches } from '../api'
 import { classifyAnalysisError } from '../utils/analysisErrors'
 
 const router = useRouter()
@@ -376,6 +391,9 @@ const baselineCount = ref(null)
 const tiMatchCount = ref(0)
 const topSourceCountry = ref(null)
 const activeCaptures = ref(0)
+const pktEngineUp = ref(false)
+const pktEngineFlowsPerSec = ref(null)
+const pktEngineWatchCount = ref(0)
 
 function _countryFlag(code) {
   if (!code) return ''
@@ -521,6 +539,24 @@ async function fetchBaselineCount() {
   } catch {}
 }
 
+async function fetchPacketEngineStatus() {
+  try {
+    const res = await fetchPacketWatches()
+    const watches = res.data || []
+    pktEngineUp.value = true
+    pktEngineWatchCount.value = watches.length
+    // Estimate flows/sec from live flows stats
+    try {
+      const flowRes = await api.get('/live-flows/stats')
+      pktEngineFlowsPerSec.value = flowRes.data?.active_flows || 0
+    } catch { pktEngineFlowsPerSec.value = null }
+  } catch {
+    pktEngineUp.value = false
+    pktEngineWatchCount.value = 0
+    pktEngineFlowsPerSec.value = null
+  }
+}
+
 // ── Timer management ────────────────────────────────────────────────────────
 function startTimers() {
   refreshTimer = setInterval(() => {
@@ -528,6 +564,7 @@ function startTimers() {
     fetchRecent()
     fetchIncidents()
     fetchBaselineCount()
+    fetchPacketEngineStatus()
   }, REFRESH_MS)
   tickTimer = setInterval(() => {
     if (lastUpdatedAt.value) {
@@ -554,6 +591,7 @@ onMounted(() => {
   fetchRecent()
   fetchIncidents()
   fetchBaselineCount()
+  fetchPacketEngineStatus()
   startTimers()
   window.addEventListener('analysis-created', onAnalysisCreated)
 })
@@ -758,6 +796,8 @@ function timeAgo(iso) {
 .ls-ti strong { color: #f56c6c; }
 .ls-capture { background: #fdf6ec; border-radius: 6px; padding: 6px 12px; }
 .ls-capture strong { color: #e6a23c; }
+.ls-pkteng { cursor: pointer; border-radius: 6px; padding: 6px 12px; background: #ecf5ff; }
+.ls-pkteng:hover { background: #d9ecff; }
 .ls-spacer { flex: 1; }
 
 .collector-dot {

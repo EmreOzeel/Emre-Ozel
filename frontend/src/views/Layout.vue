@@ -67,6 +67,10 @@
           <el-icon><MapLocation /></el-icon>
           <span>Geo Map</span>
         </el-menu-item>
+        <el-menu-item index="/packet-engine">
+          <el-icon><Cpu /></el-icon>
+          <span>Packet Engine</span>
+        </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">

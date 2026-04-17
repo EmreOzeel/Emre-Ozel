@@ -1,0 +1,62 @@
+version: '3.8'
+
+# Run Go backend alongside existing Python backend for comparison.
+# Go backend on port 8001, Python backend on port 8000 (via nginx).
+
+services:
+  go-backend:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: pcap-go-backend
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - ENV=production
+      - PORT=8000
+      - DATABASE_URL=postgresql://pcap:${POSTGRES_PASSWORD}@postgres:5432/pcap_analyzer
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
+      - DEFAULT_USER=${DEFAULT_USER:-admin}
+      - DEFAULT_PASS=${DEFAULT_PASS}
+      - UPLOAD_DIR=/data/uploads
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-500}
+      - ALLOWED_ORIGINS=*
+      - COLLECTOR_ENABLED=${COLLECTOR_ENABLED:-false}
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - PACKET_ENGINE_TOKEN=${PACKET_ENGINE_TOKEN:-}
+      - PACKET_ENGINE_URL=http://packet-engine:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pcap_data:/data
+    networks:
+      - internal
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: pcap-postgres-go
+    restart: always
+    environment:
+      POSTGRES_DB: pcap_analyzer
+      POSTGRES_USER: pcap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pcap -d pcap_analyzer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  pcap_data:
+
+networks:
+  internal:
+    driver: bridge
