@@ -59,7 +59,7 @@ services:
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-500}
       - ANALYSIS_TIMEOUT_SEC=${ANALYSIS_TIMEOUT_SEC:-300}
       - MAX_ANALYSES_PER_USER=${MAX_ANALYSES_PER_USER:-0}
-      - ALLOWED_ORIGINS=https://${DOMAIN:?Set DOMAIN in .env}
+      - ALLOWED_ORIGINS=["http://${DOMAIN:?Set DOMAIN in .env}"]
       # Collector
       - COLLECTOR_ENABLED=${COLLECTOR_ENABLED:-true}
       - SYSLOG_HOST=0.0.0.0
@@ -134,7 +134,7 @@ services:
       - UPLOAD_DIR=/data/uploads
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-500}
       - ANALYSIS_TIMEOUT_SEC=${ANALYSIS_TIMEOUT_SEC:-300}
-      - ALLOWED_ORIGINS=https://${DOMAIN}
+      - ALLOWED_ORIGINS=http://${DOMAIN}
       - COLLECTOR_ENABLED=false
       - RETENTION_DAYS=${RETENTION_DAYS:-30}
       - PACKET_ENGINE_TOKEN=${PACKET_ENGINE_TOKEN:-}
@@ -163,11 +163,8 @@ services:
     restart: always
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
       - nginx_logs:/var/log/nginx
     depends_on:
       - backend
