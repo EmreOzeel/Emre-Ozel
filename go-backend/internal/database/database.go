@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -52,13 +53,26 @@ func ConnectWithDB(db *gorm.DB) {
 }
 
 // AutoMigrate runs GORM auto-migration for all registered models.
-// Errors from constraint management on existing tables are logged but
-// not fatal — the Python backend may have created tables with different
-// constraint naming conventions.
+// When sharing a database with the Python backend, migration is skipped
+// because tables are already created by SQLAlchemy. Set SKIP_MIGRATE=false
+// to force migration (standalone Go deployments).
 func AutoMigrate() error {
 	if DB == nil {
 		return fmt.Errorf("database not connected; call Connect first")
 	}
+
+	// Skip migration by default when sharing DB with Python backend.
+	// The Python backend owns the schema; Go just reads/writes.
+	skipMigrate := true
+	if v := getEnv("SKIP_MIGRATE"); v == "false" || v == "0" {
+		skipMigrate = false
+	}
+
+	if skipMigrate {
+		log.Info().Msg("skipping auto-migration (SKIP_MIGRATE != false; Python backend owns schema)")
+		return nil
+	}
+
 	log.Info().Msg("running database auto-migration")
 	for _, model := range models.AllModels() {
 		if err := DB.AutoMigrate(model); err != nil {
@@ -66,6 +80,11 @@ func AutoMigrate() error {
 		}
 	}
 	return nil
+}
+
+func getEnv(key string) string {
+	v, _ := os.LookupEnv(key)
+	return v
 }
 
 // SeedAdmin creates a default admin user if the users table is empty.
