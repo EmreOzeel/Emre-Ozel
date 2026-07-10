@@ -63,6 +63,11 @@ const routes = [
         component: () => import('../views/LiveFlows.vue'),
       },
       {
+        path: 'web-transactions',
+        name: 'WebTransactions',
+        component: () => import('../views/WebTransactions.vue'),
+      },
+      {
         path: 'live-incidents',
         name: 'LiveIncidents',
         component: () => import('../views/LiveIncidents.vue'),

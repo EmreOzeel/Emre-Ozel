@@ -51,6 +51,10 @@
           <el-icon><Connection /></el-icon>
           <span>Live Flows</span>
         </el-menu-item>
+        <el-menu-item index="/web-transactions">
+          <el-icon><Link /></el-icon>
+          <span>Web Transactions</span>
+        </el-menu-item>
         <el-menu-item index="/live-incidents">
           <el-icon><Warning /></el-icon>
           <span>Incidents</span>

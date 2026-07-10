@@ -1,4 +1,4 @@
-package handlers
+package handlers_test
 
 import (
 	"bytes"
@@ -47,7 +47,7 @@ func TestResponseShapes(t *testing.T) {
 		// Auth
 		{
 			name: "login_success", method: "POST", path: "/api/auth/login",
-			wantStatus: 200, wantKeys: []string{"token", "user"},
+			wantStatus: 200, wantKeys: []string{"access_token", "token_type"},
 		},
 		{
 			name: "me", method: "GET", path: "/api/auth/me",
@@ -71,6 +71,18 @@ func TestResponseShapes(t *testing.T) {
 			name: "live_incidents", method: "GET", path: "/api/live-incidents?limit=5",
 			wantStatus: 200, wantKeys: []string{"total", "incidents"},
 			needsAuth: true,
+		},
+		// Web Transactions
+		{
+			name: "web_transactions", method: "GET", path: "/api/web-transactions?limit=5",
+			wantStatus: 200, wantKeys: []string{"total", "offset", "limit", "transactions"},
+			needsAuth: true,
+		},
+		{
+			name: "web_transactions_stats", method: "GET", path: "/api/web-transactions/stats",
+			wantStatus: 200,
+			wantKeys:   []string{"total", "top_hosts", "status_code_counts", "top_source_ips", "avg_duration_ms"},
+			needsAuth:  true,
 		},
 		// Notifications
 		{
@@ -150,6 +162,8 @@ func TestAuthEnforcement(t *testing.T) {
 		"/api/live-events",
 		"/api/live-flows",
 		"/api/live-incidents",
+		"/api/web-transactions",
+		"/api/web-transactions/stats",
 		"/api/notifications",
 		"/api/notifications/unread-count",
 		"/api/suppressions",
@@ -187,6 +201,7 @@ func TestPagination(t *testing.T) {
 		{"/api/live-events?limit=1", "events"},
 		{"/api/live-flows?limit=1", "flows"},
 		{"/api/live-incidents?limit=1", "incidents"},
+		{"/api/web-transactions?limit=1", "transactions"},
 	}
 
 	for _, ep := range endpoints {

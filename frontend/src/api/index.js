@@ -129,6 +129,20 @@ export function refreshAllThreatFeeds() {
   return api.post('/threat-feeds/refresh-all')
 }
 
+// ── Web Transactions ─────────────────────────────────────────────────────────
+
+export function getWebTransactions(params = {}) {
+  return api.get('/web-transactions', { params })
+}
+
+export function getWebTransaction(id) {
+  return api.get(`/web-transactions/${id}`)
+}
+
+export function getWebTransactionStats() {
+  return api.get('/web-transactions/stats')
+}
+
 // ── PCAP Trigger ─────────────────────────────────────────────────────────────
 
 export function fetchPcapTriggerStatus() {

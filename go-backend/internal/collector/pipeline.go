@@ -28,6 +28,7 @@ type Pipeline struct {
 	SourceID   string
 	DeviceRole string
 	buffer     []models.LiveEvent
+	webBuffer  []models.WebTransaction
 	mu         sync.Mutex
 	Stats      PipelineStats
 }
@@ -58,7 +59,70 @@ func (p *Pipeline) ProcessLine(line string) *models.LiveEvent {
 	}
 	event := p.normalize(parsed, parser, line)
 	p.Stats.Parsed++
+
+	// URL filtering logs additionally produce a WebTransaction row.
+	// It is buffered here (not by the caller) because the web fields live
+	// in the parsed map, which is not part of the returned LiveEvent.
+	if wt := p.webTransactionFrom(parsed, event); wt != nil {
+		p.mu.Lock()
+		p.webBuffer = append(p.webBuffer, *wt)
+		p.mu.Unlock()
+	}
+
 	return event
+}
+
+// webTransactionFrom builds a WebTransaction from a parsed URL-filtering log
+// map plus its normalised LiveEvent. Returns nil when the line is not a web
+// transaction (no "url" field).
+func (p *Pipeline) webTransactionFrom(parsed map[string]interface{}, event *models.LiveEvent) *models.WebTransaction {
+	url, ok := parsed["url"].(string)
+	if !ok || url == "" {
+		return nil
+	}
+
+	urlCopy := url
+	action := event.Action
+	wt := &models.WebTransaction{
+		SourceID:        event.SourceID,
+		DeviceType:      event.DeviceType,
+		SourceIP:        event.SourceIP,
+		DestinationIP:   event.DestinationIP,
+		URL:             &urlCopy,
+		Action:          &action,
+		TransactionTime: event.EventTime,
+	}
+
+	// Ports / bytes / duration come from the already-normalised event.
+	if event.SourcePort != nil {
+		v := *event.SourcePort
+		wt.SourcePort = &v
+	}
+	if event.DestinationPort != nil {
+		v := *event.DestinationPort
+		wt.DestinationPort = &v
+	}
+	if event.BytesIn != nil {
+		wt.BytesIn = *event.BytesIn
+	}
+	if event.BytesOut != nil {
+		wt.BytesOut = *event.BytesOut
+	}
+	if event.DurationMs != nil {
+		v := *event.DurationMs
+		wt.DurationMs = &v
+	}
+
+	// Web-specific optional fields from the parsed map.
+	setOptStr(parsed, "host", &wt.Host)
+	setOptStr(parsed, "http_method", &wt.Method)
+	setOptStr(parsed, "user_agent", &wt.UserAgent)
+	setOptStr(parsed, "content_type", &wt.ContentType)
+	setOptStr(parsed, "referer", &wt.Referer)
+	setOptStr(parsed, "url_category", &wt.Category)
+	setOptInt(parsed, "status_code", &wt.StatusCode)
+
+	return wt
 }
 
 // normalize converts a parser output map into a LiveEvent struct.
@@ -130,12 +194,20 @@ func (p *Pipeline) Buffer(event *models.LiveEvent) {
 	p.mu.Unlock()
 }
 
-// Flush writes all buffered events to the database and returns the count.
+// Flush writes all buffered events (and web transactions) to the database
+// and returns the number of events written.
 func (p *Pipeline) Flush(db *gorm.DB) int {
 	p.mu.Lock()
 	buf := p.buffer
+	webBuf := p.webBuffer
 	p.buffer = nil
+	p.webBuffer = nil
 	p.mu.Unlock()
+
+	if len(webBuf) > 0 {
+		db.Create(&webBuf)
+	}
+
 	if len(buf) == 0 {
 		return 0
 	}

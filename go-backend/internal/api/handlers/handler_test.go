@@ -1,4 +1,4 @@
-package handlers
+package handlers_test
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	"github.com/emreozeel/pcap-analyzer/backend/internal/api/handlers"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/api/router"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/auth"
 	"github.com/emreozeel/pcap-analyzer/backend/internal/config"
@@ -45,7 +46,7 @@ func setupTestRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 	hash, _ := auth.HashPassword("admin123")
 	db.Create(&models.User{Username: "admin", HashedPassword: hash, IsAdmin: true})
 
-	h := New(db, cfg)
+	h := handlers.New(db, cfg)
 	r := router.Setup(db, cfg, h)
 
 	return r, db
@@ -68,7 +69,7 @@ func getAdminToken(t *testing.T, r *gin.Engine) string {
 
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	return resp["token"].(string)
+	return resp["access_token"].(string)
 }
 
 // Test 1: POST /api/auth/login success
@@ -90,8 +91,8 @@ func TestLoginSuccess(t *testing.T) {
 
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["token"] == nil || resp["token"] == "" {
-		t.Error("expected token in response")
+	if resp["access_token"] == nil || resp["access_token"] == "" {
+		t.Error("expected access_token in response")
 	}
 }
 
@@ -281,7 +282,7 @@ func TestWorkflowStateByNonOwner(t *testing.T) {
 	r.ServeHTTP(loginW, loginReq)
 	var loginResp map[string]interface{}
 	json.Unmarshal(loginW.Body.Bytes(), &loginResp)
-	user2Token := loginResp["token"].(string)
+	user2Token := loginResp["access_token"].(string)
 
 	body, _ := json.Marshal(map[string]string{"workflow_state": "resolved"})
 	req := httptest.NewRequest("PUT", "/api/analyses/"+aID+"/workflow", bytes.NewReader(body))
@@ -312,7 +313,7 @@ func TestAssignByNonOwner(t *testing.T) {
 	r.ServeHTTP(loginW, loginReq)
 	var loginResp map[string]interface{}
 	json.Unmarshal(loginW.Body.Bytes(), &loginResp)
-	user3Token := loginResp["token"].(string)
+	user3Token := loginResp["access_token"].(string)
 
 	body, _ := json.Marshal(map[string]uint{"user_id": 1})
 	req := httptest.NewRequest("PUT", "/api/analyses/"+aID+"/assign", bytes.NewReader(body))

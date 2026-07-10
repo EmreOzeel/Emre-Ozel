@@ -88,6 +88,11 @@ func Setup(db *gorm.DB, cfg *config.Config, h *handlers.Handler) *gin.Engine {
 	p.GET("/live-flows/timeline", h.LiveFlowTimeline)
 	p.GET("/live-flows/behaviors", h.LiveFlowBehaviors)
 
+	// ── Web Transactions ──
+	p.GET("/web-transactions", h.ListWebTransactions)
+	p.GET("/web-transactions/stats", h.WebTransactionStats)
+	p.GET("/web-transactions/:id", h.GetWebTransaction)
+
 	// ── Live Incidents ──
 	p.GET("/live-incidents", h.ListLiveIncidents)
 	p.GET("/live-incidents/:id", h.GetLiveIncident)

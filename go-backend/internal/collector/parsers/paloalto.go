@@ -53,7 +53,14 @@ func (p *PaloAltoParser) Parse(line string) (map[string]interface{}, error) {
 		return parseTraffic(fields, eventTime), nil
 	}
 	if logType == "THREAT" {
-		return parseThreat(fields, eventTime), nil
+		m := parseThreat(fields, eventTime)
+		// URL Filtering logs are THREAT logs with subtype "url".
+		// Augment (never replace) the THREAT output with web fields so the
+		// existing LiveEvent production stays untouched.
+		if strings.EqualFold(strings.TrimSpace(fields[4]), "url") {
+			augmentURLFiltering(m, fields)
+		}
+		return m, nil
 	}
 	return nil, nil
 }
@@ -118,16 +125,16 @@ func parseThreat(f []string, eventTime time.Time) map[string]interface{} {
 
 	m["action"] = normalizeThreatAction(f[30])
 
-	if len(f) > 35 && f[35] != "" {
-		m["application"] = f[35] // category
-	}
-
 	if len(f) > 36 && f[36] != "" {
-		m["health_status"] = mapSeverity(f[36])
+		m["application"] = f[36] // category
 	}
 
-	if len(f) > 39 && f[39] != "" {
-		m["service"] = f[39] // direction
+	if len(f) > 37 && f[37] != "" {
+		m["health_status"] = mapSeverity(f[37]) // severity
+	}
+
+	if len(f) > 38 && f[38] != "" {
+		m["service"] = f[38] // direction
 	}
 
 	if f[29] != "" {
@@ -136,6 +143,72 @@ func parseThreat(f []string, eventTime time.Time) map[string]interface{} {
 
 	extractNAT(m, f)
 	return m
+}
+
+// augmentURLFiltering adds web-transaction fields from a PAN-OS URL Filtering
+// log (THREAT subtype "url") on top of the standard THREAT map.
+// Field positions follow the PAN-OS URL log layout:
+// [31]=misc (the URL, often quoted), [35]=category, [41]=content type,
+// [46]=user agent, [49]=referer, [56]=HTTP method. Trailing fields are only
+// read when present so shorter lines still parse.
+func augmentURLFiltering(m map[string]interface{}, f []string) {
+	m["log_subtype"] = "url"
+
+	if url := trimQuotes(f[31]); url != "" {
+		m["url"] = url
+		if host := hostFromURL(url); host != "" {
+			m["host"] = host
+		}
+	}
+	if len(f) > 35 {
+		if cat := trimQuotes(f[35]); cat != "" {
+			m["url_category"] = cat
+		}
+	}
+	if len(f) > 41 {
+		if ct := trimQuotes(f[41]); ct != "" {
+			m["content_type"] = ct
+		}
+	}
+	if len(f) > 46 {
+		if ua := trimQuotes(f[46]); ua != "" {
+			m["user_agent"] = ua
+		}
+	}
+	if len(f) > 49 {
+		if ref := trimQuotes(f[49]); ref != "" {
+			m["referer"] = ref
+		}
+	}
+	if len(f) > 56 {
+		if method := trimQuotes(f[56]); method != "" && method != "unknown" {
+			m["http_method"] = strings.ToUpper(method)
+		}
+	}
+}
+
+// trimQuotes strips surrounding double quotes and whitespace from a CSV field.
+func trimQuotes(s string) string {
+	return strings.Trim(strings.TrimSpace(s), `"`)
+}
+
+// hostFromURL extracts the host portion from a URL that may or may not
+// include a scheme, path, or port.
+func hostFromURL(url string) string {
+	host := url
+	if idx := strings.Index(host, "://"); idx >= 0 {
+		host = host[idx+3:]
+	}
+	if idx := strings.IndexByte(host, '/'); idx >= 0 {
+		host = host[:idx]
+	}
+	// Strip port (IPv4/hostname only; leave bracketed IPv6 untouched).
+	if !strings.HasPrefix(host, "[") {
+		if idx := strings.IndexByte(host, ':'); idx >= 0 {
+			host = host[:idx]
+		}
+	}
+	return host
 }
 
 // extractNAT populates NAT fields only when they differ from the original IPs.

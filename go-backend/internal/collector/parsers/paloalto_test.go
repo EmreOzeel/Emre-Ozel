@@ -14,6 +14,11 @@ var paTrafficLine = "1,2026/04/15 11:26:33,0123456789,TRAFFIC,end,2049,2026/04/1
 // THREAT line
 var paThreatLine = "1,2026/04/15 12:00:00,0123456789,THREAT,vulnerability,2049,2026/04/15 12:00:00,10.1.1.100,203.0.113.50,172.16.0.1,203.0.113.50,Allow-Web,,,suspicious-app,vsys1,trust,untrust,ae1.100,ae2.200,Log-Forward,2026/04/15 12:00:00,67890,1,54321,443,54321,443,0x400000,CVE-2024-1234,alert,0,0,0,0,0,web-attacks,high,client-to-server,unused,unused,unused"
 
+// URL Filtering line: THREAT log with subtype "url" at field 4.
+// [31]=misc/URL, [35]=category, [41]=content type, [46]=user agent,
+// [49]=referer, [56]=HTTP method.
+var paURLLine = "1,2026/04/15 12:30:00,0123456789,THREAT,url,2049,2026/04/15 12:30:00,10.1.1.100,203.0.113.50,172.16.0.1,203.0.113.50,Allow-Web,,,web-browsing,vsys1,trust,untrust,ae1.100,ae2.200,Log-Forward,2026/04/15 12:30:00,67890,1,54321,443,54321,443,0x400000,9999,block-url,\"www.malicious-site.example/path/page.html\",9999,0,0,malware-sites,high,client-to-server,1234567,0x0,US,text/html,0,,,1,Mozilla/5.0,,,https://referrer.example/,,,,,,,GET"
+
 func TestPaloAltoCanParse_Traffic(t *testing.T) {
 	p := &PaloAltoParser{}
 	if !p.CanParse(paTrafficLine) {
@@ -98,6 +103,68 @@ func TestPaloAltoThreat_FieldExtraction(t *testing.T) {
 
 	// service = direction (field 39)
 	assertStr(t, result, "service", "client-to-server")
+}
+
+func TestPaloAltoURL_FieldExtraction(t *testing.T) {
+	p := &PaloAltoParser{}
+	result, err := p.Parse(paURLLine)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Parse returned nil for valid URL filtering line")
+	}
+
+	// Standard THREAT fields must still be present (LiveEvent untouched).
+	assertStr(t, result, "source_ip", "10.1.1.100")
+	assertStr(t, result, "destination_ip", "203.0.113.50")
+	assertInt(t, result, "source_port", 54321)
+	assertInt(t, result, "destination_port", 443)
+
+	// Web-transaction fields.
+	assertStr(t, result, "log_subtype", "url")
+	assertStr(t, result, "url", "www.malicious-site.example/path/page.html")
+	assertStr(t, result, "host", "www.malicious-site.example")
+	assertStr(t, result, "url_category", "malware-sites")
+	assertStr(t, result, "content_type", "text/html")
+	assertStr(t, result, "user_agent", "Mozilla/5.0")
+	assertStr(t, result, "referer", "https://referrer.example/")
+	assertStr(t, result, "http_method", "GET")
+}
+
+func TestPaloAltoThreat_NoURLFields(t *testing.T) {
+	p := &PaloAltoParser{}
+	result, err := p.Parse(paThreatLine)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Parse returned nil for valid THREAT line")
+	}
+	if _, ok := result["url"]; ok {
+		t.Error("non-url THREAT line should not produce a url field")
+	}
+	if _, ok := result["log_subtype"]; ok {
+		t.Error("non-url THREAT line should not produce a log_subtype field")
+	}
+}
+
+func TestHostFromURL(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"www.example.com/path", "www.example.com"},
+		{"https://www.example.com/path?q=1", "www.example.com"},
+		{"example.com:8080/index.html", "example.com"},
+		{"example.com", "example.com"},
+		{"http://10.0.0.1:8443/", "10.0.0.1"},
+	}
+	for _, tt := range tests {
+		if got := hostFromURL(tt.in); got != tt.want {
+			t.Errorf("hostFromURL(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
 }
 
 func TestPaloAltoAction_Normalization(t *testing.T) {

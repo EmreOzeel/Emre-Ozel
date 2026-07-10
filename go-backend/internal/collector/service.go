@@ -187,6 +187,7 @@ func (s *Service) retentionSweep() {
 	cutoff := time.Now().UTC().AddDate(0, 0, -s.cfg.RetentionDays)
 	s.db.Where("event_time < ?", cutoff).Delete(&models.LiveEvent{})
 	s.db.Where("first_seen < ?", cutoff).Delete(&models.LiveFlow{})
+	s.db.Where("transaction_time < ?", cutoff).Delete(&models.WebTransaction{})
 	log.Printf("[collector] retention sweep: deleted events/flows older than %d days", s.cfg.RetentionDays)
 }
 

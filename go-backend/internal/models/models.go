@@ -577,6 +577,36 @@ type GeoIPCache struct {
 
 func (GeoIPCache) TableName() string { return "geoip_cache" }
 
+// ---------- WebTransaction ----------
+
+type WebTransaction struct {
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	SourceID        string    `gorm:"not null;index" json:"source_id"`
+	DeviceType      string    `gorm:"not null" json:"device_type"`
+	SourceIP        string    `gorm:"not null;index" json:"source_ip"`
+	DestinationIP   string    `gorm:"not null;index" json:"destination_ip"`
+	SourcePort      *int      `json:"source_port"`
+	DestinationPort *int      `json:"destination_port"`
+	Host            *string   `gorm:"index" json:"host"`
+	URL             *string   `gorm:"type:text" json:"url"`
+	Method          *string   `json:"method"`
+	StatusCode      *int      `json:"status_code"`
+	UserAgent       *string   `json:"user_agent"`
+	ContentType     *string   `json:"content_type"`
+	Referer         *string   `json:"referer"`
+	Category        *string   `json:"category"`
+	Action          *string   `json:"action"`
+	BytesIn         int       `gorm:"not null;default:0" json:"bytes_in"`
+	BytesOut        int       `gorm:"not null;default:0" json:"bytes_out"`
+	DurationMs      *int      `json:"duration_ms"`
+	TransactionTime time.Time `gorm:"not null;index" json:"transaction_time"`
+	Suppressed      *bool     `gorm:"default:false" json:"suppressed"`
+	CreatedAt       time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt       time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+}
+
+func (WebTransaction) TableName() string { return "web_transactions" }
+
 // AllModels returns a slice of pointers to all model types for use with AutoMigrate.
 func AllModels() []interface{} {
 	return []interface{}{
@@ -606,5 +636,6 @@ func AllModels() []interface{} {
 		&ThreatFeed{},
 		&CorrelationRule{},
 		&GeoIPCache{},
+		&WebTransaction{},
 	}
 }
