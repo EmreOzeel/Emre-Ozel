@@ -131,7 +131,9 @@ services:
       - go-backend
     environment:
       - PACKET_INTERFACE=${PACKET_INTERFACE:-eth1}
-      - BACKEND_URL=http://go-backend:8000
+      # network_mode: host -> Docker DNS name "go-backend" is unreachable here;
+      # reach the backend via its host-published port (compose maps 8001:8000).
+      - BACKEND_URL=${PACKET_ENGINE_BACKEND_URL:-http://127.0.0.1:8001}
       - BACKEND_TOKEN=${PACKET_ENGINE_TOKEN}
       - PACKET_BPF_FILTER=${PACKET_BPF_FILTER:-}
       - PACKET_BATCH_SIZE=100

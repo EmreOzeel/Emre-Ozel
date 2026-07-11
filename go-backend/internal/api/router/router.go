@@ -183,9 +183,9 @@ func Setup(db *gorm.DB, cfg *config.Config, h *handlers.Handler) *gin.Engine {
 	p.POST("/packet-engine/watches", h.NotImplemented)
 	p.DELETE("/packet-engine/watches/:ip/:port", h.NotImplemented)
 
-	// ── Ingest (token auth - 501 for now) ──
-	api.POST("/ingest/packet-events", h.NotImplemented)
-	api.POST("/ingest/packet-alerts", h.NotImplemented)
+	// ── Ingest (packet-engine token auth) ──
+	api.POST("/ingest/packet-events", h.IngestPacketEvents)
+	api.POST("/ingest/packet-alerts", h.IngestPacketAlert)
 
 	// ── Collector ──
 	p.GET("/collector/status", h.CollectorStatus)
