@@ -234,9 +234,15 @@ func toStringSlice(v interface{}) []string {
 }
 
 // inferProtocol determines the dominant protocol from packets.
+// Ties are broken by first appearance in the capture so the result is
+// deterministic (Go map iteration order is randomized).
 func inferProtocol(packets []NormalizedPacket, port *int) string {
 	counts := make(map[int]int)
+	var order []int
 	for _, p := range packets {
+		if _, seen := counts[p.IPProto]; !seen {
+			order = append(order, p.IPProto)
+		}
 		counts[p.IPProto]++
 	}
 	if len(counts) == 0 {
@@ -244,10 +250,10 @@ func inferProtocol(packets []NormalizedPacket, port *int) string {
 	}
 	maxProto := 0
 	maxCount := 0
-	for proto, count := range counts {
-		if count > maxCount {
+	for _, proto := range order {
+		if counts[proto] > maxCount {
 			maxProto = proto
-			maxCount = count
+			maxCount = counts[proto]
 		}
 	}
 	switch maxProto {

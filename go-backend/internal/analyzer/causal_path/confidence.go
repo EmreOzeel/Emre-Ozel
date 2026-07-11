@@ -4,7 +4,7 @@ import "math"
 
 // computeBaseConfidence calculates the initial confidence score based on
 // packet availability and SYN/SYNACK detection.
-func computeBaseConfidence(packets []NormalizedPacket, synFound, synackFound bool) int {
+func computeBaseConfidence(packets []NormalizedPacket, flowsFound, synFound, synackFound bool) int {
 	n := len(packets)
 	score := 50
 
@@ -17,8 +17,9 @@ func computeBaseConfidence(packets []NormalizedPacket, synFound, synackFound boo
 		score += 10
 	}
 
-	// Flow record bonus (always true if packets exist)
-	if n > 0 {
+	// Flow record bonus — only when an actual flow record exists for the pair
+	// (mirrors Python _compute_confidence: `if flows: score += 5`).
+	if flowsFound {
 		score += 5
 	}
 

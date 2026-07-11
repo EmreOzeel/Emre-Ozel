@@ -25,10 +25,11 @@ func (e *CausalPathEngine) Analyze(
 	roles := parseRoles(rolesMap)
 
 	// Step A: Filter relevant traffic
-	relevant := filterRelevant(e.packets, srcIP, dstIP, dstPort)
+	relevant := filterRelevant(e.packets, srcIP, dstIP, dstPort, roles)
+	relevantFlows := filterRelevantFlows(e.flows, srcIP, dstIP, dstPort)
 
-	// Sort by time
-	sort.Slice(relevant, func(i, j int) bool {
+	// Sort by time (stable, so equal-timestamp packets keep capture order)
+	sort.SliceStable(relevant, func(i, j int) bool {
 		return relevant[i].Time < relevant[j].Time
 	})
 
@@ -64,7 +65,7 @@ func (e *CausalPathEngine) Analyze(
 	outcome := deriveOutcome(state, impairments)
 
 	// Confidence scoring
-	baseConf := computeBaseConfidence(relevant, syn != nil, synack != nil)
+	baseConf := computeBaseConfidence(relevant, len(relevantFlows) > 0, syn != nil, synack != nil)
 	visNotes := visibilityNotes(relevant, syn != nil, dstPort)
 
 	var ctPtr, frtPtr *float64
@@ -162,12 +163,23 @@ func (e *CausalPathEngine) Analyze(
 
 // ── Pipeline helper functions ────────────────────────────────────────────────
 
-// filterRelevant returns only packets between srcIP and dstIP.
-func filterRelevant(packets []NormalizedPacket, srcIP, dstIP string, dstPort *int) []NormalizedPacket {
+// filterRelevant returns packets between srcIP and dstIP, plus packets
+// exchanged between one of the pair endpoints and a known firewall IP
+// (e.g. an intermediate firewall injecting a RST toward the client).
+// Without the firewall leg, the firewall_reset_observed hop step and the
+// "RST from known firewall" impairment evidence could never trigger.
+func filterRelevant(packets []NormalizedPacket, srcIP, dstIP string, dstPort *int, roles *TopologyRoles) []NormalizedPacket {
 	var result []NormalizedPacket
 	for _, p := range packets {
-		match := (p.SrcIP == srcIP && p.DstIP == dstIP) || (p.SrcIP == dstIP && p.DstIP == srcIP)
-		if !match {
+		pair := (p.SrcIP == srcIP && p.DstIP == dstIP) || (p.SrcIP == dstIP && p.DstIP == srcIP)
+		fwLeg := false
+		if !pair && roles != nil {
+			srcIsFW := contains(roles.FirewallIPs, p.SrcIP)
+			dstIsFW := contains(roles.FirewallIPs, p.DstIP)
+			fwLeg = (srcIsFW && (p.DstIP == srcIP || p.DstIP == dstIP)) ||
+				(dstIsFW && (p.SrcIP == srcIP || p.SrcIP == dstIP))
+		}
+		if !pair && !fwLeg {
 			continue
 		}
 		if dstPort != nil {
@@ -176,6 +188,23 @@ func filterRelevant(packets []NormalizedPacket, srcIP, dstIP string, dstPort *in
 			}
 		}
 		result = append(result, p)
+	}
+	return result
+}
+
+// filterRelevantFlows returns flow records between srcIP and dstIP
+// (mirrors Python _step_a_filter's _matches_flow).
+func filterRelevantFlows(flows []FlowRecord, srcIP, dstIP string, dstPort *int) []FlowRecord {
+	var result []FlowRecord
+	for _, f := range flows {
+		pair := (f.SrcIP == srcIP && f.DstIP == dstIP) || (f.SrcIP == dstIP && f.DstIP == srcIP)
+		if !pair {
+			continue
+		}
+		if dstPort != nil && f.DstPort != *dstPort && f.SrcPort != *dstPort {
+			continue
+		}
+		result = append(result, f)
 	}
 	return result
 }
@@ -213,12 +242,15 @@ func findSYNACK(packets []NormalizedPacket, srcIP, dstIP string, dstPort *int, s
 }
 
 // findDataPackets returns packets with application data.
+// Mirrors Python _step_d_find_data: the fallback heuristic checks RAW TCP flags
+// (not the derived IsSYN/IsACK helpers), so that e.g. a SYN-ACK — where
+// IsSYN()==false and IsACK()==false — is never misclassified as data.
 func findDataPackets(packets []NormalizedPacket, srcIP, dstIP string) []NormalizedPacket {
 	var result []NormalizedPacket
 	for _, p := range packets {
 		if p.HasPayload() {
 			result = append(result, p)
-		} else if !p.IsSYN() && !p.IsFIN() && !p.IsRST() && !p.IsACK() && p.FrameLen > 54 {
+		} else if !p.TCPFlags["syn"] && !p.TCPFlags["fin"] && !p.TCPFlags["rst"] && !p.TCPFlags["ack"] && p.FrameLen > 54 {
 			result = append(result, p)
 		}
 	}
