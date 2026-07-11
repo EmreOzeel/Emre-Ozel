@@ -22,6 +22,7 @@ type Service struct {
 	pipeline   *Pipeline
 	flowEngine *flow.Engine
 	syslog     *listeners.SyslogListener
+	webRules   *intelligence.WebRuleScanner
 	running    bool
 	mu         sync.Mutex
 	stopCh     chan struct{}
@@ -51,6 +52,9 @@ func (s *Service) Start() {
 
 	// Create flow engine with 60-second idle timeout
 	s.flowEngine = flow.NewEngine(60)
+
+	// Create web incident rules scanner (thresholds configurable via env)
+	s.webRules = intelligence.NewWebRuleScanner()
 
 	// Start syslog listener
 	s.syslog = listeners.NewSyslogListener(s.cfg.SyslogHost, s.cfg.SyslogPort, s.ProcessLine)
@@ -154,6 +158,11 @@ func (s *Service) retentionLoop() {
 			// Every 2 ticks: scan patterns
 			if tick%2 == 0 {
 				intelligence.ScanPatterns(s.db)
+			}
+
+			// Every 60 ticks (~60s at default interval): web incident rules scan
+			if tick%60 == 0 && s.webRules != nil {
+				s.webRules.Scan(s.db)
 			}
 
 			// Every 60 ticks: retention sweep

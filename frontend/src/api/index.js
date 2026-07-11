@@ -143,6 +143,14 @@ export function getWebTransactionStats() {
   return api.get('/web-transactions/stats')
 }
 
+export function getWebTransactionTimeseries(params = {}) {
+  return api.get('/web-transactions/timeseries', { params })
+}
+
+export function getWebTransactionsTop(params = {}) {
+  return api.get('/web-transactions/top', { params })
+}
+
 // ── PCAP Trigger ─────────────────────────────────────────────────────────────
 
 export function fetchPcapTriggerStatus() {

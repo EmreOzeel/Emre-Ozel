@@ -84,6 +84,16 @@ func TestResponseShapes(t *testing.T) {
 			wantKeys:   []string{"total", "top_hosts", "status_code_counts", "top_source_ips", "avg_duration_ms"},
 			needsAuth:  true,
 		},
+		{
+			name: "web_transactions_timeseries", method: "GET", path: "/api/web-transactions/timeseries",
+			wantStatus: 200, wantKeys: []string{"interval", "start_time", "end_time", "series"},
+			needsAuth: true,
+		},
+		{
+			name: "web_transactions_top", method: "GET", path: "/api/web-transactions/top",
+			wantStatus: 200, wantKeys: []string{"dimension", "items"},
+			needsAuth: true,
+		},
 		// Notifications
 		{
 			name: "notifications_unread_count", method: "GET", path: "/api/notifications/unread-count",
@@ -164,6 +174,8 @@ func TestAuthEnforcement(t *testing.T) {
 		"/api/live-incidents",
 		"/api/web-transactions",
 		"/api/web-transactions/stats",
+		"/api/web-transactions/timeseries",
+		"/api/web-transactions/top",
 		"/api/notifications",
 		"/api/notifications/unread-count",
 		"/api/suppressions",

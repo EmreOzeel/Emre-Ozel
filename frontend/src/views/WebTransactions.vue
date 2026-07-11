@@ -24,6 +24,35 @@
       </div>
     </div>
 
+    <!-- Trends -->
+    <div class="trends-grid">
+      <div class="trend-card trend-main">
+        <div class="trend-header">
+          <span class="trend-title">Traffic Trend</span>
+          <span class="trend-sub">{{ trendRangeLabel }} · {{ trendInterval }} buckets</span>
+        </div>
+        <TimeSeriesChart :series="timeseries" :height="170" />
+      </div>
+      <div class="trend-card">
+        <div class="trend-header">
+          <span class="trend-title">Top {{ dimLabel(topDim1) }}</span>
+          <el-select v-model="topDim1" size="small" style="width:110px">
+            <el-option v-for="d in TOP_DIMENSIONS" :key="d.value" :label="d.label" :value="d.value" />
+          </el-select>
+        </div>
+        <TopNList :items="top1Items" :empty-text="`No ${dimLabel(topDim1).toLowerCase()} data`" />
+      </div>
+      <div class="trend-card">
+        <div class="trend-header">
+          <span class="trend-title">Top {{ dimLabel(topDim2) }}</span>
+          <el-select v-model="topDim2" size="small" style="width:110px">
+            <el-option v-for="d in TOP_DIMENSIONS" :key="d.value" :label="d.label" :value="d.value" />
+          </el-select>
+        </div>
+        <TopNList :items="top2Items" :empty-text="`No ${dimLabel(topDim2).toLowerCase()} data`" />
+      </div>
+    </div>
+
     <!-- Filters -->
     <div class="filter-bar">
       <el-input v-model="filters.host" placeholder="Host" clearable size="small" style="width:160px" @clear="resetAndFetch" @keyup.enter="resetAndFetch" />
@@ -158,7 +187,9 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Warning } from '@element-plus/icons-vue'
-import { getWebTransactions, getWebTransaction, getWebTransactionStats } from '@/api'
+import { getWebTransactions, getWebTransaction, getWebTransactionStats, getWebTransactionTimeseries, getWebTransactionsTop } from '@/api'
+import TimeSeriesChart from '@/components/charts/TimeSeriesChart.vue'
+import TopNList from '@/components/charts/TopNList.vue'
 
 const router = useRouter()
 const PAGE_SIZE = 100
@@ -175,6 +206,19 @@ const timeRange = ref(null)
 
 let tableTimer = null
 let statsTimer = null
+
+// ── Trends state ─────────────────────────────────────────────────────────────
+const TOP_DIMENSIONS = [
+  { value: 'host', label: 'Hosts' },
+  { value: 'category', label: 'Categories' },
+  { value: 'source_ip', label: 'Source IPs' },
+]
+const timeseries = ref([])
+const trendInterval = ref('15m')
+const topDim1 = ref('host')
+const topDim2 = ref('category')
+const top1Items = ref([])
+const top2Items = ref([])
 
 const filters = reactive({
   host: '', source_ip: '', method: '', status_code: '', action: '', search: '',
@@ -218,7 +262,70 @@ async function fetchTransactions(append = false) {
   } catch {} finally { loading.value = false; loadingMore.value = false }
 }
 async function fetchStats() { try { stats.value = (await getWebTransactionStats()).data } catch {} }
-function resetAndFetch() { offset.value = 0; fetchTransactions(); fetchStats() }
+
+// ── Trends (timeseries + top-N) ──────────────────────────────────────────────
+const DEFAULT_TREND_HOURS = 6
+
+function trendRange() {
+  if (timeRange.value?.[0] && timeRange.value?.[1]) {
+    return { start: new Date(timeRange.value[0]), end: new Date(timeRange.value[1]) }
+  }
+  const end = new Date()
+  return { start: new Date(end.getTime() - DEFAULT_TREND_HOURS * 3600 * 1000), end }
+}
+
+function pickInterval(start, end) {
+  const hours = (end.getTime() - start.getTime()) / 3600000
+  if (hours <= 2) return '5m'
+  if (hours <= 12) return '15m'
+  if (hours <= 48) return '1h'
+  return '1d'
+}
+
+const trendRangeLabel = computed(() => {
+  if (timeRange.value?.[0] && timeRange.value?.[1]) return 'selected range'
+  return `last ${DEFAULT_TREND_HOURS}h`
+})
+
+function dimLabel(dim) {
+  return TOP_DIMENSIONS.find(d => d.value === dim)?.label || dim
+}
+
+async function fetchTimeseries() {
+  const { start, end } = trendRange()
+  const interval = pickInterval(start, end)
+  trendInterval.value = interval
+  const params = { interval, start_time: start.toISOString(), end_time: end.toISOString() }
+  if (filters.host) params.host = filters.host.trim()
+  if (filters.source_ip) params.source_ip = filters.source_ip.trim()
+  if (filters.action) params.action = filters.action
+  try {
+    const res = await getWebTransactionTimeseries(params)
+    timeseries.value = Array.isArray(res.data?.series) ? res.data.series : []
+  } catch { timeseries.value = [] }
+}
+
+async function fetchTop(dimension, target) {
+  const { start, end } = trendRange()
+  try {
+    const res = await getWebTransactionsTop({
+      dimension, limit: 10,
+      start_time: start.toISOString(), end_time: end.toISOString(),
+    })
+    target.value = Array.isArray(res.data?.items) ? res.data.items : []
+  } catch { target.value = [] }
+}
+
+function fetchTrends() {
+  fetchTimeseries()
+  fetchTop(topDim1.value, top1Items)
+  fetchTop(topDim2.value, top2Items)
+}
+
+watch(topDim1, (d) => fetchTop(d, top1Items))
+watch(topDim2, (d) => fetchTop(d, top2Items))
+
+function resetAndFetch() { offset.value = 0; fetchTransactions(); fetchStats(); fetchTrends() }
 function loadMore() { offset.value = transactions.value.length; fetchTransactions(true) }
 
 async function openDetail(row) {
@@ -280,7 +387,7 @@ function startTimers() {
   stopTimers()
   if (!autoRefresh.value) return
   tableTimer = setInterval(() => { offset.value = 0; fetchTransactions() }, 10000)
-  statsTimer = setInterval(fetchStats, 15000)
+  statsTimer = setInterval(() => { fetchStats(); fetchTrends() }, 15000)
 }
 function stopTimers() {
   if (tableTimer) { clearInterval(tableTimer); tableTimer = null }
@@ -288,7 +395,7 @@ function stopTimers() {
 }
 watch(autoRefresh, (on) => { if (on) startTimers(); else stopTimers() })
 
-onMounted(() => { fetchTransactions(); fetchStats(); startTimers() })
+onMounted(() => { fetchTransactions(); fetchStats(); fetchTrends(); startTimers() })
 onUnmounted(stopTimers)
 </script>
 
@@ -306,6 +413,14 @@ onUnmounted(stopTimers)
 .sb-4xx .stat-value { color:#e6a23c; }
 .sb-5xx .stat-value { color:#f56c6c; }
 .mono { font-family:'SF Mono','Menlo',monospace; font-size:12px; }
+
+/* Trends */
+.trends-grid { display:grid; grid-template-columns:2fr 1fr 1fr; gap:8px; margin-bottom:12px; }
+@media (max-width: 1100px) { .trends-grid { grid-template-columns:1fr; } }
+.trend-card { background:white; border-radius:8px; border:1px solid #e4e7ed; padding:12px 14px; min-width:0; }
+.trend-header { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:10px; }
+.trend-title { font-size:12px; font-weight:600; text-transform:uppercase; color:#909399; }
+.trend-sub { font-size:11px; color:#c0c4cc; }
 
 /* Filters */
 .filter-bar { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:10px; padding:8px 12px; background:white; border-radius:8px; border:1px solid #e4e7ed; }

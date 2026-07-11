@@ -91,6 +91,8 @@ func Setup(db *gorm.DB, cfg *config.Config, h *handlers.Handler) *gin.Engine {
 	// ── Web Transactions ──
 	p.GET("/web-transactions", h.ListWebTransactions)
 	p.GET("/web-transactions/stats", h.WebTransactionStats)
+	p.GET("/web-transactions/timeseries", h.WebTransactionTimeseries)
+	p.GET("/web-transactions/top", h.WebTransactionTop)
 	p.GET("/web-transactions/:id", h.GetWebTransaction)
 
 	// ── Live Incidents ──

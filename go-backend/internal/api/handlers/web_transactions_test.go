@@ -198,6 +198,264 @@ func TestWebTransactionStats(t *testing.T) {
 	}
 }
 
+// seedWebTransactionsForAnalytics seeds transactions at fixed, known times
+// relative to base for deterministic timeseries/top assertions.
+//
+// Layout (base = bucket boundary, 5m interval):
+//   - base+1m: a.example.com, 10.0.0.1, business, allow, dur 100, in 500, out 100
+//   - base+2m: a.example.com, 10.0.0.2, malware-sites, block-url, dur nil, in 0, out 50
+//   - base+3m: host nil, 10.0.0.3, category nil, deny, dur 200, in 10, out 20
+//   - base+7m: b.example.com, 10.0.0.1, business, allow, dur 300, in 1000, out 2000
+func seedWebTransactionsForAnalytics(t *testing.T, db *gorm.DB, base time.Time) {
+	t.Helper()
+
+	strPtr := func(s string) *string { return &s }
+	intPtr := func(n int) *int { return &n }
+
+	txs := []models.WebTransaction{
+		{
+			SourceID: "src-1", DeviceType: "firewall",
+			SourceIP: "10.0.0.1", DestinationIP: "203.0.113.10",
+			Host: strPtr("a.example.com"), Category: strPtr("business"),
+			Action: strPtr("allow"), DurationMs: intPtr(100),
+			BytesIn: 500, BytesOut: 100,
+			TransactionTime: base.Add(1 * time.Minute),
+		},
+		{
+			SourceID: "src-1", DeviceType: "firewall",
+			SourceIP: "10.0.0.2", DestinationIP: "203.0.113.20",
+			Host: strPtr("a.example.com"), Category: strPtr("malware-sites"),
+			Action: strPtr("block-url"),
+			BytesIn: 0, BytesOut: 50,
+			TransactionTime: base.Add(2 * time.Minute),
+		},
+		{
+			SourceID: "src-1", DeviceType: "firewall",
+			SourceIP: "10.0.0.3", DestinationIP: "203.0.113.30",
+			Action: strPtr("deny"), DurationMs: intPtr(200),
+			BytesIn: 10, BytesOut: 20,
+			TransactionTime: base.Add(3 * time.Minute),
+		},
+		{
+			SourceID: "src-1", DeviceType: "firewall",
+			SourceIP: "10.0.0.1", DestinationIP: "203.0.113.40",
+			Host: strPtr("b.example.com"), Category: strPtr("business"),
+			Action: strPtr("allow"), DurationMs: intPtr(300),
+			BytesIn: 1000, BytesOut: 2000,
+			TransactionTime: base.Add(7 * time.Minute),
+		},
+	}
+	if err := db.Create(&txs).Error; err != nil {
+		t.Fatalf("failed to seed analytics web transactions: %v", err)
+	}
+}
+
+// GET /api/web-transactions/timeseries buckets correctly and zero-fills
+// empty buckets.
+func TestWebTransactionTimeseries(t *testing.T) {
+	r, db := setupTestRouter(t)
+	token := getAdminToken(t, r)
+
+	base := time.Date(2026, 1, 10, 10, 0, 0, 0, time.UTC)
+	seedWebTransactionsForAnalytics(t, db, base)
+
+	path := "/api/web-transactions/timeseries?interval=5m" +
+		"&start_time=" + base.Format(time.RFC3339) +
+		"&end_time=" + base.Add(15*time.Minute).Format(time.RFC3339)
+	resp := getJSON(t, r, token, path, 200)
+
+	for _, k := range []string{"interval", "start_time", "end_time", "series"} {
+		if _, ok := resp[k]; !ok {
+			t.Errorf("missing key %q in timeseries response", k)
+		}
+	}
+	if resp["interval"] != "5m" {
+		t.Errorf("expected interval=5m, got %v", resp["interval"])
+	}
+
+	series, ok := resp["series"].([]interface{})
+	if !ok {
+		t.Fatal("series is not an array")
+	}
+	if len(series) != 3 {
+		t.Fatalf("expected 3 buckets, got %d", len(series))
+	}
+
+	// Bucket 0 [base, base+5m): 3 transactions, 2 denied (block-url + deny),
+	// avg duration over 100 and 200 = 150.
+	b0 := series[0].(map[string]interface{})
+	if b0["bucket"] != base.Format(time.RFC3339) {
+		t.Errorf("bucket 0 timestamp = %v, want %v", b0["bucket"], base.Format(time.RFC3339))
+	}
+	if b0["count"].(float64) != 3 {
+		t.Errorf("bucket 0 count = %v, want 3", b0["count"])
+	}
+	if b0["denied_count"].(float64) != 2 {
+		t.Errorf("bucket 0 denied_count = %v, want 2", b0["denied_count"])
+	}
+	if b0["avg_duration_ms"].(float64) != 150 {
+		t.Errorf("bucket 0 avg_duration_ms = %v, want 150", b0["avg_duration_ms"])
+	}
+	if b0["bytes_in"].(float64) != 510 {
+		t.Errorf("bucket 0 bytes_in = %v, want 510", b0["bytes_in"])
+	}
+	if b0["bytes_out"].(float64) != 170 {
+		t.Errorf("bucket 0 bytes_out = %v, want 170", b0["bytes_out"])
+	}
+
+	// Bucket 1 [base+5m, base+10m): a single allowed transaction.
+	b1 := series[1].(map[string]interface{})
+	if b1["bucket"] != base.Add(5*time.Minute).Format(time.RFC3339) {
+		t.Errorf("bucket 1 timestamp = %v, want %v", b1["bucket"], base.Add(5*time.Minute).Format(time.RFC3339))
+	}
+	if b1["count"].(float64) != 1 {
+		t.Errorf("bucket 1 count = %v, want 1", b1["count"])
+	}
+	if b1["denied_count"].(float64) != 0 {
+		t.Errorf("bucket 1 denied_count = %v, want 0", b1["denied_count"])
+	}
+	if b1["avg_duration_ms"].(float64) != 300 {
+		t.Errorf("bucket 1 avg_duration_ms = %v, want 300", b1["avg_duration_ms"])
+	}
+
+	// Bucket 2 [base+10m, base+15m): empty, zero-filled with null avg.
+	b2 := series[2].(map[string]interface{})
+	if b2["count"].(float64) != 0 {
+		t.Errorf("bucket 2 count = %v, want 0", b2["count"])
+	}
+	if b2["denied_count"].(float64) != 0 {
+		t.Errorf("bucket 2 denied_count = %v, want 0", b2["denied_count"])
+	}
+	if b2["avg_duration_ms"] != nil {
+		t.Errorf("bucket 2 avg_duration_ms = %v, want null", b2["avg_duration_ms"])
+	}
+	if b2["bytes_in"].(float64) != 0 || b2["bytes_out"].(float64) != 0 {
+		t.Errorf("bucket 2 bytes = %v/%v, want 0/0", b2["bytes_in"], b2["bytes_out"])
+	}
+}
+
+// Timeseries respects the shared optional filters.
+func TestWebTransactionTimeseriesFilters(t *testing.T) {
+	r, db := setupTestRouter(t)
+	token := getAdminToken(t, r)
+
+	base := time.Date(2026, 1, 10, 10, 0, 0, 0, time.UTC)
+	seedWebTransactionsForAnalytics(t, db, base)
+
+	path := "/api/web-transactions/timeseries?interval=5m&source_ip=10.0.0.1" +
+		"&start_time=" + base.Format(time.RFC3339) +
+		"&end_time=" + base.Add(15*time.Minute).Format(time.RFC3339)
+	resp := getJSON(t, r, token, path, 200)
+
+	series := resp["series"].([]interface{})
+	if len(series) != 3 {
+		t.Fatalf("expected 3 buckets, got %d", len(series))
+	}
+	b0 := series[0].(map[string]interface{})
+	b1 := series[1].(map[string]interface{})
+	if b0["count"].(float64) != 1 || b1["count"].(float64) != 1 {
+		t.Errorf("filtered counts = %v/%v, want 1/1", b0["count"], b1["count"])
+	}
+}
+
+// Timeseries input validation: bad interval, bad times, too many buckets.
+func TestWebTransactionTimeseriesValidation(t *testing.T) {
+	r, _ := setupTestRouter(t)
+	token := getAdminToken(t, r)
+
+	// Unsupported interval.
+	getJSON(t, r, token, "/api/web-transactions/timeseries?interval=2m", 400)
+
+	// Unparsable time params.
+	getJSON(t, r, token, "/api/web-transactions/timeseries?start_time=not-a-time", 400)
+	getJSON(t, r, token, "/api/web-transactions/timeseries?end_time=not-a-time", 400)
+
+	// start_time must be before end_time.
+	getJSON(t, r, token,
+		"/api/web-transactions/timeseries?start_time=2026-01-10T10:00:00Z&end_time=2026-01-10T09:00:00Z", 400)
+
+	// 9 days at 5m = 2592 buckets, over the ~1000 cap.
+	getJSON(t, r, token,
+		"/api/web-transactions/timeseries?interval=5m&start_time=2026-01-01T00:00:00Z&end_time=2026-01-10T00:00:00Z", 400)
+
+	// Same range is fine at 1h (216 buckets).
+	resp := getJSON(t, r, token,
+		"/api/web-transactions/timeseries?interval=1h&start_time=2026-01-01T00:00:00Z&end_time=2026-01-10T00:00:00Z", 200)
+	if len(resp["series"].([]interface{})) != 216 {
+		t.Errorf("expected 216 buckets, got %d", len(resp["series"].([]interface{})))
+	}
+}
+
+// GET /api/web-transactions/top aggregates per dimension, excludes NULL keys
+// and honors limit.
+func TestWebTransactionTop(t *testing.T) {
+	r, db := setupTestRouter(t)
+	token := getAdminToken(t, r)
+
+	base := time.Date(2026, 1, 10, 10, 0, 0, 0, time.UTC)
+	seedWebTransactionsForAnalytics(t, db, base)
+
+	rangeQuery := "&start_time=" + base.Format(time.RFC3339) +
+		"&end_time=" + base.Add(time.Hour).Format(time.RFC3339)
+
+	// Default dimension is host; NULL hosts are excluded.
+	resp := getJSON(t, r, token, "/api/web-transactions/top?limit=10"+rangeQuery, 200)
+	if resp["dimension"] != "host" {
+		t.Errorf("expected dimension=host, got %v", resp["dimension"])
+	}
+	items, ok := resp["items"].([]interface{})
+	if !ok {
+		t.Fatal("items is not an array")
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 host items (NULL host excluded), got %d", len(items))
+	}
+	first := items[0].(map[string]interface{})
+	if first["key"] != "a.example.com" {
+		t.Errorf("top host = %v, want a.example.com", first["key"])
+	}
+	if first["count"].(float64) != 2 {
+		t.Errorf("top host count = %v, want 2", first["count"])
+	}
+	if first["denied_count"].(float64) != 1 {
+		t.Errorf("top host denied_count = %v, want 1", first["denied_count"])
+	}
+	// bytes_total for a.example.com: (500+100) + (0+50) = 650.
+	if first["bytes_total"].(float64) != 650 {
+		t.Errorf("top host bytes_total = %v, want 650", first["bytes_total"])
+	}
+
+	// dimension=category: NULL categories excluded.
+	resp = getJSON(t, r, token, "/api/web-transactions/top?dimension=category"+rangeQuery, 200)
+	items = resp["items"].([]interface{})
+	if len(items) != 2 {
+		t.Fatalf("expected 2 category items, got %d", len(items))
+	}
+	if items[0].(map[string]interface{})["key"] != "business" {
+		t.Errorf("top category = %v, want business", items[0].(map[string]interface{})["key"])
+	}
+
+	// dimension=source_ip: all three sources present, 10.0.0.1 first.
+	resp = getJSON(t, r, token, "/api/web-transactions/top?dimension=source_ip"+rangeQuery, 200)
+	items = resp["items"].([]interface{})
+	if len(items) != 3 {
+		t.Fatalf("expected 3 source_ip items, got %d", len(items))
+	}
+	topIP := items[0].(map[string]interface{})
+	if topIP["key"] != "10.0.0.1" || topIP["count"].(float64) != 2 {
+		t.Errorf("top source_ip = %v (count %v), want 10.0.0.1 (count 2)", topIP["key"], topIP["count"])
+	}
+
+	// limit is honored.
+	resp = getJSON(t, r, token, "/api/web-transactions/top?dimension=source_ip&limit=1"+rangeQuery, 200)
+	if len(resp["items"].([]interface{})) != 1 {
+		t.Errorf("expected 1 item with limit=1, got %d", len(resp["items"].([]interface{})))
+	}
+
+	// Unknown dimension is rejected.
+	getJSON(t, r, token, "/api/web-transactions/top?dimension=bogus", 400)
+}
+
 // All web-transaction endpoints require auth.
 func TestWebTransactionsNoAuth(t *testing.T) {
 	r, _ := setupTestRouter(t)
@@ -205,6 +463,8 @@ func TestWebTransactionsNoAuth(t *testing.T) {
 	for _, path := range []string{
 		"/api/web-transactions",
 		"/api/web-transactions/stats",
+		"/api/web-transactions/timeseries",
+		"/api/web-transactions/top",
 		"/api/web-transactions/1",
 	} {
 		req := httptest.NewRequest("GET", path, nil)

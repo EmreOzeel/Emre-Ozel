@@ -301,6 +301,35 @@
           <div v-else class="empty-hint">No active incidents</div>
         </el-card>
 
+        <!-- ══ Section 3c — Web Transactions ═══════════════════════════ -->
+        <el-card class="intel-card" shadow="never">
+          <template #header>
+            <div class="card-header-row">
+              <span class="card-title">Web Transactions</span>
+              <el-button link type="primary" size="small" @click="$router.push('/web-transactions')">
+                View all
+              </el-button>
+            </div>
+          </template>
+          <template v-if="webTxnLoaded">
+            <div class="webtxn-stats">
+              <div class="webtxn-stat">
+                <strong>{{ webTxnTotal.toLocaleString() }}</strong>
+                <span>last hour</span>
+              </div>
+              <div class="webtxn-stat webtxn-denied">
+                <strong>{{ webTxnDenied.toLocaleString() }}</strong>
+                <span>denied</span>
+              </div>
+            </div>
+            <div class="webtxn-spark" v-if="webTxnSeries.length">
+              <TimeSeriesChart :series="webTxnSeries" :height="42" sparkline />
+            </div>
+            <div v-else class="empty-hint">No web transactions in the last hour</div>
+          </template>
+          <div v-else class="empty-hint">Loading…</div>
+        </el-card>
+
         <!-- ══ Section 4 — Collector Health (collapsed) ════════════════ -->
         <el-card class="intel-card collector-card" shadow="never">
           <template #header>
@@ -365,8 +394,9 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowDown, Warning } from '@element-plus/icons-vue'
 import api from '../api'
-import { lookupThreatIP, fetchGeoBatchLookup, fetchPcapTriggerStatus, fetchPacketWatches } from '../api'
+import { lookupThreatIP, fetchGeoBatchLookup, fetchPcapTriggerStatus, fetchPacketWatches, getWebTransactionTimeseries } from '../api'
 import { classifyAnalysisError } from '../utils/analysisErrors'
+import TimeSeriesChart from '../components/charts/TimeSeriesChart.vue'
 
 const router = useRouter()
 
@@ -394,6 +424,15 @@ const activeCaptures = ref(0)
 const pktEngineUp = ref(false)
 const pktEngineFlowsPerSec = ref(null)
 const pktEngineWatchCount = ref(0)
+const webTxnSeries = ref([])
+const webTxnLoaded = ref(false)
+
+const webTxnTotal = computed(() =>
+  webTxnSeries.value.reduce((sum, b) => sum + (Number(b?.count) || 0), 0)
+)
+const webTxnDenied = computed(() =>
+  webTxnSeries.value.reduce((sum, b) => sum + (Number(b?.denied_count) || 0), 0)
+)
 
 function _countryFlag(code) {
   if (!code) return ''
@@ -557,6 +596,24 @@ async function fetchPacketEngineStatus() {
   }
 }
 
+async function fetchWebTransactionsWidget() {
+  try {
+    const end = new Date()
+    const start = new Date(end.getTime() - 3600 * 1000)
+    const res = await getWebTransactionTimeseries({
+      interval: '5m',
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+    })
+    webTxnSeries.value = Array.isArray(res.data?.series) ? res.data.series : []
+    webTxnLoaded.value = true
+  } catch {
+    // Endpoint unavailable — show empty state instead of "Loading…" forever
+    webTxnSeries.value = []
+    webTxnLoaded.value = true
+  }
+}
+
 // ── Timer management ────────────────────────────────────────────────────────
 function startTimers() {
   refreshTimer = setInterval(() => {
@@ -565,6 +622,7 @@ function startTimers() {
     fetchIncidents()
     fetchBaselineCount()
     fetchPacketEngineStatus()
+    fetchWebTransactionsWidget()
   }, REFRESH_MS)
   tickTimer = setInterval(() => {
     if (lastUpdatedAt.value) {
@@ -592,6 +650,7 @@ onMounted(() => {
   fetchIncidents()
   fetchBaselineCount()
   fetchPacketEngineStatus()
+  fetchWebTransactionsWidget()
   startTimers()
   window.addEventListener('analysis-created', onAnalysisCreated)
 })
@@ -1108,6 +1167,28 @@ function timeAgo(iso) {
   font-size: 11px;
   white-space: nowrap;
 }
+
+/* ── Web transactions widget ─────────────────────────────────────────── */
+.webtxn-stats {
+  display: flex;
+  align-items: baseline;
+  gap: 18px;
+  margin-bottom: 8px;
+}
+.webtxn-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  color: #909399;
+}
+.webtxn-stat strong {
+  font-size: 20px;
+  font-weight: 700;
+  color: #1a1a2e;
+}
+.webtxn-denied strong { color: #f56c6c; }
+.webtxn-spark { padding-top: 2px; }
 
 /* ── Collector health ────────────────────────────────────────────────── */
 .collector-body { padding-top: 4px; }
